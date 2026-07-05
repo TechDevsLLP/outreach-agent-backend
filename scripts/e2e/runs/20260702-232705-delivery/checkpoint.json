@@ -1,0 +1,209 @@
+{
+  "run_id": "20260702-232705-delivery",
+  "profile": "delivery",
+  "created_at": "2026-07-02T23:27:05.591358",
+  "last_completed_step": "approve_day2",
+  "steps": {
+    "register": {
+      "status": "done",
+      "at": "2026-07-02T23:27:05.660251"
+    },
+    "login": {
+      "status": "done",
+      "at": "2026-07-02T23:27:05.845563"
+    },
+    "onboarding_start": {
+      "status": "done",
+      "at": "2026-07-02T23:27:05.861484",
+      "session_id": "714588ea-703b-4cb6-ad0d-9a81e5ad05d3"
+    },
+    "stage1_scrape": {
+      "status": "done",
+      "at": "2026-07-02T23:27:05.879551",
+      "job_id": "7e4429bf-2b4b-46ac-9007-f52f283fb410"
+    },
+    "stage1_poll": {
+      "status": "done",
+      "at": "2026-07-02T23:27:25.977151"
+    },
+    "stage1_save": {
+      "status": "done",
+      "at": "2026-07-02T23:27:26.029784"
+    },
+    "stage2_voice": {
+      "status": "done",
+      "at": "2026-07-02T23:27:32.238714"
+    },
+    "stage3_icp": {
+      "status": "done",
+      "at": "2026-07-02T23:27:32.892749"
+    },
+    "stage4_offer": {
+      "status": "done",
+      "at": "2026-07-02T23:27:33.131278"
+    },
+    "stage6_chat": {
+      "status": "done",
+      "at": "2026-07-02T23:27:35.739137"
+    },
+    "wizard_complete": {
+      "status": "done",
+      "at": "2026-07-02T23:27:35.801319"
+    },
+    "connect_sender": {
+      "status": "done",
+      "at": "2026-07-02T23:27:35.828771",
+      "reused": true,
+      "email_account_id": "6a26ab6e35e9ddcaec3d83f6"
+    },
+    "create_campaign": {
+      "status": "done",
+      "at": "2026-07-02T23:27:35.888438",
+      "campaign_id": "6a46f3e7a96628eae285687a"
+    },
+    "discovery_poll": {
+      "status": "done",
+      "at": "2026-07-03T00:31:02.125115",
+      "companies_found": 200,
+      "enrolled": 240,
+      "msg_gen_status": "completed"
+    },
+    "approve_day1": {
+      "status": "done",
+      "at": "2026-07-04T13:46:20.240413",
+      "day1_date": "2026-07-06"
+    },
+    "approve_day2": {
+      "status": 200,
+      "at": "2026-07-04T13:46:50.588153"
+    }
+  },
+  "state": {
+    "token": "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJzdWIiOiI2YTI1YzliMTM1ZTlkZGNhZWMzZDgzZWEiLCJhY2NvdW50X2lkIjoiNmEyNWM5YjEzNWU5ZGRjYWVjM2Q4M2ViIiwiZW1haWwiOiJwcml0aHZpQHRlY2hkZXZzLmluIiwiZXhwIjoxNzgzMjU5MTcyfQ.2wlGcxqLk0Cr_LGzsdi14LQesRh2GGkIM_i2g-BRBSE",
+    "session_id": "714588ea-703b-4cb6-ad0d-9a81e5ad05d3",
+    "job_id": "7e4429bf-2b4b-46ac-9007-f52f283fb410",
+    "campaign_id": "6a46f3e7a96628eae285687a",
+    "email_account_id": "6a26ab6e35e9ddcaec3d83f6",
+    "stage1_analysis": {
+      "target_market": "Multi-location businesses and service-based companies in India seeking to dominate local search and generate qualified leads. Primarily small to mid-sized businesses across healthcare, real estate, legal, hospitality, retail, and B2B services with 1-50 locations.",
+      "services": [
+        "Local SEO & Google Maps Optimization",
+        "AI-Powered SEO & Generative Engine Optimization (GEO)",
+        "Conversion Rate Optimization (CRO)",
+        "High-Performance Website Development",
+        "Marketing Automation & Workflow Intelligence",
+        "Paid Advertising (Google, Facebook, LinkedIn)",
+        "Lead Generation & Sales Pipeline Development",
+        "E-commerce Operations & Strategy"
+      ],
+      "industries": [
+        "Healthcare & Dental",
+        "Real Estate",
+        "Legal Services",
+        "Food & Hospitality",
+        "Construction",
+        "Beauty & Wellness",
+        "E-commerce & Retail",
+        "B2B SaaS",
+        "Financial Services",
+        "Marketing Agencies"
+      ],
+      "differentiators": [
+        "Data-driven systems with proven 3.2x average ROI in 6 months",
+        "AI-powered optimization for next-gen search engines (ChatGPT, Perplexity)",
+        "43% average CAC reduction through conversion optimization",
+        "Marketing automation saving 15+ hours weekly",
+        "Track record of $34M+ revenue generated for 130+ clients"
+      ],
+      "pain_points": [
+        "Wasting marketing budget on campaigns that don't generate qualified leads or revenue",
+        "Struggling to rank in local search and get found by nearby customers on Google Maps",
+        "Low website conversion rates turning traffic into lost opportunities",
+        "Spending 15+ hours weekly on repetitive marketing tasks that could be automated",
+        "Unable to compete with larger competitors in local markets",
+        "Slow or non-existent lead flow from digital channels"
+      ],
+      "icp_description": "The ideal customer is a growth-focused business owner or marketing leader at a multi-location service business or retail brand in India with 1-50 outlets. They're frustrated with inconsistent lead flow, poor local search visibility, and marketing spend that doesn't deliver measurable ROI. They operate in competitive local markets (healthcare, real estate, legal, hospitality, retail, or B2B services) and need a partner who can deliver data-driven results\u2014dominating Google Maps rankings, automating lead generation, and turning their website into a revenue engine. They value transparency, proven results (case studies showing 3-4x ROI), and want to reduce customer acquisition costs while scaling efficiently across locations.",
+      "sender_role": "Co-Founder",
+      "case_studies": [
+        {
+          "client": "SmileCare Dental",
+          "outcome": "Achieved top local SEO rankings and consistent appointment flow",
+          "metric": "10-15 appointment requests weekly from Google searches",
+          "industry": "Healthcare"
+        },
+        {
+          "client": "Shivamcharms",
+          "outcome": "Generated significant revenue through e-commerce optimization",
+          "metric": "$162.4K revenue in 3 months with 1371 interactions",
+          "industry": "E-commerce"
+        },
+        {
+          "client": "B2B SaaS Client",
+          "outcome": "Built consistent qualified lead pipeline",
+          "metric": "$14K monthly lead generation with 234% growth",
+          "industry": "B2B SaaS"
+        }
+      ],
+      "_usage": {
+        "prompt_tokens": 1723,
+        "completion_tokens": 853,
+        "total_tokens": 2576,
+        "cost": 0.017964,
+        "is_byok": false,
+        "prompt_tokens_details": {
+          "cached_tokens": 0,
+          "cache_write_tokens": 0,
+          "audio_tokens": 0,
+          "video_tokens": 0
+        },
+        "cost_details": {
+          "upstream_inference_cost": 0.017964,
+          "upstream_inference_prompt_cost": 0.005169,
+          "upstream_inference_completions_cost": 0.012795
+        },
+        "completion_tokens_details": {
+          "reasoning_tokens": 0,
+          "image_tokens": 0,
+          "audio_tokens": 0
+        }
+      }
+    },
+    "day1_date": "2026-07-06",
+    "discovery_result": {
+      "campaign_id": "6a46f3e7a96628eae285687a",
+      "discovery_status": "completed",
+      "discovery_error": null,
+      "discovery_prospects_found": 244,
+      "discovery_prospects_enrolled": 240,
+      "discovery_companies_found": 200,
+      "discovery_apify_triggered": false,
+      "discovery_prospects_from_db": 0,
+      "discovery_prospects_from_apify": 244,
+      "message_gen_status": "completed",
+      "message_gen_prospects_done": 0,
+      "message_gen_failed_count": 40,
+      "discovery_day1_enrolled": 0,
+      "total_enrolled": 0,
+      "prospect_count_target": 400,
+      "approval_status": "pending",
+      "auto_launch_status": "idle",
+      "auto_launch_error": null,
+      "enrichment_completed_count": 0,
+      "enrichment_total_count": 240,
+      "discovery_prospects_scraped": 0,
+      "discovery_enrichment_failed": 0,
+      "discovery_failure_reason": null,
+      "discovery_prospects_rule_scored": 0,
+      "discovery_prospects_rule_scored_total": 0,
+      "discovery_prospects_total_seen": 0,
+      "discovery_prospects_eligible": 240,
+      "discovery_prospects_planned": 240,
+      "ai_enrichment_done": 0,
+      "ai_enrichment_total": 0,
+      "day1_date": "2026-07-03",
+      "day1_is_today": false,
+      "timezone": "America/New_York"
+    }
+  }
+}

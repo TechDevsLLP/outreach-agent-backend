@@ -1,0 +1,803 @@
+"""
+Prospect scoring algorithm.
+Scores each prospect 0-100 based on how well they match the configured ideal client profile.
+"""
+
+# --- ICP Target Lists ---
+
+TARGET_SENIORITY = {
+    "owner": 25,
+    "c_suite": 25,
+    "founder": 25,
+    "partner": 22,
+    "vp": 20,
+    "director": 15,
+    "manager": 10,
+    "senior": 8,
+}
+
+TARGET_INDUSTRIES = {
+    # Heavy Industry & Resources (exact match = 20)
+    "oil & gas": 20, "oil, gas, and mining": 20, "mining & metals": 20,
+    "mining": 20, "power generation": 20, "energy": 20,
+    "renewables & environment": 20, "utilities": 20,
+    # Manufacturing (exact match = 20)
+    "automotive": 20, "aerospace": 20, "aerospace & defense": 20,
+    "chemicals": 20, "chemical": 20, "steel": 20, "metals": 20,
+    "industrial machinery": 20, "machinery": 20,
+    "construction materials": 20, "construction": 18,
+    "manufacturing": 18, "industrial automation": 18,
+    "packaging": 16, "textiles": 16, "food production": 16,
+    "pharmaceuticals": 16, "electronics": 16,
+    # IT/SaaS (related = 15)
+    "information technology": 15, "information technology and services": 15,
+    "computer software": 15, "internet": 15, "saas": 15,
+    # Engineering & Consulting (related = 14)
+    "engineering": 14, "management consulting": 14,
+    "civil engineering": 14, "mechanical engineering": 14,
+    # Finance (related = 12)
+    "financial services": 12, "investment management": 12,
+    "venture capital & private equity": 12, "banking": 12,
+    # Professional Services (related = 10)
+    "legal services": 10, "accounting": 10, "human resources": 10,
+    "insurance": 10, "logistics and supply chain": 10,
+    "transportation/trucking/railroad": 10, "wholesale": 10,
+}
+
+TARGET_JOB_KEYWORDS = [
+    "chief", "ceo", "cto", "cfo", "coo", "cmo", "cro", "cco",
+    "founder", "co-founder", "owner", "partner", "principal",
+    "president", "vice president", "vp",
+    "director", "head of",
+    "business development", "marketing", "sales",
+    "sustainability", "government relations",
+    "managing director", "general manager",
+]
+
+PRIORITY_CITIES_USA = [
+    "houston", "dallas", "denver", "chicago", "detroit", "pittsburgh",
+    "new york", "los angeles", "san francisco", "seattle", "boston",
+    "atlanta", "phoenix", "minneapolis",
+]
+
+PRIORITY_CITIES_EUROPE = [
+    "london", "manchester", "aberdeen", "birmingham",
+    "frankfurt", "munich", "stuttgart", "hamburg",
+    "paris", "lyon", "marseille",
+    "rotterdam", "amsterdam",
+    "zurich", "geneva",
+    "milan", "turin",
+    "madrid", "barcelona",
+    "stockholm", "oslo", "copenhagen",
+    "brussels", "antwerp",
+    "vienna", "dublin", "warsaw", "krakow",
+]
+
+PRIORITY_COUNTRIES = ["united states", "united kingdom", "germany", "france",
+                      "netherlands", "switzerland", "italy", "spain",
+                      "sweden", "norway", "denmark", "belgium", "austria",
+                      "ireland", "poland"]
+
+
+def score_prospect(lead: dict) -> tuple[float, dict]:
+    """
+    Score a prospect against the configured ICP.
+    Returns (total_score, breakdown_dict).
+    """
+    breakdown = {}
+
+    # 1. Seniority (max 25)
+    seniority = (lead.get("seniority_level") or "").lower().strip()
+    seniority_score = 0
+    for key, points in TARGET_SENIORITY.items():
+        if key in seniority:
+            seniority_score = points
+            break
+    breakdown["seniority"] = seniority_score
+
+    # 2. Industry match (max 20)
+    industry = (lead.get("industry") or "").lower().strip()
+    industry_score = 0
+    for key, points in TARGET_INDUSTRIES.items():
+        if key in industry or industry in key:
+            industry_score = max(industry_score, points)
+    breakdown["industry"] = industry_score
+
+    # 3. Company size (max 15)
+    company_size = lead.get("company_size")
+    size_score = 0
+    if company_size is not None:
+        try:
+            company_size = int(company_size)
+        except (ValueError, TypeError):
+            company_size = None
+    if company_size is not None:
+        if 20 <= company_size <= 5000:
+            size_score = 15  # Sweet spot
+        elif 10 <= company_size < 20:
+            size_score = 8
+        elif 5000 < company_size <= 10000:
+            size_score = 10
+        elif company_size > 10000:
+            size_score = 5
+    breakdown["company_size"] = size_score
+
+    # 4. Revenue match (max 15)
+    revenue = lead.get("company_annual_revenue_clean")
+    revenue_score = 0
+    if revenue is not None:
+        try:
+            revenue = float(revenue)
+        except (ValueError, TypeError):
+            revenue = None
+    if revenue is not None:
+        rev_m = revenue / 1_000_000  # Convert to millions
+        if 20 <= rev_m <= 250:
+            revenue_score = 15  # Sweet spot
+        elif 5 <= rev_m < 20:
+            revenue_score = 10
+        elif 250 < rev_m <= 2000:
+            revenue_score = 10
+        elif rev_m > 2000:
+            revenue_score = 5
+        elif 1 <= rev_m < 5:
+            revenue_score = 3
+    breakdown["revenue"] = revenue_score
+
+    # 5. Location match (max 10)
+    city = (lead.get("city") or "").lower().strip()
+    country = (lead.get("country") or "").lower().strip()
+    location_score = 0
+    all_priority_cities = PRIORITY_CITIES_USA + PRIORITY_CITIES_EUROPE
+    if city in all_priority_cities:
+        location_score = 10
+    elif country in PRIORITY_COUNTRIES:
+        location_score = 7
+    elif country:
+        location_score = 3
+    breakdown["location"] = location_score
+
+    # 6. Job title keywords (max 10)
+    job_title = (lead.get("job_title") or "").lower()
+    headline = (lead.get("headline") or "").lower()
+    combined_title = f"{job_title} {headline}"
+    title_score = 0
+    matches = sum(1 for kw in TARGET_JOB_KEYWORDS if kw in combined_title)
+    title_score = min(10, matches * 3)  # 3 pts per keyword match, max 10
+    breakdown["job_title"] = title_score
+
+    # 7. Email verified (max 5)
+    email = lead.get("email")
+    email_score = 5 if email and email.strip() else 0
+    breakdown["email_verified"] = email_score
+
+    total = sum(breakdown.values())
+    return min(100.0, total), breakdown
+
+
+def build_icp_context(industry_doc: dict) -> dict:
+    """
+    Extract ICP context from an industry document's apify_base_params.
+    Used to boost scoring when a prospect matches the search industry's target criteria.
+
+    Args:
+        industry_doc: Industry document from MongoDB
+
+    Returns:
+        Dict with target industry keywords, job titles, locations, etc.
+    """
+    params = industry_doc.get("apify_base_params", {})
+    return {
+        "target_industry": industry_doc.get("name", ""),
+        "target_job_titles": params.get("job_title", []) if isinstance(params.get("job_title"), list) else [params.get("job_title", "")],
+        "target_seniority": params.get("seniority_level", []) if isinstance(params.get("seniority_level"), list) else [],
+        "target_locations": params.get("contact_location", []) if isinstance(params.get("contact_location"), list) else [],
+        "target_industries": params.get("industry", []) if isinstance(params.get("industry"), list) else [params.get("industry", "")],
+        "target_keywords": params.get("keywords", []) if isinstance(params.get("keywords"), list) else [],
+    }
+
+
+def score_prospect_v2(lead: dict, icp_context: dict | None = None) -> tuple[float, dict]:
+    """
+    Score a prospect against the configured ICP (v2).
+    Adds ICP alignment, digital maturity gap, engagement opportunity, and recency signal.
+    Rebalanced dimensions to still sum to 100 max.
+
+    Returns (total_score, breakdown_dict).
+    """
+    breakdown = {}
+
+    # 1. Seniority (max 20, was 25)
+    seniority = (lead.get("seniority_level") or "").lower().strip()
+    seniority_score = 0
+    seniority_map = {
+        "owner": 20, "c_suite": 20, "founder": 20,
+        "partner": 18, "vp": 16, "director": 12, "manager": 8, "senior": 6,
+    }
+    for key, points in seniority_map.items():
+        if key in seniority:
+            seniority_score = points
+            break
+    breakdown["seniority"] = seniority_score
+
+    # 2. Industry match (max 15, was 20)
+    industry = (lead.get("industry") or "").lower().strip()
+    industry_score = 0
+    for key, points in TARGET_INDUSTRIES.items():
+        if key in industry or industry in key:
+            # Rescale: old max 20 -> new max 15
+            rescaled = round(points * 15 / 20)
+            industry_score = max(industry_score, rescaled)
+    breakdown["industry"] = industry_score
+
+    # 3. Company size (max 12, was 15)
+    company_size = lead.get("company_size")
+    size_score = 0
+    if company_size is not None:
+        try:
+            company_size = int(company_size)
+        except (ValueError, TypeError):
+            company_size = None
+    if company_size is not None:
+        if 20 <= company_size <= 5000:
+            size_score = 12
+        elif 10 <= company_size < 20:
+            size_score = 6
+        elif 5000 < company_size <= 10000:
+            size_score = 8
+        elif company_size > 10000:
+            size_score = 4
+    breakdown["company_size"] = size_score
+
+    # 4. Revenue match (max 12, was 15)
+    revenue = lead.get("company_annual_revenue_clean")
+    revenue_score = 0
+    if revenue is not None:
+        try:
+            revenue = float(revenue)
+        except (ValueError, TypeError):
+            revenue = None
+    if revenue is not None:
+        rev_m = revenue / 1_000_000
+        if 20 <= rev_m <= 250:
+            revenue_score = 12
+        elif 5 <= rev_m < 20:
+            revenue_score = 8
+        elif 250 < rev_m <= 2000:
+            revenue_score = 8
+        elif rev_m > 2000:
+            revenue_score = 4
+        elif 1 <= rev_m < 5:
+            revenue_score = 2
+    breakdown["revenue"] = revenue_score
+
+    # 5. Location match (max 8, was 10)
+    city = (lead.get("city") or "").lower().strip()
+    country = (lead.get("country") or "").lower().strip()
+    location_score = 0
+    all_priority_cities = PRIORITY_CITIES_USA + PRIORITY_CITIES_EUROPE
+    if city in all_priority_cities:
+        location_score = 8
+    elif country in PRIORITY_COUNTRIES:
+        location_score = 5
+    elif country:
+        location_score = 2
+    breakdown["location"] = location_score
+
+    # 6. Job title keywords (max 8, was 10)
+    job_title = (lead.get("job_title") or "").lower()
+    headline = (lead.get("headline") or "").lower()
+    combined_title = f"{job_title} {headline}"
+    matches = sum(1 for kw in TARGET_JOB_KEYWORDS if kw in combined_title)
+    title_score = min(8, matches * 2)
+    breakdown["job_title"] = title_score
+
+    # 7. Email verified (max 5)
+    email = lead.get("email")
+    email_score = 5 if email and email.strip() else 0
+    breakdown["email_verified"] = email_score
+
+    # 8. ICP alignment (max 5) - NEW
+    icp_score = 0
+    if icp_context:
+        target_industry = (icp_context.get("target_industry") or "").lower()
+        target_titles = [t.lower() for t in icp_context.get("target_job_titles", []) if t]
+        target_industries = [i.lower() for i in icp_context.get("target_industries", []) if i]
+
+        # Industry alignment with search target
+        if target_industry and target_industry in industry:
+            icp_score += 2
+        if any(ti in industry for ti in target_industries if ti):
+            icp_score += 1
+
+        # Job title alignment with search target
+        if any(tt in combined_title for tt in target_titles if tt):
+            icp_score += 2
+
+        icp_score = min(5, icp_score)
+    breakdown["icp_alignment"] = icp_score
+
+    # 9. Digital maturity gap (max 5) - NEW
+    # High revenue + no tech stack/no website = opportunity for digital transformation
+    digital_gap_score = 0
+    has_revenue = revenue is not None and revenue > 0
+    has_tech = bool(lead.get("company_technologies"))
+    has_website = bool(lead.get("company_website") or lead.get("company_domain"))
+
+    if has_revenue:
+        rev_m = revenue / 1_000_000 if revenue else 0
+        if rev_m >= 20 and not has_tech:
+            digital_gap_score += 3
+        if rev_m >= 20 and not has_website:
+            digital_gap_score += 2
+    digital_gap_score = min(5, digital_gap_score)
+    breakdown["digital_maturity_gap"] = digital_gap_score
+
+    # 10. Engagement opportunity (max 5) - NEW
+    # Short/missing company description, no tech stack = needs content marketing
+    engagement_score = 0
+    description = lead.get("company_description") or ""
+    if len(description) < 50:
+        engagement_score += 2
+    if not description:
+        engagement_score += 1
+    if not has_tech:
+        engagement_score += 2
+    engagement_score = min(5, engagement_score)
+    breakdown["engagement_opportunity"] = engagement_score
+
+    # 11. Recency signal (max 5) - NEW
+    # Company age vs size archetype detection
+    recency_score = 0
+    founded_year = lead.get("company_founded_year")
+    if founded_year:
+        try:
+            founded = int(founded_year)
+            company_age = 2026 - founded
+            cs = lead.get("company_size")
+            try:
+                cs = int(cs) if cs else 0
+            except (ValueError, TypeError):
+                cs = 0
+
+            # Traditional Titan: old (30+ years) + large = high opportunity
+            if company_age >= 30 and cs >= 50:
+                recency_score = 5
+            # Growth Disruptor: 5-15 years
+            elif 5 <= company_age <= 15 and cs >= 20:
+                recency_score = 4
+            # Established but not ancient
+            elif 15 < company_age < 30:
+                recency_score = 3
+            # Very new
+            elif company_age < 3:
+                recency_score = 1
+        except (ValueError, TypeError):
+            pass
+    breakdown["recency_signal"] = recency_score
+
+    total = sum(breakdown.values())
+    return min(100.0, total), breakdown
+
+
+NON_DECISION_MAKER_TITLES = [
+    "software engineer", "software developer", "web developer", "data engineer",
+    "devops", "sre", "qa engineer", "test engineer", "frontend", "backend",
+    "full stack", "mobile developer", "machine learning engineer",
+    "accountant", "bookkeeper", "auditor", "tax",
+    "recruiter", "talent acquisition", "hr coordinator", "hr assistant",
+    "intern", "trainee", "apprentice", "junior",
+    "receptionist", "secretary", "administrative assistant", "office manager",
+    "graphic designer", "ui designer", "ux designer",
+    "customer service", "customer support", "help desk", "technical support",
+    "warehouse", "logistics coordinator", "shipping", "driver",
+    "nurse", "physician", "therapist", "pharmacist",
+    "teacher", "professor", "lecturer", "instructor",
+    "paralegal", "legal assistant",
+    "analyst",  # too generic, usually not decision-makers
+]
+
+DECISION_MAKER_TITLE_KEYWORDS = [
+    "chief", "ceo", "cto", "cfo", "coo", "cmo", "cro", "cco",
+    "founder", "co-founder", "owner", "partner", "principal",
+    "president", "vice president", "vp",
+    "director", "head of", "managing director", "general manager",
+    "business development", "marketing", "sales",
+    "sustainability", "government relations",
+]
+
+DECISION_MAKER_FUNCTIONS = [
+    "marketing", "sales", "business development", "biz dev",
+    "growth", "revenue", "partnerships", "strategy",
+    "operations", "supply chain", "procurement",
+    "sustainability", "digital transformation", "innovation",
+]
+
+
+def is_decision_maker_rule_based(prospect: dict) -> tuple[bool, str]:
+    """
+    Rule-based check for whether a prospect is likely a decision-maker.
+    Uses job_title and seniority_level (available from Apify search data, no scraping needed).
+    Returns (is_decision_maker, reasoning).
+    """
+    job_title = (prospect.get("job_title") or "").lower().strip()
+    seniority = (prospect.get("seniority_level") or "").lower().strip()
+
+    # High seniority → always a decision maker
+    if seniority in ("owner", "c_suite", "founder", "partner"):
+        return True, f"High seniority: {seniority}"
+
+    # Check for non-decision-maker titles first
+    for ndt in NON_DECISION_MAKER_TITLES:
+        if ndt in job_title:
+            return False, f"Non-decision-maker title: matched '{ndt}'"
+
+    # VP/Director seniority with decision-maker title keywords
+    if seniority in ("vp", "director"):
+        for kw in DECISION_MAKER_TITLE_KEYWORDS:
+            if kw in job_title:
+                return True, f"{seniority} with decision-maker title keyword: '{kw}'"
+        # VP/Director even without keyword match is still likely a decision-maker
+        return True, f"Seniority level '{seniority}' implies decision-making authority"
+
+    # Manager in relevant function
+    if seniority == "manager" or "manager" in job_title:
+        for func in DECISION_MAKER_FUNCTIONS:
+            if func in job_title:
+                return True, f"Manager in relevant function: '{func}'"
+
+    # Senior in relevant function
+    if seniority == "senior" or "senior" in job_title:
+        for func in DECISION_MAKER_FUNCTIONS:
+            if func in job_title:
+                return True, f"Senior in relevant function: '{func}'"
+
+    # Check for explicit decision-maker keywords in title
+    for kw in DECISION_MAKER_TITLE_KEYWORDS:
+        if kw in job_title:
+            return True, f"Decision-maker title keyword: '{kw}'"
+
+    return False, f"No decision-maker signals found (title: '{job_title}', seniority: '{seniority}')"
+
+
+def score_company_fit_rule_based(prospect: dict) -> tuple[float, dict]:
+    """
+    Evaluate ONLY company-related scoring dimensions (no person dimensions).
+    Reuses same logic as score_prospect_v2 for: industry (max 15), company size (max 12),
+    revenue (max 12), location (max 8). Max possible ~47.
+    Returns (score, breakdown_dict).
+    """
+    breakdown = {}
+
+    # Industry match (max 15) — same as score_prospect_v2
+    industry = (prospect.get("industry") or "").lower().strip()
+    industry_score = 0
+    for key, points in TARGET_INDUSTRIES.items():
+        if key in industry or industry in key:
+            rescaled = round(points * 15 / 20)
+            industry_score = max(industry_score, rescaled)
+    breakdown["industry"] = industry_score
+
+    # Company size (max 12) — same as score_prospect_v2
+    company_size = prospect.get("company_size")
+    size_score = 0
+    if company_size is not None:
+        try:
+            company_size = int(company_size)
+        except (ValueError, TypeError):
+            company_size = None
+    if company_size is not None:
+        if 20 <= company_size <= 5000:
+            size_score = 12
+        elif 10 <= company_size < 20:
+            size_score = 6
+        elif 5000 < company_size <= 10000:
+            size_score = 8
+        elif company_size > 10000:
+            size_score = 4
+    breakdown["company_size"] = size_score
+
+    # Revenue match (max 12) — same as score_prospect_v2
+    revenue = prospect.get("company_annual_revenue_clean")
+    revenue_score = 0
+    if revenue is not None:
+        try:
+            revenue = float(revenue)
+        except (ValueError, TypeError):
+            revenue = None
+    if revenue is not None:
+        rev_m = revenue / 1_000_000
+        if 20 <= rev_m <= 250:
+            revenue_score = 12
+        elif 5 <= rev_m < 20:
+            revenue_score = 8
+        elif 250 < rev_m <= 2000:
+            revenue_score = 8
+        elif rev_m > 2000:
+            revenue_score = 4
+        elif 1 <= rev_m < 5:
+            revenue_score = 2
+    breakdown["revenue"] = revenue_score
+
+    # Location match (max 8) — same as score_prospect_v2
+    city = (prospect.get("city") or "").lower().strip()
+    country = (prospect.get("country") or "").lower().strip()
+    location_score = 0
+    all_priority_cities = PRIORITY_CITIES_USA + PRIORITY_CITIES_EUROPE
+    if city in all_priority_cities:
+        location_score = 8
+    elif country in PRIORITY_COUNTRIES:
+        location_score = 5
+    elif country:
+        location_score = 2
+    breakdown["location"] = location_score
+
+    total = sum(breakdown.values())
+    return total, breakdown
+
+
+def _title_match_score(prospect: dict, campaign: dict, max_pts: float) -> float:
+    """Score title/headline alignment against campaign target titles. Returns 0 if no targets specified."""
+    import re
+    target_titles = [t.lower().strip() for t in (campaign.get("icp_job_titles") or []) if t and t.strip()]
+    if not target_titles:
+        return 0.0
+
+    pt = (prospect.get("job_title") or prospect.get("title") or "").lower().strip()
+    headline = (prospect.get("headline") or "").lower().strip()
+    haystack = f"{pt} {headline}".strip()
+    if not haystack:
+        return 0.0
+
+    best = 0.0
+    for tt in target_titles:
+        if tt == pt:
+            best = max_pts
+            break
+        if tt in haystack or haystack in tt:
+            best = max(best, max_pts * 0.8)
+            continue
+        # Word-overlap fallback: at least one shared word ≥4 chars
+        tt_words = set(re.split(r"[\s\-/]+", tt))
+        hay_words = set(re.split(r"[\s\-/]+", haystack))
+        common = tt_words & hay_words
+        if common and any(len(w) >= 4 for w in common):
+            best = max(best, max_pts * 0.5)
+
+    # Bonus: functional department match
+    target_depts = [d.lower().strip() for d in (campaign.get("icp_functional_departments") or []) if d and d.strip()]
+    if target_depts and best < max_pts:
+        for dept in target_depts:
+            if dept in haystack:
+                best = min(max_pts, best * 1.2 + max_pts * 0.1)
+                break
+
+    return min(max_pts, best)
+
+
+def score_prospect_for_campaign(prospect: dict, campaign: dict) -> float:
+    """
+    Campaign-aware 0-100 rule-based score. No AI calls.
+
+    Uses only fields available from the Apify scrape / DB row, so it runs
+    instantly on every discovered prospect and drives the initial multi-day
+    cohort planning. AI enrichment happens separately, only on the cohort
+    scheduled for the currently-approved day.
+
+    Weights:
+      - Seniority match to campaign ICP seniorities (0-10)
+      - Title / headline match to campaign ICP job titles (0-35)
+      - Industry match to campaign ICP industries (0-18)
+      - Company size within ICP min/max window (0-12)
+      - Country / region match to ICP countries (0-5)
+      - Has email (0-15)
+      - Has LinkedIn profile URL (0-5)
+    Total = 100. Title+company(industry+size) = 35+30 = 65 dominant.
+    """
+    score = 0.0
+
+    # Per-account weight overrides (tuned from reply-rate feedback via scoring_feedback_service)
+    _weights = campaign.get("scoring_weights") or {}
+    W_SENIORITY = _weights.get("seniority", 10)
+    W_TITLE = _weights.get("title_match", 35)
+    W_INDUSTRY = _weights.get("industry", 18)
+    W_SIZE = _weights.get("company_size", 12)
+    W_COUNTRY = _weights.get("country", 5)
+    W_EMAIL = _weights.get("has_email", 15)
+    W_LINKEDIN = _weights.get("has_linkedin", 5)
+
+    # 1. Seniority match (0-W_SENIORITY)
+    # Merge icp_seniority_levels (free-text) with seniorities (canonical tokens from icp_canonicalizer)
+    # so that "C-Level" (free-text) and "c_suite" (canonical) both match a c-suite prospect.
+    _raw_seniorities = list(campaign.get("seniorities") or []) + list(campaign.get("icp_seniority_levels") or [])
+    target_seniorities = {s.lower().strip() for s in _raw_seniorities if s}
+    # "seniority" is the canonical token from the employee transform; "seniority_level" is the legacy name
+    prospect_seniority = (
+        prospect.get("seniority_level") or prospect.get("seniority") or ""
+    ).lower().strip()
+    if target_seniorities and prospect_seniority:
+        if prospect_seniority in target_seniorities:
+            score += W_SENIORITY
+        else:
+            for ts in target_seniorities:
+                if ts and (ts in prospect_seniority or prospect_seniority in ts):
+                    score += W_SENIORITY * 0.67
+                    break
+    elif not target_seniorities and prospect_seniority:
+        if prospect_seniority in ("owner", "c_suite", "founder", "vp", "director"):
+            score += W_SENIORITY * 0.67
+        elif prospect_seniority in ("manager", "senior"):
+            score += W_SENIORITY * 0.33
+
+    # 2. Title / headline match to campaign target titles (0-W_TITLE)
+    score += _title_match_score(prospect, campaign, W_TITLE)
+
+    # 3. Industry match (0-W_INDUSTRY)
+    target_industries = [
+        i.lower().strip() for i in (campaign.get("icp_industries") or []) if i
+    ]
+    # "industry" is the legacy name; new schema stores "company_industry_group" (e.g. "Retail")
+    # and "company_industry_id" (numeric LinkedIn ID). Try all three.
+    prospect_industry = (
+        prospect.get("industry")
+        or prospect.get("company_industry_group")
+        or prospect.get("company_industry_id")
+        or ""
+    )
+    if isinstance(prospect_industry, dict):
+        prospect_industry = prospect_industry.get("label") or prospect_industry.get("group") or ""
+    prospect_industry = str(prospect_industry).lower().strip()
+    if target_industries and prospect_industry:
+        if prospect_industry in target_industries:
+            score += W_INDUSTRY
+        else:
+            for ti in target_industries:
+                if ti and (ti in prospect_industry or prospect_industry in ti):
+                    score += W_INDUSTRY * 0.72
+                    break
+
+    # 4. Company size within ICP window (0-W_SIZE)
+    size_min = campaign.get("icp_company_size_min")
+    size_max = campaign.get("icp_company_size_max")
+    company_size_raw = prospect.get("company_size")
+    company_size: int | None
+    try:
+        company_size = int(company_size_raw) if company_size_raw is not None else None
+    except (ValueError, TypeError):
+        company_size = None
+    if company_size is not None and (size_min or size_max):
+        lo = int(size_min) if size_min else 0
+        hi = int(size_max) if size_max else 10**9
+        if lo <= company_size <= hi:
+            score += W_SIZE
+        else:
+            # Partial credit within a 50% tolerance of the window edge
+            tolerance = max(lo * 0.5, 10)
+            if abs(company_size - lo) <= tolerance or abs(company_size - hi) <= tolerance:
+                score += W_SIZE * 0.47
+    elif company_size is not None and company_size >= 10:
+        score += W_SIZE * 0.53
+
+    # 5. Country / region match (0-W_COUNTRY)
+    target_countries = [
+        c.lower().strip() for c in (campaign.get("icp_countries") or []) if c
+    ]
+    # New schema: country may be in location.country_code, location.country, or location.raw
+    _loc = prospect.get("location") or {}
+    if isinstance(_loc, dict):
+        _loc_country = _loc.get("country") or _loc.get("country_code") or _loc.get("raw") or ""
+    else:
+        _loc_country = str(_loc)
+    prospect_country = (prospect.get("country") or _loc_country or "").lower().strip()
+    if target_countries and prospect_country:
+        if prospect_country in target_countries:
+            score += W_COUNTRY
+        else:
+            for tc in target_countries:
+                if tc and (tc in prospect_country or prospect_country in tc):
+                    score += W_COUNTRY * 0.6
+                    break
+    elif prospect_country:
+        score += W_COUNTRY * 0.3
+
+    # 6. Has email (0-W_EMAIL)
+    email = (prospect.get("email") or "").strip()
+    if email and "@" in email:
+        score += W_EMAIL
+
+    # 7. Has LinkedIn URL (0-W_LINKEDIN)
+    linkedin = (prospect.get("linkedin") or "").strip().lower()
+    if linkedin and ("linkedin.com" in linkedin or linkedin.startswith("http")):
+        score += W_LINKEDIN
+
+    # Stale-employer penalty: prospect still in pool but employer data is outdated.
+    # 0.7× keeps strong-fit stale prospects above the min_score_to_enroll threshold
+    # while ranking them below verified-fresh peers.
+    if prospect.get("freshness_check_status") == "stale":
+        score *= 0.7
+
+    return min(100.0, score)
+
+
+_DM_SENIORITY_TRIGGER = {"c_suite", "csuite", "founder", "owner", "vp", "director", "head", "partner", "senior"}
+
+
+def passes_title_gate(
+    prospect: dict,
+    icp_seniority_levels: list[str],
+    exclude_keywords: list[str] | None = None,
+) -> tuple[bool, str | None]:
+    """Check if a prospect passes the title-level quality gate.
+
+    Returns (True, None) if passes, (False, reason) if rejected.
+    Reasons: "non_decision_maker_title" | "title_keyword_blocklisted"
+    """
+    job_title = (prospect.get("job_title") or "").lower()
+    headline = (prospect.get("headline") or "").lower()
+    combined_text = job_title + " " + headline
+
+    if exclude_keywords:
+        for kw in exclude_keywords:
+            kw_lower = kw.lower()
+            if kw_lower in job_title or kw_lower in headline:
+                return False, "title_keyword_blocklisted"
+
+    normalized_seniorities = {s.lower().strip() for s in icp_seniority_levels}
+    if normalized_seniorities & _DM_SENIORITY_TRIGGER:
+        for ndt in NON_DECISION_MAKER_TITLES:
+            if ndt in combined_text:
+                return False, "non_decision_maker_title"
+
+    return True, None
+
+
+def tier_from_score(score: float | None) -> str | None:
+    """Canonical priority tier from ai_prospect_score. hot>=80, warm>=60, cold<60."""
+    if score is None:
+        return None
+    if score >= 80:
+        return "hot"
+    if score >= 60:
+        return "warm"
+    return "cold"
+
+
+def generate_tags(lead: dict) -> list[str]:
+    """Generate auto-tags based on prospect attributes."""
+    tags = []
+
+    seniority = (lead.get("seniority_level") or "").lower()
+    if seniority in ("owner", "c_suite", "founder"):
+        tags.append("c_suite")
+    elif seniority in ("vp", "director"):
+        tags.append("senior_leader")
+
+    industry = (lead.get("industry") or "").lower()
+    for key in ["oil", "gas", "mining", "power", "energy", "utilities"]:
+        if key in industry:
+            tags.append("heavy_industry")
+            break
+    for key in ["automotive", "aerospace", "chemical", "steel", "manufacturing", "machinery"]:
+        if key in industry:
+            tags.append("manufacturing")
+            break
+    for key in ["information technology", "software", "saas", "internet"]:
+        if key in industry:
+            tags.append("tech")
+            break
+    for key in ["engineering", "consulting"]:
+        if key in industry:
+            tags.append("consulting")
+            break
+    for key in ["financial", "investment", "banking", "private equity"]:
+        if key in industry:
+            tags.append("finance")
+            break
+
+    country = (lead.get("country") or "").lower()
+    if country == "united states":
+        tags.append("usa")
+    elif country in PRIORITY_COUNTRIES:
+        tags.append("europe")
+
+    return tags

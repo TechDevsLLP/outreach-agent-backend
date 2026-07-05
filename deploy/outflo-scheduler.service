@@ -1,0 +1,19 @@
+[Unit]
+Description=OutFlo Scheduler Worker
+After=network.target
+
+[Service]
+Type=simple
+User=outflo
+Group=outflo
+WorkingDirectory=/opt/outflo/backend
+EnvironmentFile=-/opt/outflo/backend/.env
+Environment=APP_ROLE=scheduler
+ExecStart=/opt/outflo/venv/bin/python -m scheduler_worker
+Restart=always
+RestartSec=5
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target
