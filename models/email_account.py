@@ -1,5 +1,9 @@
 """
-EmailAccount model - supports sendgrid/google/microsoft/smtp email providers.
+EmailAccount model - supports google (Gmail API) / zoho (Zoho Mail API) / smtp
+(custom SMTP+IMAP) email providers. Credential fields (oauth_access_token,
+oauth_refresh_token, smtp_password, imap_password) are encrypted at rest via
+services/email_account_crypto.py — always write through encrypt_account_fields()
+and read through decrypt_account() (the provider factory does this automatically).
 """
 
 from pydantic import BaseModel, Field, ConfigDict
@@ -13,29 +17,33 @@ class EmailAccountBase(BaseModel):
     user_id: str
     email: str
     display_name: str
-    provider: str  # sendgrid/google/microsoft/smtp
+    provider: str  # google/zoho/smtp (microsoft kept wired but unimplemented — see campaign_engine)
 
-    # ── SendGrid specific ──
-    sendgrid_api_key: Optional[str] = None  # encrypted in practice
-    sendgrid_sender_name: Optional[str] = None
-    sendgrid_sender_email: Optional[str] = None
-    sendgrid_reply_to: Optional[str] = None
-
-    # ── OAuth specific (Google / Microsoft) ──
-    oauth_access_token: Optional[str] = None
-    oauth_refresh_token: Optional[str] = None
+    # ── OAuth specific (Google / Zoho / Microsoft) ──
+    oauth_access_token: Optional[str] = None  # encrypted at rest
+    oauth_refresh_token: Optional[str] = None  # encrypted at rest
     oauth_token_expiry: Optional[datetime] = None
     oauth_scopes: list[str] = Field(default_factory=list)
-    microsoft_tenant_id: Optional[str] = None
+    microsoft_tenant_id: Optional[str] = None  # unused — Microsoft send is an unimplemented stub
 
-    # ── SMTP specific ──
+    # ── Zoho Mail specific ──
+    zoho_account_id: Optional[str] = None       # accountId from GET /api/accounts
+    zoho_api_domain: Optional[str] = None        # e.g. https://mail.zoho.com (per data center)
+    zoho_accounts_domain: Optional[str] = None   # e.g. https://accounts.zoho.com (OAuth DC)
+    zoho_from_address: Optional[str] = None
+    zoho_inbox_folder_id: Optional[str] = None   # resolved at connect time, used for message content fetch
+
+    # ── SMTP + IMAP specific (IMAP required for reply-check + drafts) ──
     smtp_host: Optional[str] = None
     smtp_port: Optional[int] = None
     smtp_encryption: Optional[str] = None  # tls/ssl/none
     smtp_username: Optional[str] = None
-    smtp_password: Optional[str] = None
+    smtp_password: Optional[str] = None  # encrypted at rest
     imap_host: Optional[str] = None
     imap_port: Optional[int] = None
+    imap_encryption: Optional[str] = None  # tls/ssl/none
+    imap_username: Optional[str] = None
+    imap_password: Optional[str] = None  # encrypted at rest
 
     # ── Status ──
     status: str = "connected"  # connected/disconnected/error/warming
@@ -44,9 +52,10 @@ class EmailAccountBase(BaseModel):
 
     # ── Send limits & warm-up ──
     daily_send_limit: int = 50
-    warmup_enabled: bool = False
-    warmup_status: Optional[str] = None  # warming/active/paused
+    warmup_enabled: bool = True
+    warmup_status: Optional[str] = "warming"  # warming/active/paused
     warmup_day: int = 0
+    warmup_started_at: Optional[datetime] = None
 
     # ── Daily counters ──
     emails_sent_today: int = 0
@@ -76,25 +85,29 @@ class EmailAccountResponse(BaseModel):
     email: str
     display_name: str
     provider: str
-    sendgrid_sender_name: Optional[str] = None
-    sendgrid_sender_email: Optional[str] = None
-    sendgrid_reply_to: Optional[str] = None
     oauth_scopes: list[str] = Field(default_factory=list)
-    microsoft_tenant_id: Optional[str] = None
     oauth_token_expiry: Optional[datetime] = None
+    microsoft_tenant_id: Optional[str] = None
+    zoho_account_id: Optional[str] = None
+    zoho_api_domain: Optional[str] = None
+    zoho_accounts_domain: Optional[str] = None
+    zoho_from_address: Optional[str] = None
     smtp_host: Optional[str] = None
     smtp_port: Optional[int] = None
     smtp_encryption: Optional[str] = None
     smtp_username: Optional[str] = None
     imap_host: Optional[str] = None
     imap_port: Optional[int] = None
+    imap_encryption: Optional[str] = None
+    imap_username: Optional[str] = None
     status: str = "connected"
     error_message: Optional[str] = None
     last_health_check: Optional[datetime] = None
     daily_send_limit: int = 50
-    warmup_enabled: bool = False
-    warmup_status: Optional[str] = None
+    warmup_enabled: bool = True
+    warmup_status: Optional[str] = "warming"
     warmup_day: int = 0
+    warmup_started_at: Optional[datetime] = None
     emails_sent_today: int = 0
     emails_sent_today_reset_at: Optional[datetime] = None
     health: str = "healthy"
@@ -107,17 +120,12 @@ class EmailAccountResponse(BaseModel):
     model_config = ConfigDict(populate_by_name=True)
 
 
-class SendGridAccountRequest(BaseModel):
-    """Request body for connecting a SendGrid email account."""
-    display_name: str
-    sendgrid_api_key: str
-    sendgrid_sender_name: str
-    sendgrid_sender_email: str
-    sendgrid_reply_to: Optional[str] = None
-
-
 class SmtpAccountRequest(BaseModel):
-    """Request body for connecting an SMTP/IMAP email account."""
+    """
+    Request body for connecting a custom SMTP+IMAP email account.
+    IMAP credentials are required — without them the account could only send,
+    not check for replies or create native mailbox drafts.
+    """
     email: str
     display_name: str
     smtp_host: str
@@ -125,5 +133,8 @@ class SmtpAccountRequest(BaseModel):
     smtp_encryption: str  # tls/ssl/none
     smtp_username: str
     smtp_password: str
-    imap_host: Optional[str] = None
-    imap_port: Optional[int] = None
+    imap_host: str
+    imap_port: int
+    imap_encryption: str  # tls/ssl/none
+    imap_username: str
+    imap_password: str

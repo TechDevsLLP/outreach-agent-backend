@@ -6,27 +6,128 @@ Sends email or LinkedIn message, records the outcome, advances to next step.
 
 import asyncio
 import logging
+import os
 import re
+import socket
 from datetime import datetime, timedelta
 from bson import ObjectId
 from typing import Optional
 
 import database
 from config import get_settings
-from services.unipile_service import UnipileClient as UnipileService
+from models.send_attempt import SendAttemptIdentity, SendAttemptState
+from services.send_attempt_service import (
+    SendAttemptService,
+    claim_due_enrollment,
+    release_enrollment_lease,
+)
+from services.unipile_service import UnipileClient
+from utils.email_html import plain_text_to_html
 
 logger = logging.getLogger(__name__)
 settings = get_settings()
 
-# Lazy-loaded service instances
-_unipile_service: Optional[UnipileService] = None
+ENGINE_WORKER_ID = f"{socket.gethostname()}:{os.getpid()}"
 
 
-def get_unipile_service() -> UnipileService:
-    global _unipile_service
-    if _unipile_service is None:
-        _unipile_service = UnipileService()
-    return _unipile_service
+def _send_attempt_identity(
+    campaign: dict,
+    enrollment: dict,
+    channel: str,
+) -> SendAttemptIdentity:
+    """Return the stable identity shared by cap accounting and provider dispatch."""
+    state = enrollment.get("sequence_state") or {}
+    node_id = (
+        state.get("current_node_id")
+        or (enrollment.get("flow_state") or {}).get("current_node_id")
+        or f"step-{enrollment.get('current_step', 0)}-{channel}"
+    )
+    return SendAttemptIdentity(
+        account_id=str(enrollment.get("account_id", "")),
+        enrollment_id=str(enrollment["_id"]),
+        sequence_version=str(
+            campaign.get("sequence_version") or campaign.get("version") or "1"
+        ),
+        node_id=str(node_id),
+        generation=int(
+            state.get("generation") or enrollment.get("send_generation") or 0
+        ),
+    )
+
+
+async def _existing_send_attempt(
+    campaign: dict,
+    enrollment: dict,
+    channel: str,
+) -> Optional[dict]:
+    identity = _send_attempt_identity(campaign, enrollment, channel)
+    return await database.send_attempts_collection.find_one(
+        {
+            "send_key": identity.send_key,
+            "account_id": identity.account_id,
+            "enrollment_id": identity.enrollment_id,
+        }
+    )
+
+
+def _attempt_owns_daily_cap(attempt: Optional[dict]) -> bool:
+    """Whether an earlier execution already consumed this touch's cap slot.
+
+    PREPARED is included because the cap is reserved immediately before the
+    durable attempt is prepared. RETRY_SCHEDULED and FAILED_TERMINAL have had
+    their slot released by the engine (or by explicit reconciliation).
+    """
+    return bool(
+        attempt
+        and attempt.get("state")
+        in {
+            SendAttemptState.PREPARED.value,
+            SendAttemptState.DISPATCHING.value,
+            SendAttemptState.AMBIGUOUS.value,
+            SendAttemptState.SENT.value,
+        }
+    )
+
+
+async def _release_cap_slots_once(
+    send_key: Optional[str],
+    campaign_id,
+    channel: str,
+    sender_id: Optional[str],
+) -> None:
+    """Release the campaign + sender daily-cap slots reserved for one send
+    attempt, guarded so a replayed/re-leased failure never double-decrements.
+
+    ``send_key`` identifies the durable send attempt; when it's unknown (the
+    provider call raised before a send attempt record could be created) we
+    fall back to a direct, unguarded release — there is no attempt doc to
+    guard against, and that case was never double-released before this fix.
+    """
+    from services.daily_cap_service import release_slot, release_sender_slot as _release_sender_slot
+
+    if send_key:
+        service = SendAttemptService(database.send_attempts_collection)
+        if not await service.mark_cap_released(send_key):
+            return
+    await release_slot(database.db, campaign_id, channel)
+    if sender_id:
+        await _release_sender_slot(database.db, sender_id, channel)
+
+
+def get_unipile_service(account_id: Optional[str] = None) -> UnipileClient:
+    """Compatibility factory that cannot construct an unbound provider client."""
+    if not account_id:
+        raise ValueError("Explicit tenant-owned Unipile account id is required")
+    return UnipileClient(account_id=str(account_id))
+
+
+def _account_values(account_id) -> list[object]:
+    values: list[object] = [str(account_id)]
+    try:
+        values.append(ObjectId(str(account_id)))
+    except Exception:
+        pass
+    return values
 
 
 def personalize(template: str, prospect: dict, sender_context: dict = None) -> str:
@@ -72,8 +173,11 @@ def is_in_send_window(campaign: dict, prospect: Optional[dict] = None) -> bool:
         send_start = campaign.get("send_hour_start", 9)
         send_end = campaign.get("send_hour_end", 17)
         return day_name in send_days and send_start <= hour < send_end
-    except Exception:
-        return True  # If timezone lookup fails, allow sending
+    except Exception as exc:
+        # Invalid timezone/window configuration must fail closed. Sending at an
+        # unintended local hour is a compliance and sender-reputation risk.
+        logger.warning("Invalid campaign send window; deferring send: %s", exc)
+        return False
 
 
 def get_next_send_window(campaign: dict, prospect: Optional[dict] = None) -> datetime:
@@ -113,150 +217,24 @@ async def send_email_via_account(
     to_email: str,
     subject: str,
     body: str,
-    tracking_token: Optional[str] = None,
     prospect_id: Optional[str] = None,
     campaign_id: Optional[str] = None,
 ) -> Optional[dict]:
     """
-    Send email via the appropriate provider.
+    Send email via the appropriate provider (Gmail API / Zoho Mail API / custom SMTP+IMAP).
 
-    Returns a dict with at minimum {"message_id": str} on success, or None on failure.
-    Gmail additionally returns {"thread_id": str, "rfc_message_id": str}.
+    Thin wrapper over services.email_delivery_service.send_email — kept here for
+    call-site compatibility across the campaign engine. Click-link rewriting happens
+    inside the facade; open-pixel tracking has been removed (replies + clicks only).
+
+    Returns a dict with at minimum {"message_id": str, "provider": str} on success,
+    or None on failure. May also include {"thread_ref": str, "rfc_message_id": str}.
     """
-    provider = email_account.get("provider", "sendgrid")
-
-    if provider == "sendgrid":
-        try:
-            import httpx
-            headers = {
-                "Authorization": f"Bearer {email_account['sendgrid_api_key']}",
-                "Content-Type": "application/json",
-            }
-            payload = {
-                "personalizations": [{"to": [{"email": to_email}]}],
-                "from": {
-                    "email": email_account.get("sendgrid_sender_email", ""),
-                    "name": email_account.get("sendgrid_sender_name", ""),
-                },
-                "subject": subject,
-                "content": [{"type": "text/html", "value": body}],
-            }
-            if email_account.get("sendgrid_reply_to"):
-                payload["reply_to"] = {"email": email_account["sendgrid_reply_to"]}
-
-            async with httpx.AsyncClient(timeout=30) as client:
-                resp = await client.post(
-                    "https://api.sendgrid.com/v3/mail/send",
-                    headers=headers,
-                    json=payload,
-                )
-                if resp.status_code == 202:
-                    msg_id = resp.headers.get("X-Message-Id", "sendgrid-sent")
-                    return {"message_id": msg_id, "provider": "sendgrid"}
-                else:
-                    logger.error(f"SendGrid error {resp.status_code}: {resp.text}")
-                    return None
-        except Exception as e:
-            logger.error(f"Email send failed via SendGrid: {e}")
-            return None
-
-    elif provider == "google":
-        try:
-            from services.gmail_service import send_gmail_email
-            from routes.email_tracking import (
-                build_pixel_url,
-                inject_tracking_pixel,
-                rewrite_links_for_tracking,
-            )
-
-            html_body = body
-
-            # 1. Inject open-tracking pixel
-            if tracking_token:
-                try:
-                    pixel_url = build_pixel_url(tracking_token)
-                    html_body = inject_tracking_pixel(html_body, pixel_url)
-                except Exception as px_err:
-                    logger.warning(f"Failed to inject tracking pixel: {px_err}")
-
-            # 2. Rewrite links for click tracking
-            if prospect_id:
-                try:
-                    html_body = await rewrite_links_for_tracking(
-                        html_body,
-                        prospect_id=prospect_id,
-                        email_account_id=str(email_account["_id"]),
-                        campaign_id=campaign_id,
-                    )
-                except Exception as cl_err:
-                    logger.warning(f"Failed to rewrite links for click tracking: {cl_err}")
-
-            result = await send_gmail_email(email_account, to_email, subject, html_body)
-            if result:
-                result["provider"] = "gmail"
-            return result
-        except Exception as e:
-            logger.error(f"Gmail send failed for {to_email}: {e}")
-            return None
-
-    elif provider == "microsoft":
-        logger.info(f"Outlook send to {to_email} (stub)")
-        return {"message_id": f"outlook-{datetime.utcnow().timestamp()}", "provider": "microsoft"}
-
-    elif provider == "smtp":
-        try:
-            import aiosmtplib
-            from email.mime.multipart import MIMEMultipart
-            from email.mime.text import MIMEText
-            from routes.email_tracking import (
-                build_pixel_url,
-                inject_tracking_pixel,
-                rewrite_links_for_tracking,
-            )
-
-            html_body = body
-
-            # Inject tracking pixel for open tracking
-            if tracking_token:
-                try:
-                    pixel_url = build_pixel_url(tracking_token)
-                    html_body = inject_tracking_pixel(html_body, pixel_url)
-                except Exception as px_err:
-                    logger.warning(f"Failed to inject tracking pixel: {px_err}")
-
-            # Rewrite links for click tracking
-            if prospect_id:
-                try:
-                    html_body = await rewrite_links_for_tracking(
-                        html_body,
-                        prospect_id=prospect_id,
-                        email_account_id=str(email_account["_id"]),
-                        campaign_id=campaign_id,
-                    )
-                except Exception as cl_err:
-                    logger.warning(f"Failed to rewrite links for click tracking: {cl_err}")
-
-            msg = MIMEMultipart("alternative")
-            msg["Subject"] = subject
-            msg["From"] = email_account.get("smtp_username", "")
-            msg["To"] = to_email
-            msg.attach(MIMEText(html_body, "html"))
-
-            await aiosmtplib.send(
-                msg,
-                hostname=email_account["smtp_host"],
-                port=email_account.get("smtp_port", 587),
-                username=email_account["smtp_username"],
-                password=email_account["smtp_password"],
-                use_tls=(email_account.get("smtp_encryption") == "ssl"),
-                start_tls=(email_account.get("smtp_encryption") == "tls"),
-            )
-            return {"message_id": f"smtp-{datetime.utcnow().timestamp()}", "provider": "smtp"}
-        except Exception as e:
-            logger.error(f"SMTP send failed: {e}")
-            return None
-
-    return None
+    from services.email_delivery_service import send_email
+    return await send_email(
+        email_account, to_email, subject, body,
+        prospect_id=prospect_id, campaign_id=campaign_id,
+    )
 
 
 async def record_campaign_message(
@@ -267,23 +245,42 @@ async def record_campaign_message(
     subject: str,
     provider_message_id: Optional[str],
     status: str,
-    gmail_thread_id: Optional[str] = None,
+    provider_thread_id: Optional[str] = None,
     provider: Optional[str] = None,
     ab_variant: Optional[str] = None,
+    rfc_message_id: Optional[str] = None,
+    send_key: Optional[str] = None,
+    prospect: Optional[dict] = None,
+    provider_account_id: Optional[str] = None,
+    content_html: Optional[str] = None,
 ):
-    """Record a sent (or failed) message in campaign_messages."""
+    """
+    Record a sent (or failed) message in campaign_messages.
+
+    `content_html` should be the exact HTML the provider was handed (the delivery
+    facade returns it). When it is missing — a failed send, or a non-email
+    channel — we fall back to rendering the plain text, so the stored HTML always
+    matches what a client would display rather than being raw text that renders
+    as one collapsed paragraph.
+    """
+    if content_html is None:
+        content_html = (
+            plain_text_to_html(content_text)
+            if step_def.get("channel") == "email"
+            else content_text
+        )
     doc = {
         "campaign_id": campaign["_id"],
         "campaign_enrollment_id": enrollment["_id"],
         "account_id": enrollment["account_id"],
         "prospect_id": enrollment["prospect_id"],
-        "step_number": enrollment["current_step"],
+        "step_number": int(enrollment.get("current_step") or 0),
         "channel": step_def["channel"],
         "action": step_def["action"],
         "direction": "outbound",
         "subject": subject,
         "content_text": content_text,
-        "content_html": content_text,  # TODO: proper HTML wrapping
+        "content_html": content_html,
         "provider_message_id": provider_message_id,
         "email_account_id": campaign.get("email_account_id"),
         "status": status,
@@ -291,27 +288,119 @@ async def record_campaign_message(
         "sent_at": datetime.utcnow() if status == "sent" else None,
         "created_at": datetime.utcnow(),
     }
-    if gmail_thread_id:
-        doc["gmail_thread_id"] = gmail_thread_id
+    if provider_thread_id:
+        doc["provider_thread_id"] = provider_thread_id
     if provider:
         doc["provider"] = provider
     if ab_variant:
         doc["ab_variant"] = ab_variant
-    await database.campaign_messages_collection.insert_one(doc)
+    if rfc_message_id:
+        doc["rfc_message_id"] = rfc_message_id
+    if send_key:
+        doc["send_key"] = send_key
+        write_result = await database.campaign_messages_collection.update_one(
+            {"send_key": send_key},
+            {"$setOnInsert": doc},
+            upsert=True,
+        )
+        inserted = write_result.upserted_id is not None
+        transitioned_to_sent = False
+        if not inserted and status == "sent":
+            sent_fields = {
+                "status": "sent",
+                "provider_message_id": provider_message_id,
+                "sent_at": datetime.utcnow(),
+            }
+            if provider_thread_id:
+                sent_fields["provider_thread_id"] = provider_thread_id
+            if provider:
+                sent_fields["provider"] = provider
+            if rfc_message_id:
+                sent_fields["rfc_message_id"] = rfc_message_id
+            transition = await database.campaign_messages_collection.update_one(
+                {"send_key": send_key, "status": {"$ne": "sent"}},
+                {"$set": sent_fields},
+            )
+            transitioned_to_sent = transition.modified_count > 0
+    else:
+        await database.campaign_messages_collection.insert_one(doc)
+        inserted = True
+        transitioned_to_sent = False
 
     # Update campaign counter
     counter_map = {
         "email": "emails_sent",
         "connection_request": "linkedin_connections_sent",
         "inmail": "linkedin_inmails_sent",
-        "linkedin_message": "linkedin_replies",
+        "linkedin_message": "linkedin_messages_sent",
     }
     counter = counter_map.get(step_def["action"])
-    if counter and status == "sent":
+    if (inserted or transitioned_to_sent) and counter and status == "sent":
         await database.campaigns_collection.update_one(
-            {"_id": campaign["_id"]},
+            {
+                "_id": campaign["_id"],
+                "account_id": {"$in": _account_values(enrollment.get("account_id"))},
+            },
             {"$inc": {counter: 1}},
         )
+
+    # A LinkedIn DM/InMail send never created a conversations doc, so the reply
+    # webhook had nothing to match provider_thread_id against. Connection
+    # requests have no chat yet at send time, so they open a placeholder thread
+    # keyed on ``prospect:<id>``; get_or_create_conversation adopts that
+    # placeholder once the real chat id turns up. Without this the inbox never
+    # shows campaign-sent connection requests at all, while the manual send
+    # path in routes/linkedin_outreach.py does create them.
+    if (
+        status == "sent"
+        and step_def.get("channel") == "linkedin"
+        and (provider_thread_id or step_def.get("action") == "connection_request")
+    ):
+        try:
+            from services.conversation_service import record_outbound_linkedin_message
+            await record_outbound_linkedin_message(
+                prospect_id=str(enrollment["prospect_id"]),
+                prospect_name=(prospect or {}).get("full_name"),
+                prospect_company=(prospect or {}).get("company_name"),
+                message_text=content_text,
+                unipile_chat_id=provider_thread_id,
+                unipile_message_id=provider_message_id,
+                outreach_type=step_def.get("action"),
+                account_id=str(enrollment.get("account_id", "")),
+                provider_account_id=provider_account_id,
+            )
+        except Exception as _conv_e:
+            logger.warning(
+                "Failed to record conversation for LinkedIn send (enrollment %s): %s",
+                enrollment.get("_id"), _conv_e,
+            )
+
+    # Campaign emails were never recorded as conversations either, so a sent
+    # email stayed invisible in the inbox until the prospect replied and the
+    # poller created the thread. Record it here so the outbound message is
+    # already in the thread the reply will land on.
+    if status == "sent" and step_def.get("channel") == "email":
+        try:
+            from services.conversation_service import record_outbound_email
+            await record_outbound_email(
+                prospect_id=str(enrollment["prospect_id"]),
+                prospect_name=(prospect or {}).get("full_name"),
+                prospect_email=(prospect or {}).get("email"),
+                prospect_company=(prospect or {}).get("company_name"),
+                subject=subject,
+                body_text=content_text,
+                provider=provider,
+                provider_message_id=provider_message_id,
+                email_message_id=rfc_message_id,
+                account_id=str(enrollment.get("account_id", "")),
+                provider_account_id=provider_account_id,
+                provider_thread_id=provider_thread_id,
+            )
+        except Exception as _conv_e:
+            logger.warning(
+                "Failed to record conversation for email send (enrollment %s): %s",
+                enrollment.get("_id"), _conv_e,
+            )
 
 
 async def advance_enrollment(enrollment: dict, campaign: dict):
@@ -458,7 +547,7 @@ async def _execute_smart_enrollment(
     Execute outreach for a smart campaign enrollment using pre-generated messages.
     channel: "email" | "linkedin_connection" | "linkedin_inmail"
     """
-    from services.daily_cap_service import reserve_slot, release_slot, reserve_sender_slot, release_sender_slot as _release_sender_slot
+    from services.daily_cap_service import reserve_slot, release_slot, reserve_sender_slot
     from services import flow_engine
 
     # Short-circuit for terminal prospect/enrollment states
@@ -510,24 +599,20 @@ async def _execute_smart_enrollment(
         if current_node:
             channel = current_node.get("channel", channel)
 
-    # Re-check channel availability at execution time (sender may have disconnected)
-    channel_available = False
+    # A provider-confirmed replay finalizes local state without requiring the
+    # sender to still be connected. A new/retry dispatch must resolve the exact
+    # tenant-owned sender before reserving that mailbox's cap.
+    existing_attempt = await _existing_send_attempt(campaign, enrollment, channel)
+    cap_already_reserved = _attempt_owns_daily_cap(existing_attempt)
+    resolved_sender = None
     if channel == "email":
-        email_account_id = campaign.get("email_account_id")
-        if email_account_id:
-            email_acc = await database.email_accounts_collection.find_one(
-                {"_id": ObjectId(str(email_account_id))},
-                {"status": 1},
-            )
-            channel_available = bool(email_acc and email_acc.get("status") in ("connected", "active"))
+        resolved_sender = await _get_email_account_for_campaign(campaign, enrollment)
     elif channel in ("linkedin_connection", "linkedin_inmail", "linkedin_message"):
-        linkedin_account_id = campaign.get("linkedin_account_id")
-        if linkedin_account_id:
-            li_acc = await database.linkedin_accounts_collection.find_one(
-                {"_id": ObjectId(str(linkedin_account_id))},
-                {"unipile_status": 1},
-            )
-            channel_available = bool(li_acc and li_acc.get("unipile_status") in ("OK", "CONNECTING"))
+        resolved_sender = await _get_linkedin_account_for_campaign(campaign, enrollment)
+    channel_available = bool(resolved_sender) or bool(
+        existing_attempt
+        and existing_attempt.get("state") == SendAttemptState.SENT.value
+    )
 
     if not channel_available:
         skip_count = enrollment.get("consecutive_channel_skip_count", 0) + 1
@@ -548,8 +633,11 @@ async def _execute_smart_enrollment(
         logger.info(f"Smart enrollment {enrollment['_id']} deferred 1h — sender channel {channel!r} unavailable")
         return {"status": "deferred", "reason": "sender_unavailable"}
 
-    # Reserve a daily cap slot (campaign-level)
-    slot_reserved = await reserve_slot(database.db, str(enrollment["campaign_id"]), channel)
+    # Reserve each touch once. Replays of a prepared/in-flight/ambiguous/sent
+    # attempt use the original reservation and never double-count capacity.
+    slot_reserved = cap_already_reserved or await reserve_slot(
+        database.db, enrollment["campaign_id"], channel
+    )
     if not slot_reserved:
         # Defer to tomorrow at 9am UTC
         from datetime import timezone, timedelta
@@ -564,18 +652,19 @@ async def _execute_smart_enrollment(
 
     # Also enforce sender-level daily cap (prevents multiple campaigns from
     # collectively overrunning a single LinkedIn/email account's daily limit)
-    _sender_id = None
-    if channel in ("linkedin_connection", "linkedin_inmail", "linkedin_message"):
-        _sender_id = str(campaign.get("linkedin_account_id") or "")
-    elif channel == "email":
-        _sender_id = str(campaign.get("email_account_id") or "")
-    if _sender_id:
-        sender_slot_reserved = await reserve_sender_slot(database.db, _sender_id, channel)
+    _sender_id = str(
+        (existing_attempt or {}).get("sender_record_id")
+        or (resolved_sender or {}).get("_id")
+        or ""
+    )
+    if _sender_id and not cap_already_reserved:
+        sender_slot_reserved = await reserve_sender_slot(
+            database.db, _sender_id, channel, sender=resolved_sender
+        )
         if not sender_slot_reserved:
-            await release_slot(database.db, str(enrollment["campaign_id"]), channel)
-            from datetime import timezone as _tz, timedelta as _td
-            tomorrow = datetime.now(_tz.utc) + _td(days=1)
-            tomorrow = tomorrow.replace(hour=9, minute=0, second=0, microsecond=0, tzinfo=None)
+            await release_slot(database.db, enrollment["campaign_id"], channel)
+            from services.daily_cap_service import get_sender_defer_until
+            tomorrow = await get_sender_defer_until(database.db, _sender_id, channel)
             await database.campaign_enrollments_collection.update_one(
                 {"_id": enrollment["_id"]},
                 {"$set": {"next_action_at": tomorrow}},
@@ -613,7 +702,6 @@ async def _execute_smart_enrollment(
     try:
         if channel == "email":
             cold_email = msgs.get("cold_email", {})
-            # A/B subject selection: randomly pick subject_a or subject_b when both exist
             import random as _random
             subject_a = cold_email.get("subject_a", "")
             subject_b = cold_email.get("subject_b", "")
@@ -624,100 +712,18 @@ async def _execute_smart_enrollment(
                 _ab_variant = "A"
                 subject = subject_a or subject_b
             body = cold_email.get("body", "")
-
-            email_account_id = campaign.get("email_account_id")
-            if not email_account_id:
-                logger.warning(f"Smart campaign {campaign['_id']} has no email_account_id")
-                return
-            email_account = await database.email_accounts_collection.find_one(
-                {"_id": ObjectId(str(email_account_id))}
-            )
-            if not email_account:
-                logger.warning(f"Email account {email_account_id} not found")
-                return
-            to_email = prospect.get("email", "")
-            if not to_email:
-                logger.warning(f"Prospect {prospect['_id']} has no email for smart campaign email send")
-                return
-
-            # Generate open-tracking token for non-SendGrid providers
-            tracking_token = None
-            if email_account.get("provider", "sendgrid") != "sendgrid":
-                try:
-                    from routes.email_tracking import create_tracking_token
-                    tracking_token = await create_tracking_token(
-                        prospect_id=str(prospect["_id"]),
-                        email_account_id=str(email_account_id),
-                        campaign_id=str(campaign["_id"]),
-                    )
-                except Exception as tok_err:
-                    logger.warning(f"Failed to create tracking token (smart): {tok_err}")
-
-            send_result = await send_email_via_account(
-                email_account,
-                to_email,
-                subject,
-                body,
-                tracking_token=tracking_token,
-                prospect_id=str(prospect["_id"]),
-                campaign_id=str(campaign["_id"]),
-            )
-            provider_message_id = send_result["message_id"] if send_result else None
-            status = "sent" if provider_message_id else "failed"
-
-        elif channel == "linkedin_connection":
-            note = msgs.get("linkedin_connection", {}).get("note", "")
-            body = note
-
-            linkedin_account = await _get_linkedin_account_for_campaign(campaign, enrollment)
-            if not linkedin_account:
-                logger.warning(f"No LinkedIn account for smart campaign {campaign['_id']}")
-                return
-
-            unipile = get_unipile_service()
-            linkedin_url = prospect.get("linkedin", "") or prospect.get("linkedin_url", "")
-            if not linkedin_url:
-                logger.warning(f"Prospect {prospect['_id']} has no LinkedIn URL for connection request")
-                return
-
-            result = await unipile.send_connection_request_async(
-                provider_id=linkedin_account.get("profile_id", ""),
-                profile_url=linkedin_url,
-                message=note,
-            )
-            provider_message_id = str(result) if result else None
-            status = "sent" if result else "failed"
-
-            if status == "sent":
-                await database.prospects_collection.update_one(
-                    {"_id": prospect["_id"]},
-                    {"$set": {"connection_request_sent_at": now}},
-                )
-
+        elif channel in ("linkedin_connection", "linkedin_message"):
+            body = msgs.get("linkedin_connection", {}).get("note", "")
         elif channel == "linkedin_inmail":
             inmail = msgs.get("linkedin_inmail", {})
             subject = inmail.get("subject", "")
             body = inmail.get("body", "")
 
-            linkedin_account = await _get_linkedin_account_for_campaign(campaign, enrollment)
-            if not linkedin_account:
-                logger.warning(f"No LinkedIn account for smart campaign {campaign['_id']}")
-                return
-
-            unipile = get_unipile_service()
-            linkedin_url = prospect.get("linkedin", "") or prospect.get("linkedin_url", "")
-            if not linkedin_url:
-                logger.warning(f"Prospect {prospect['_id']} has no LinkedIn URL for InMail")
-                return
-
-            result = await unipile.send_inmail_async(
-                provider_id=linkedin_account.get("profile_id", ""),
-                profile_url=linkedin_url,
-                subject=subject,
-                message=body,
-            )
-            provider_message_id = str(result) if result else None
-            status = "sent" if result else "failed"
+        status, provider_message_id, send_result = await _send_via_channel(
+            campaign, enrollment, prospect, channel, subject, body,
+        )
+        subject = send_result.get("frozen_subject", subject)
+        body = send_result.get("frozen_body", body)
 
     except Exception as e:
         logger.error(
@@ -731,21 +737,44 @@ async def _execute_smart_enrollment(
         "email": "email",
         "linkedin_connection": "connection_request",
         "linkedin_inmail": "inmail",
+        "linkedin_message": "linkedin_message",
     }
     _channel_to_msg_channel = {
         "email": "email",
         "linkedin_connection": "linkedin",
         "linkedin_inmail": "linkedin",
+        "linkedin_message": "linkedin",
     }
     step_def = {
         "channel": _channel_to_msg_channel.get(channel, "email"),
         "action": _channel_to_action.get(channel, "email"),
     }
 
+    _send_result = locals().get("send_result") or {}
     await record_campaign_message(
         enrollment, campaign, step_def, body, subject, provider_message_id, status,
+        provider_thread_id=_send_result.get("thread_ref"),
+        provider=_send_result.get("provider"),
+        rfc_message_id=_send_result.get("rfc_message_id"),
         ab_variant=locals().get("_ab_variant"),
+        send_key=_send_result.get("send_key"),
+        prospect=prospect,
+        provider_account_id=_send_result.get("provider_account_id"),
+        content_html=_send_result.get("content_html"),
     )
+
+    if status == "ambiguous":
+        await database.campaign_enrollments_collection.update_one(
+            {"_id": enrollment["_id"]},
+            {"$set": {
+                "status": "send_ambiguous",
+                "next_action_at": None,
+                "ambiguous_send_key": _send_result.get("send_key"),
+                "last_transition_reason": "provider_outcome_requires_reconciliation",
+                "last_activity_at": now,
+            }},
+        )
+        return {"status": "ambiguous", "send_key": _send_result.get("send_key")}
 
     if status == "sent":
         # Use flow_engine to transition to next state if flow is configured
@@ -838,10 +867,8 @@ async def _execute_smart_enrollment(
             except Exception as _sync_e:
                 logger.warning("used_by sync failed for enrollment %s: %s", enrollment.get("_id"), _sync_e)
     else:
-        # On failure: release cap slot and transition flow state via send_failed
-        await release_slot(database.db, str(enrollment["campaign_id"]), channel)
-        if _sender_id:
-            await _release_sender_slot(database.db, _sender_id, channel)
+        # On failure: release cap slot (once per attempt) and transition flow state via send_failed
+        await _release_cap_slots_once(_send_result.get("send_key"), enrollment["campaign_id"], channel, _sender_id)
         if flow and flow_state and not flow_engine.is_stopped(flow_state):
             _prospect_for_flow = await database.prospects_collection.find_one({"_id": enrollment["prospect_id"]})
             new_flow_state = flow_engine.transition(flow_state, flow, "send_failed", _prospect_for_flow or {})
@@ -903,20 +930,681 @@ async def _execute_smart_enrollment(
 
 
 async def _get_linkedin_account_for_campaign(campaign: dict, enrollment: dict) -> Optional[dict]:
-    """Fetch the LinkedIn account for a campaign, falling back to account default."""
+    """Fetch exactly one connected sender owned by the enrollment tenant."""
+    tenant_filter = {"$in": _account_values(enrollment.get("account_id"))}
     linkedin_account_id = campaign.get("linkedin_account_id")
     if linkedin_account_id:
         return await database.linkedin_accounts_collection.find_one(
-            {"_id": ObjectId(str(linkedin_account_id))}
+            {
+                "_id": ObjectId(str(linkedin_account_id)),
+                "account_id": tenant_filter,
+                "unipile_status": "OK",
+                "unipile_account_id": {"$exists": True, "$nin": [None, ""]},
+            }
         )
-    return await database.linkedin_accounts_collection.find_one(
-        {"account_id": enrollment["account_id"], "is_default": True}
+    candidates = await database.linkedin_accounts_collection.find(
+        {
+            "account_id": tenant_filter,
+            "is_default": True,
+            "unipile_status": "OK",
+            "unipile_account_id": {"$exists": True, "$nin": [None, ""]},
+        }
+    ).limit(2).to_list(2)
+    return candidates[0] if len(candidates) == 1 else None
+
+
+async def _get_email_account_for_campaign(campaign: dict, enrollment: dict) -> Optional[dict]:
+    email_account_id = campaign.get("email_account_id")
+    if not email_account_id:
+        return None
+    return await database.email_accounts_collection.find_one(
+        {
+            "_id": ObjectId(str(email_account_id)),
+            "account_id": {"$in": _account_values(enrollment.get("account_id"))},
+            "status": {"$in": ["connected", "active"]},
+        }
     )
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# Branching sequence campaigns (multi-touch DAG) — see services/sequence_service.py
+# ═══════════════════════════════════════════════════════════════════════════
+
+def _seq_extract_subject_body(engine_channel: str, node_msg: Optional[dict], classic_msg: Optional[dict]) -> tuple[str, str]:
+    """Resolve (subject, body) for a touch from either a per-node message
+    (generated_messages_by_step[node_id]) or the legacy flat generated_messages.
+
+    A thin adapter over the message generator's output shapes — kept in the
+    engine so campaign_message_generator_service is not modified.
+    """
+    if node_msg:
+        return node_msg.get("subject", "") or "", node_msg.get("body", "") or ""
+    if classic_msg:
+        if engine_channel == "email":
+            ce = classic_msg.get("cold_email", {})
+            return (ce.get("subject_a") or ce.get("subject") or ""), (ce.get("body") or "")
+        if engine_channel in ("linkedin_connection", "linkedin_message"):
+            note = classic_msg.get("linkedin_connection", {}).get("note", "")
+            return "", note
+        if engine_channel == "linkedin_inmail":
+            im = classic_msg.get("linkedin_inmail", {})
+            return im.get("subject", ""), im.get("body", "")
+    return "", ""
+
+
+async def _generate_sequence_node_message(campaign: dict, enrollment: dict, prospect: dict, node: dict) -> None:
+    """Lazily generate the message for a sequence node when it becomes current.
+
+    Reuses campaign_message_generator_service.generate_message_for_node (which we
+    call but do not edit). The contract node uses channel names like "inmail";
+    we adapt to the engine channel the generator understands.
+    """
+    from services import sequence_service as seq
+    from services.campaign_message_generator_service import generate_message_for_node
+
+    gen_node = {
+        "id": node.get("id"),
+        "channel": seq.engine_channel(node.get("channel")),
+        "message_intent": node.get("message_intent"),
+        # Optional per-node authoring hints from the sequence builder. A hard
+        # subject/body override is applied at send time; guidance steers the AI.
+        "subject_template": node.get("subject"),
+        "guidance": node.get("guidance"),
+    }
+
+    # Build prior-step context from already-generated node messages.
+    by_step = enrollment.get("generated_messages_by_step") or {}
+    prior_step_messages = []
+    for nid, msg in by_step.items():
+        prior_step_messages.append({
+            "channel": msg.get("channel", ""),
+            "subject": msg.get("subject", ""),
+            "body_excerpt": (msg.get("body") or "")[:150],
+        })
+
+    await generate_message_for_node(
+        campaign=campaign,
+        enrollment=enrollment,
+        prospect=prospect,
+        node=gen_node,
+        prior_step_messages=prior_step_messages,
+    )
+
+
+async def _send_via_channel(
+    campaign: dict,
+    enrollment: dict,
+    prospect: dict,
+    channel: str,
+    subject: str,
+    body: str,
+) -> tuple[str, Optional[str], dict]:
+    """Durably dispatch one touch and return its persisted provider outcome."""
+    identity = _send_attempt_identity(campaign, enrollment, channel)
+    service = SendAttemptService(database.send_attempts_collection)
+    payload = {
+        "campaign_id": str(campaign["_id"]),
+        "prospect_id": str(prospect["_id"]),
+        "channel": channel,
+        "subject": subject,
+        "body": body,
+    }
+
+    async def _preflight():
+        if channel == "email":
+            sender = await _get_email_account_for_campaign(campaign, enrollment)
+            recipient = prospect.get("email", "")
+            if not sender:
+                raise ValueError("No tenant-owned connected email sender")
+            if not recipient:
+                raise ValueError("Prospect has no email")
+            return {
+                "sender": sender,
+                "recipient": recipient,
+                "_attempt_metadata": {
+                    "provider": sender.get("provider"),
+                    "provider_account_id": str(sender["_id"]),
+                    "sender_record_id": str(sender["_id"]),
+                },
+            }
+        if channel in ("linkedin_connection", "linkedin_message", "linkedin_inmail"):
+            sender = await _get_linkedin_account_for_campaign(campaign, enrollment)
+            profile_url = prospect.get("linkedin", "") or prospect.get("linkedin_url", "")
+            if not sender:
+                raise ValueError("No tenant-owned connected LinkedIn sender")
+            if not profile_url:
+                raise ValueError("Prospect has no LinkedIn URL")
+            return {
+                "sender": sender,
+                "profile_url": profile_url,
+                "client": UnipileClient(account_id=str(sender["unipile_account_id"])),
+                "_attempt_metadata": {
+                    "provider": "unipile",
+                    "provider_account_id": str(sender["unipile_account_id"]),
+                    "sender_record_id": str(sender["_id"]),
+                },
+            }
+        raise ValueError(f"Unsupported channel: {channel}")
+
+    async def _provider_call(context: dict) -> dict | None:
+        resolved = context["resolved"]
+        frozen = context["payload"]
+        frozen_subject = frozen.get("subject", "")
+        frozen_body = frozen.get("body", "")
+        if channel == "email":
+            return await send_email_via_account(
+                resolved["sender"], resolved["recipient"], frozen_subject, frozen_body,
+                prospect_id=str(prospect["_id"]), campaign_id=str(campaign["_id"]),
+            )
+        client: UnipileClient = resolved["client"]
+        profile_url = resolved["profile_url"]
+        if channel == "linkedin_connection":
+            raw = await client.send_connection_request(profile_url, frozen_body or None)
+        elif channel == "linkedin_message":
+            raw = await client.start_new_chat(profile_url, frozen_body)
+        else:
+            raw = await client.send_inmail(
+                profile_url, frozen_body, frozen_subject or None
+            )
+        if not raw:
+            return None
+        return {
+            "provider": "unipile",
+            "message_id": raw.get("message_id") or raw.get("id"),
+            "thread_ref": raw.get("chat_id"),
+            "raw": raw,
+        }
+
+    attempt = await service.dispatch(
+        identity=identity,
+        channel=channel,
+        payload=payload,
+        worker_id=ENGINE_WORKER_ID,
+        before_provider=_preflight,
+        provider_call=_provider_call,
+    )
+    attempt_state = attempt.get("state")
+    result = attempt.get("provider_result") or {}
+    result["send_key"] = identity.send_key
+    result["provider_account_id"] = attempt.get("provider_account_id")
+    frozen_payload = attempt.get("payload") or {}
+    result["frozen_subject"] = frozen_payload.get("subject", subject)
+    result["frozen_body"] = frozen_payload.get("body", body)
+    if attempt_state == SendAttemptState.SENT.value:
+        pmid = result.get("message_id")
+        return "sent", str(pmid) if pmid else None, result
+    if attempt_state in {
+        SendAttemptState.AMBIGUOUS.value,
+        SendAttemptState.DISPATCHING.value,
+    }:
+        return "ambiguous", None, result
+    return "failed", None, result
+
+
+async def _seq_detect_reply(enrollment: dict, prospect: dict) -> bool:
+    """Detect whether the prospect has replied on any channel (backstop check).
+
+    The reply-webhook / poller paths stamp sequence_state.stopped_reason directly,
+    so this is a defensive re-check at timeout evaluation time.
+    """
+    if prospect.get("status") == "replied":
+        return True
+    try:
+        state_doc = await database.prospect_state_collection.find_one(
+            {
+                "account_id": str(enrollment.get("account_id", "")),
+                "prospect_id": str(enrollment.get("prospect_id", "")),
+            },
+            {"status": 1},
+        )
+        if state_doc and state_doc.get("status") == "replied":
+            return True
+    except Exception:
+        pass
+    # Inbound message in the conversation after our last send
+    last_sent = (enrollment.get("sequence_state") or {}).get("last_sent_at")
+    try:
+        conv = await database.conversations_collection.find_one(
+            {
+                "account_id": {
+                    "$in": _account_values(enrollment.get("account_id"))
+                },
+                "prospect_id": {
+                    "$in": [
+                        str(enrollment.get("prospect_id", "")),
+                        enrollment.get("prospect_id"),
+                    ]
+                },
+            },
+        )
+        if conv:
+            for m in conv.get("messages", []):
+                if m.get("direction") != "inbound":
+                    continue
+                ts = m.get("created_at") or m.get("timestamp")
+                if last_sent is None or (ts is not None and ts > last_sent):
+                    return True
+    except Exception:
+        pass
+    return False
+
+
+def _seq_detect_accepted(prospect: dict, enrollment: dict) -> bool:
+    """Detect whether the prospect accepted the connection request since our last send."""
+    accepted_at = (enrollment.get("linkedin_activity") or {}).get("connection_accepted_at")
+    if not accepted_at:
+        return False
+    last_sent = (enrollment.get("sequence_state") or {}).get("last_sent_at")
+    if last_sent is not None and isinstance(accepted_at, datetime) and isinstance(last_sent, datetime):
+        return accepted_at >= last_sent - timedelta(minutes=1)
+    return True
+
+
+async def _complete_sequence_enrollment(enrollment: dict, campaign: dict, now: datetime, stopped_reason: str) -> None:
+    """Terminate a sequence enrollment, updating counters + used_by lifecycle.
+
+    Status mapping: ``replied`` → "replied"; a sequence exhausted with no
+    response (``max_touches`` / ``sequence_end``) → "not_replied" (terminal —
+    the prospect was contacted but never answered); every other reason (e.g.
+    ``suppressed``) keeps the legacy "completed".
+    """
+    from services import sequence_service as seq
+
+    if stopped_reason == seq.STOP_REPLIED:
+        status = "replied"
+    elif stopped_reason in (seq.STOP_MAX_TOUCHES, seq.STOP_SEQUENCE_END):
+        status = "not_replied"
+    else:
+        status = "completed"
+    await database.campaign_enrollments_collection.update_one(
+        {"_id": enrollment["_id"]},
+        {"$set": {
+            "status": status,
+            "completed_at": now,
+            "last_activity_at": now,
+            "next_action_at": None,
+            "sequence_state.stopped_reason": stopped_reason,
+            "sequence_state.phase": "stopped",
+            "sequence_state.next_action_at": None,
+        }},
+    )
+    inc = {"active_count": -1}
+    if status == "replied":
+        inc["replied_count"] = 1
+    elif status == "not_replied":
+        inc["not_replied_count"] = 1
+    else:
+        inc["completed_count"] = 1
+    await database.campaigns_collection.update_one({"_id": campaign["_id"]}, {"$inc": inc})
+
+    # ── Event-driven cascade rotation ──
+    # When the primary of a company cascade group exhausts its sequence without
+    # a reply, wake the next backup prospect for that company. Fail-soft: a
+    # rotation error must never break enrollment termination.
+    if status == "not_replied" and enrollment.get("cascade_group_id"):
+        try:
+            from services.cascade_rotation_service import activate_next_backup
+            activated = await activate_next_backup(enrollment)
+            if activated:
+                logger.info(
+                    "Cascade rotation: activated backup enrollment %s (group=%s pos=%s) "
+                    "after primary %s went not_replied",
+                    activated.get("_id"), enrollment.get("cascade_group_id"),
+                    activated.get("cascade_position"), enrollment.get("_id"),
+                )
+        except Exception as _casc_e:
+            logger.warning(
+                "Cascade rotation failed for enrollment %s (group=%s): %s",
+                enrollment.get("_id"), enrollment.get("cascade_group_id"), _casc_e,
+            )
+    try:
+        from services.prospect_search_service import update_used_by_status
+        await update_used_by_status(
+            database.db,
+            account_id=str(enrollment.get("account_id", "")),
+            prospect_id=str(enrollment.get("prospect_id", "")),
+            campaign_id=str(enrollment.get("campaign_id", "")),
+            new_status="completed",
+            completed_at=now,
+        )
+    except Exception as _sync_e:
+        logger.warning("used_by sync failed for sequence enrollment %s: %s", enrollment.get("_id"), _sync_e)
+
+
+async def _persist_sequence_state(enrollment: dict, campaign: dict, new_state: dict, now: datetime) -> None:
+    """Write an advanced sequence_state back to the enrollment (and terminate if stopped)."""
+    if new_state.get("stopped_reason"):
+        await _complete_sequence_enrollment(enrollment, campaign, now, new_state["stopped_reason"])
+        return
+    update_fields = {
+        "sequence_state": new_state,
+        "next_action_at": new_state.get("next_action_at"),
+        "last_activity_at": now,
+        "status": "active",
+        "current_step": int(enrollment.get("current_step", 0)) + 1,
+    }
+    await database.campaign_enrollments_collection.update_one(
+        {"_id": enrollment["_id"]},
+        {"$set": update_fields},
+    )
+
+
+async def _execute_sequence_enrollment(enrollment: dict, campaign: dict, prospect: dict) -> None:
+    """Execute one tick for a branching-sequence enrollment.
+
+    Two phases per node:
+      * ``pending_send`` — deliver the current node's touch (reserving daily caps,
+        lazily generating the message if needed), then advance on ``sent``.
+      * ``awaiting`` — the timeout fired; check reply / acceptance signals and
+        advance via ``replied`` / ``accepted`` / ``no_reply_timeout``.
+    """
+    from services import sequence_service as seq
+    from services.daily_cap_service import (
+        reserve_slot, release_slot, reserve_sender_slot,
+        release_sender_slot as _release_sender_slot,
+    )
+
+    now = datetime.utcnow()
+    state = enrollment.get("sequence_state") or {}
+    graph = campaign.get("sequence_graph") or {}
+
+    # Already stopped — finalize and exit.
+    if state.get("stopped_reason"):
+        await _complete_sequence_enrollment(enrollment, campaign, now, state["stopped_reason"])
+        return
+
+    node = seq.get_node(graph, state.get("current_node_id"))
+    if not node:
+        await _complete_sequence_enrollment(enrollment, campaign, now, "sequence_end")
+        return
+
+    phase = state.get("phase", "pending_send")
+    node_engine_channel = seq.engine_channel(node.get("channel"))
+
+    # ── AWAITING: evaluate signals at the timeout ──
+    if phase == "awaiting":
+        if await _seq_detect_reply(enrollment, prospect):
+            new_state = seq.advance_sequence(enrollment, campaign, "replied", now=now)
+        elif node_engine_channel == "linkedin_connection" and _seq_detect_accepted(prospect, enrollment):
+            new_state = seq.advance_sequence(enrollment, campaign, "accepted", now=now)
+        else:
+            new_state = seq.advance_sequence(enrollment, campaign, "no_reply_timeout", now=now)
+        await _persist_sequence_state(enrollment, campaign, new_state, now)
+        return
+
+    # ── PENDING_SEND: deliver the current node's touch ──
+
+    # Suppression check — opt out if the prospect is suppressed.
+    try:
+        from services.suppression_service import is_suppressed
+        if await is_suppressed(str(enrollment.get("account_id", "")), prospect):
+            await database.campaign_enrollments_collection.update_one(
+                {"_id": enrollment["_id"]},
+                {"$set": {
+                    "status": "opted_out",
+                    "last_transition_reason": "suppressed",
+                    "sequence_state.stopped_reason": "suppressed",
+                    "sequence_state.phase": "stopped",
+                    "sequence_state.next_action_at": None,
+                }},
+            )
+            await database.campaigns_collection.update_one(
+                {"_id": campaign["_id"]}, {"$inc": {"active_count": -1, "opted_out_count": 1}},
+            )
+            return
+    except Exception as _sup_err:
+        logger.warning(f"Suppression check failed for sequence enrollment {enrollment['_id']}: {_sup_err}")
+
+    existing_attempt = await _existing_send_attempt(
+        campaign, enrollment, node_engine_channel
+    )
+    cap_already_reserved = _attempt_owns_daily_cap(existing_attempt)
+
+    resolved_sender = None
+    if not (
+        existing_attempt
+        and existing_attempt.get("state") == SendAttemptState.SENT.value
+    ):
+        if node_engine_channel == "email":
+            resolved_sender = await _get_email_account_for_campaign(campaign, enrollment)
+        elif node_engine_channel in {
+            "linkedin_connection",
+            "linkedin_inmail",
+            "linkedin_message",
+        }:
+            resolved_sender = await _get_linkedin_account_for_campaign(campaign, enrollment)
+        if not resolved_sender:
+            skip_count = enrollment.get("consecutive_channel_skip_count", 0) + 1
+            if skip_count >= 3:
+                await database.campaign_enrollments_collection.update_one(
+                    {"_id": enrollment["_id"]},
+                    {"$set": {
+                        "status": "skipped_no_channel",
+                        "consecutive_channel_skip_count": skip_count,
+                        "last_transition_reason": "sender_unavailable",
+                    }},
+                )
+                logger.warning(f"Sequence enrollment {enrollment['_id']} marked skipped_no_channel after {skip_count} unavailable-sender skips")
+                return
+            await database.campaign_enrollments_collection.update_one(
+                {"_id": enrollment["_id"]},
+                {"$set": {
+                    "next_action_at": now + timedelta(hours=1),
+                    "sequence_state.next_action_at": now + timedelta(hours=1),
+                    "last_transition_reason": "sender_unavailable",
+                    "consecutive_channel_skip_count": skip_count,
+                }},
+            )
+            return
+
+    # Reserve a campaign-level daily-cap slot once per deterministic touch.
+    if not cap_already_reserved and not await reserve_slot(
+        database.db, enrollment["campaign_id"], node_engine_channel
+    ):
+        from datetime import timezone as _tz
+        tomorrow = datetime.now(_tz.utc) + timedelta(days=1)
+        tomorrow = tomorrow.replace(hour=9, minute=0, second=0, microsecond=0, tzinfo=None)
+        await database.campaign_enrollments_collection.update_one(
+            {"_id": enrollment["_id"]},
+            {"$set": {"next_action_at": tomorrow, "sequence_state.next_action_at": tomorrow}},
+        )
+        logger.info(f"Sequence enrollment {enrollment['_id']} deferred to tomorrow (daily cap hit for {node_engine_channel})")
+        return
+
+    # Enforce the sender-level daily cap too.
+    sender_id = str(
+        (existing_attempt or {}).get("sender_record_id")
+        or (resolved_sender or {}).get("_id")
+        or ""
+    )
+    if sender_id and not cap_already_reserved:
+        if not await reserve_sender_slot(
+            database.db, sender_id, node_engine_channel, sender=resolved_sender
+        ):
+            await release_slot(database.db, enrollment["campaign_id"], node_engine_channel)
+            from services.daily_cap_service import get_sender_defer_until
+            tomorrow = await get_sender_defer_until(
+                database.db, sender_id, node_engine_channel
+            )
+            await database.campaign_enrollments_collection.update_one(
+                {"_id": enrollment["_id"]},
+                {"$set": {"next_action_at": tomorrow, "sequence_state.next_action_at": tomorrow}},
+            )
+            logger.info(f"Sequence enrollment {enrollment['_id']} deferred to tomorrow (sender cap hit for {node_engine_channel})")
+            return
+
+    # Ensure a message exists for this node. First touch is generated for all
+    # prospects at approval (generated_messages); later nodes are generated
+    # lazily here when the node becomes current.
+    node_id = node.get("id")
+    # Any route's start node is a "first touch" whose copy was generated at
+    # approval time (flat generated_messages); downstream nodes generate lazily.
+    is_start = (node_id in seq.get_start_node_ids(graph))
+    node_msg = (enrollment.get("generated_messages_by_step") or {}).get(node_id)
+    if not node_msg:
+        if is_start:
+            # Fall back to the legacy flat message written at approval time.
+            pass
+        else:
+            try:
+                await _generate_sequence_node_message(campaign, enrollment, prospect, node)
+                refreshed = await database.campaign_enrollments_collection.find_one({"_id": enrollment["_id"]})
+                if refreshed:
+                    enrollment = refreshed
+                    node_msg = (enrollment.get("generated_messages_by_step") or {}).get(node_id)
+            except Exception as _gen_err:
+                logger.warning(f"Sequence message gen failed for enrollment {enrollment['_id']} node {node_id}: {_gen_err}")
+                await release_slot(database.db, enrollment["campaign_id"], node_engine_channel)
+                if sender_id:
+                    await _release_sender_slot(database.db, sender_id, node_engine_channel)
+                _gen_fails = int(enrollment.get("consecutive_failures") or 0) + 1
+                _gen_fail_set: dict = {"last_activity_at": now}
+                if _gen_fails >= 5:
+                    _gen_fail_set["next_action_at"] = None
+                    _gen_fail_set["status"] = "failed"
+                    _gen_fail_set["last_transition_reason"] = "max_message_gen_retries"
+                else:
+                    _gen_fail_set["next_action_at"] = now + timedelta(hours=1)
+                await database.campaign_enrollments_collection.update_one(
+                    {"_id": enrollment["_id"]},
+                    {"$set": _gen_fail_set, "$inc": {"consecutive_failures": 1}},
+                )
+                return
+
+    subject, body = _seq_extract_subject_body(
+        node_engine_channel, node_msg, enrollment.get("generated_messages"),
+    )
+
+    # Per-node manual override: if the sequence builder set explicit copy on this
+    # node, it wins over AI-generated copy (personalized via {{variable}} tokens).
+    override_subject = (node.get("subject") or "").strip()
+    override_body = (node.get("body") or "").strip()
+    if override_body:
+        body = personalize(override_body, prospect)
+    if override_subject:
+        subject = personalize(override_subject, prospect)
+
+    status = "failed"
+    provider_message_id = None
+    send_result: dict = {}
+    try:
+        status, provider_message_id, send_result = await _send_via_channel(
+            campaign, enrollment, prospect, node_engine_channel, subject, body,
+        )
+        subject = send_result.get("frozen_subject", subject)
+        body = send_result.get("frozen_body", body)
+    except Exception as e:
+        logger.error(
+            f"Sequence send error for enrollment {enrollment['_id']} (channel={node_engine_channel}): {e}",
+            exc_info=True,
+        )
+        status = "failed"
+
+    # Record the touch.
+    _channel_to_action = {
+        "email": "email",
+        "linkedin_connection": "connection_request",
+        "linkedin_inmail": "inmail",
+        "linkedin_message": "linkedin_message",
+    }
+    _channel_to_msg_channel = {
+        "email": "email",
+        "linkedin_connection": "linkedin",
+        "linkedin_inmail": "linkedin",
+        "linkedin_message": "linkedin",
+    }
+    step_def = {
+        "channel": _channel_to_msg_channel.get(node_engine_channel, "email"),
+        "action": _channel_to_action.get(node_engine_channel, "email"),
+    }
+    await record_campaign_message(
+        enrollment, campaign, step_def, body, subject, provider_message_id, status,
+        provider_thread_id=send_result.get("thread_ref"),
+        provider=send_result.get("provider"),
+        rfc_message_id=send_result.get("rfc_message_id"),
+        send_key=send_result.get("send_key"),
+        prospect=prospect,
+        provider_account_id=send_result.get("provider_account_id"),
+        content_html=send_result.get("content_html"),
+    )
+
+    if status == "ambiguous":
+        await database.campaign_enrollments_collection.update_one(
+            {"_id": enrollment["_id"]},
+            {"$set": {
+                "status": "send_ambiguous",
+                "next_action_at": None,
+                "sequence_state.next_action_at": None,
+                "ambiguous_send_key": send_result.get("send_key"),
+                "last_transition_reason": "provider_outcome_requires_reconciliation",
+                "last_activity_at": now,
+            }},
+        )
+        return
+
+    if status == "sent":
+        # A connection request must be stamped on the tenant overlay + enrollment,
+        # otherwise connection_tracker_service.check_pending_connections never
+        # picks the prospect up and the graph's "accepted" edge can never fire —
+        # every prospect would silently fall through to the not_accepted timeout.
+        # Mirrors the manual send path in routes/linkedin_outreach.py.
+        if node_engine_channel == "linkedin_connection":
+            try:
+                from services.prospect_activity_state_service import (
+                    record_prospect_activity,
+                )
+                await record_prospect_activity(
+                    account_id=enrollment.get("account_id"),
+                    prospect_id=enrollment.get("prospect_id"),
+                    enrollment_id=enrollment["_id"],
+                    fields={
+                        "status": "contacted",
+                        "connection_request_sent_at": now,
+                    },
+                    event={
+                        "type": "connection_request_sent",
+                        "channel": "linkedin",
+                        "at": now,
+                        "campaign_id": str(campaign["_id"]),
+                        "node_id": node_id,
+                    },
+                )
+            except Exception as _activity_err:
+                logger.warning(
+                    "Failed to record connection_request_sent_at for enrollment %s: %s",
+                    enrollment["_id"], _activity_err,
+                )
+
+        new_state = seq.advance_sequence(enrollment, campaign, "sent", now=now)
+        await _persist_sequence_state(enrollment, campaign, new_state, now)
+    else:
+        # Release reserved slots (once per attempt) and back off (cap consecutive failures).
+        await _release_cap_slots_once(send_result.get("send_key"), enrollment["campaign_id"], node_engine_channel, sender_id)
+        fails = int(enrollment.get("consecutive_failures") or 0) + 1
+        fail_set: dict = {"last_activity_at": now}
+        if fails >= 5:
+            fail_set["next_action_at"] = None
+            fail_set["status"] = "failed"
+            fail_set["last_transition_reason"] = "max_send_retries"
+        else:
+            fail_set["next_action_at"] = now + timedelta(hours=1)
+            fail_set["sequence_state.next_action_at"] = now + timedelta(hours=1)
+        await database.campaign_enrollments_collection.update_one(
+            {"_id": enrollment["_id"]},
+            {"$set": fail_set, "$inc": {"consecutive_failures": 1}},
+        )
 
 
 async def execute_enrollment(enrollment: dict, campaign: dict, prospect: dict):
     """Execute the current step for one enrollment."""
     now = datetime.utcnow()
+
+    # ── Branching sequence campaign (multi-touch DAG) ──
+    # Gated strictly on the presence of a sequence_graph + sequence_state so
+    # legacy campaigns are never routed here.
+    if campaign.get("sequence_graph") and enrollment.get("sequence_state"):
+        await _execute_sequence_enrollment(enrollment, campaign, prospect)
+        return
 
     # ── Smart Campaign (v2): pre-generated messages, single step ──
     smart_channel = enrollment.get("smart_campaign_channel")
@@ -965,116 +1653,82 @@ async def execute_enrollment(enrollment: dict, campaign: dict, prospect: dict):
     subject = personalize(step_def.get("subject_template", ""), prospect, sender_context)
 
     action = step_def.get("action", "email")
+    engine_channel = {
+        "email": "email",
+        "connection_request": "linkedin_connection",
+        "inmail": "linkedin_inmail",
+        "linkedin_message": "linkedin_message",
+    }.get(action, action)
+
+    # Classic steps must respect the same daily caps as smart/sequence
+    # enrollments — without this, a classic campaign can blow past the
+    # campaign- and sender-level daily quotas entirely.
+    from services.daily_cap_service import reserve_slot, release_slot, reserve_sender_slot
+
+    existing_attempt = await _existing_send_attempt(campaign, enrollment, engine_channel)
+    cap_already_reserved = _attempt_owns_daily_cap(existing_attempt)
+
+    resolved_sender = None
+    if engine_channel == "email":
+        resolved_sender = await _get_email_account_for_campaign(campaign, enrollment)
+    elif engine_channel in ("linkedin_connection", "linkedin_inmail", "linkedin_message"):
+        resolved_sender = await _get_linkedin_account_for_campaign(campaign, enrollment)
+
+    slot_reserved = cap_already_reserved or await reserve_slot(
+        database.db, enrollment["campaign_id"], engine_channel
+    )
+    if not slot_reserved:
+        from datetime import timezone as _tz
+        tomorrow = datetime.now(_tz.utc) + timedelta(days=1)
+        tomorrow = tomorrow.replace(hour=9, minute=0, second=0, microsecond=0, tzinfo=None)
+        await database.campaign_enrollments_collection.update_one(
+            {"_id": enrollment["_id"]},
+            {"$set": {"next_action_at": tomorrow}},
+        )
+        logger.info(f"Classic enrollment {enrollment['_id']} deferred to tomorrow (daily cap hit for {engine_channel})")
+        return
+
+    _sender_id = str(
+        (existing_attempt or {}).get("sender_record_id")
+        or (resolved_sender or {}).get("_id")
+        or ""
+    )
+    if _sender_id and not cap_already_reserved:
+        sender_slot_reserved = await reserve_sender_slot(
+            database.db, _sender_id, engine_channel, sender=resolved_sender
+        )
+        if not sender_slot_reserved:
+            await release_slot(database.db, enrollment["campaign_id"], engine_channel)
+            from services.daily_cap_service import get_sender_defer_until
+            tomorrow = await get_sender_defer_until(database.db, _sender_id, engine_channel)
+            await database.campaign_enrollments_collection.update_one(
+                {"_id": enrollment["_id"]},
+                {"$set": {"next_action_at": tomorrow}},
+            )
+            logger.info(f"Classic enrollment {enrollment['_id']} deferred to tomorrow (sender {_sender_id} cap hit for {engine_channel})")
+            return
+
     provider_message_id = None
-    gmail_thread_id = None
-    send_provider = None
     status = "failed"
+    send_result: dict = {}
 
     try:
-        if action == "email":
-            email_account_id = campaign.get("email_account_id")
-            if not email_account_id:
-                logger.warning(f"Campaign {campaign['_id']} has no email_account_id")
-                return
-            email_account = await database.email_accounts_collection.find_one(
-                {"_id": ObjectId(str(email_account_id))}
+        if action == "connection_request":
+            body = personalize(
+                step_def.get("connection_note_template", body), prospect, sender_context
             )
-            if not email_account:
-                logger.warning(f"Email account {email_account_id} not found")
-                return
-
-            to_email = prospect.get("email", "")
-            if not to_email:
-                logger.warning(f"Prospect {prospect['_id']} has no email")
-                return
-
-            # For non-SendGrid providers, generate a tracking token for open detection
-            tracking_token = None
-            provider = email_account.get("provider", "sendgrid")
-            if provider != "sendgrid":
-                try:
-                    from routes.email_tracking import create_tracking_token
-                    tracking_token = await create_tracking_token(
-                        prospect_id=str(prospect["_id"]),
-                        email_account_id=str(email_account_id),
-                        campaign_id=str(campaign["_id"]),
-                    )
-                except Exception as tok_err:
-                    logger.warning(f"Failed to create tracking token: {tok_err}")
-
-            send_result = await send_email_via_account(
-                email_account,
-                to_email,
-                subject,
-                body,
-                tracking_token=tracking_token,
-                prospect_id=str(prospect["_id"]),
-                campaign_id=str(campaign["_id"]),
+        elif action == "inmail":
+            subject = personalize(
+                step_def.get("inmail_subject_template", subject), prospect, sender_context
             )
-            provider_message_id = send_result["message_id"] if send_result else None
-            gmail_thread_id = send_result.get("thread_id") if send_result else None
-            send_provider = send_result.get("provider") if send_result else None
-            status = "sent" if provider_message_id else "failed"
-
-        elif action in ("connection_request", "inmail", "linkedin_message"):
-            linkedin_account_id = campaign.get("linkedin_account_id")
-            if linkedin_account_id:
-                linkedin_account = await database.linkedin_accounts_collection.find_one(
-                    {"_id": ObjectId(str(linkedin_account_id))}
-                )
-            else:
-                linkedin_account = await database.linkedin_accounts_collection.find_one(
-                    {"account_id": enrollment["account_id"], "is_default": True}
-                )
-
-            if not linkedin_account:
-                logger.warning(f"No LinkedIn account for campaign {campaign['_id']}")
-                return
-
-            unipile = get_unipile_service()
-            linkedin_url = prospect.get("linkedin", "") or prospect.get("linkedin_url", "")
-
-            if action == "connection_request":
-                connection_note = personalize(
-                    step_def.get("connection_note_template", body), prospect, sender_context
-                )
-                result = await unipile.send_connection_request_async(
-                    provider_id=linkedin_account.get("profile_id", ""),
-                    profile_url=linkedin_url,
-                    message=connection_note,
-                )
-                provider_message_id = str(result) if result else None
-                status = "sent" if result else "failed"
-                if status == "sent":
-                    await database.prospects_collection.update_one(
-                        {"_id": enrollment["prospect_id"]},
-                        {"$set": {"connection_request_sent_at": datetime.utcnow()}},
-                    )
-
-            elif action == "inmail":
-                inmail_subject = personalize(
-                    step_def.get("inmail_subject_template", subject), prospect, sender_context
-                )
-                inmail_body = personalize(
-                    step_def.get("inmail_body_template", body), prospect, sender_context
-                )
-                result = await unipile.send_inmail_async(
-                    provider_id=linkedin_account.get("profile_id", ""),
-                    profile_url=linkedin_url,
-                    subject=inmail_subject,
-                    message=inmail_body,
-                )
-                provider_message_id = str(result) if result else None
-                status = "sent" if result else "failed"
-
-            elif action == "linkedin_message":
-                result = await unipile.send_message_async(
-                    provider_id=linkedin_account.get("profile_id", ""),
-                    profile_url=linkedin_url,
-                    message=body,
-                )
-                provider_message_id = str(result) if result else None
-                status = "sent" if result else "failed"
+            body = personalize(
+                step_def.get("inmail_body_template", body), prospect, sender_context
+            )
+        status, provider_message_id, send_result = await _send_via_channel(
+            campaign, enrollment, prospect, engine_channel, subject, body,
+        )
+        subject = send_result.get("frozen_subject", subject)
+        body = send_result.get("frozen_body", body)
 
     except Exception as e:
         logger.error(
@@ -1086,14 +1740,33 @@ async def execute_enrollment(enrollment: dict, campaign: dict, prospect: dict):
     # Record the message outcome
     await record_campaign_message(
         enrollment, campaign, step_def, body, subject, provider_message_id, status,
-        gmail_thread_id=gmail_thread_id,
-        provider=send_provider,
+        provider_thread_id=send_result.get("thread_ref"),
+        provider=send_result.get("provider"),
+        rfc_message_id=send_result.get("rfc_message_id"),
+        send_key=send_result.get("send_key"),
+        prospect=prospect,
+        provider_account_id=send_result.get("provider_account_id"),
+        content_html=send_result.get("content_html"),
     )
+
+    if status == "ambiguous":
+        await database.campaign_enrollments_collection.update_one(
+            {"_id": enrollment["_id"]},
+            {"$set": {
+                "status": "send_ambiguous",
+                "next_action_at": None,
+                "ambiguous_send_key": send_result.get("send_key"),
+                "last_transition_reason": "provider_outcome_requires_reconciliation",
+                "last_activity_at": datetime.utcnow(),
+            }},
+        )
+        return
 
     # Advance to next step if successful; otherwise track failure
     if status == "sent":
         await advance_enrollment(enrollment, campaign)
     else:
+        await _release_cap_slots_once(send_result.get("send_key"), enrollment["campaign_id"], engine_channel, _sender_id)
         await database.campaign_enrollments_collection.update_one(
             {"_id": enrollment["_id"]},
             {
@@ -1108,13 +1781,19 @@ async def execute_enrollment(enrollment: dict, campaign: dict, prospect: dict):
 
 async def _activate_due_cascade_enrollments(now: datetime):
     """
-    For each cascade_waiting enrollment whose cascade_activate_at has passed,
-    check if the primary prospect in the same group has replied.
-    If not replied → activate the cascade enrollment.
+    Legacy TIME-BASED cascade activation (API-route enrollments that carry a
+    concrete ``cascade_activate_at``): once the timestamp passes, activate the
+    backup unless the primary already engaged.
+
+    Event-driven backups (discovery-created, ``cascade_activate_at: None``) are
+    deliberately excluded — they are only woken by ``activate_next_backup``
+    when their primary's sequence ends "not_replied".
     """
     due_cascade = await database.campaign_enrollments_collection.find({
         "cascade_status": "waiting",
-        "cascade_activate_at": {"$lte": now},
+        # $ne None keeps event-driven backups (activate_at unset/None) out of
+        # the time-based sweep even though $lte would already skip None.
+        "cascade_activate_at": {"$ne": None, "$lte": now},
     }).to_list(length=100)
 
     if not due_cascade:
@@ -1124,26 +1803,38 @@ async def _activate_due_cascade_enrollments(now: datetime):
 
     for enrollment in due_cascade:
         group_id = enrollment.get("cascade_group_id")
-        if not group_id:
+        account_id = enrollment.get("account_id")
+        if not group_id or not account_id:
             continue
 
         # Check if the primary (position=0) in this group has replied
         primary = await database.campaign_enrollments_collection.find_one({
+            "account_id": {"$in": _account_values(account_id)},
             "cascade_group_id": group_id,
             "cascade_position": 0,
         })
 
+        # Suppress the backup only when the primary genuinely engaged/closed
+        # (replied / completed / opted_out). A primary that finished
+        # "not_replied" must NOT suppress backups — that is exactly the case
+        # where the next prospect at the company should be tried.
         if primary and primary.get("status") in ("replied", "completed", "opted_out"):
             # Primary replied — mark this cascade as dormant (won't need outreach)
             await database.campaign_enrollments_collection.update_one(
-                {"_id": enrollment["_id"]},
+                {
+                    "_id": enrollment["_id"],
+                    "account_id": {"$in": _account_values(account_id)},
+                },
                 {"$set": {"cascade_status": "dormant", "status": "opted_out", "last_activity_at": now}},
             )
             logger.info(f"Cascade dormant (primary replied): group={group_id} pos={enrollment.get('cascade_position')}")
         else:
             # Primary has NOT replied → activate this prospect
             await database.campaign_enrollments_collection.update_one(
-                {"_id": enrollment["_id"]},
+                {
+                    "_id": enrollment["_id"],
+                    "account_id": {"$in": _account_values(account_id)},
+                },
                 {"$set": {
                     "status": "active",
                     "cascade_status": "activated",
@@ -1151,6 +1842,14 @@ async def _activate_due_cascade_enrollments(now: datetime):
                     "last_activity_at": now,
                 }},
             )
+            # Backups only count as enrolled/active once activated.
+            try:
+                await database.campaigns_collection.update_one(
+                    {"_id": ObjectId(str(enrollment["campaign_id"]))},
+                    {"$inc": {"active_count": 1, "total_enrolled": 1}},
+                )
+            except Exception as _cnt_e:
+                logger.warning(f"Cascade activation counter update failed: {_cnt_e}")
             logger.info(f"Cascade activated: group={group_id} pos={enrollment.get('cascade_position')}")
 
 
@@ -1165,72 +1864,140 @@ async def execute_pending_steps():
     logger.info(f"Campaign engine running at {now.isoformat()}")
 
     try:
-        # Find due enrollments — uses the critical compound index (sorted oldest-due first
-        # to drain backlog fairly and prevent newer campaigns from starving old ones).
-        due_cursor = database.campaign_enrollments_collection.find({
-            "status": "active",
-            "next_action_at": {"$lte": now},
-        }).sort("next_action_at", 1).limit(200)  # Process max 200 per run to stay within the 5-min window
-
-        due_enrollments = await due_cursor.to_list(length=200)
-
-        if not due_enrollments:
-            logger.info("Campaign engine: no due enrollments")
-            return
-
-        logger.info(f"Campaign engine: {len(due_enrollments)} enrollments due")
-
         # Activate cascade enrollments whose primary prospect hasn't replied
         await _activate_due_cascade_enrollments(now)
-
-        # Batch-load campaigns and prospects
-        campaign_ids = []
-        for c in {e["campaign_id"] for e in due_enrollments}:
+        processed = 0
+        for _ in range(200):
+            enrollment = await claim_due_enrollment(
+                database.campaign_enrollments_collection,
+                worker_id=ENGINE_WORKER_ID,
+                now=now,
+                lease_seconds=300,
+            )
+            if not enrollment:
+                break
+            processed += 1
             try:
-                campaign_ids.append(ObjectId(str(c)))
-            except Exception:
-                pass
-                
-        prospect_ids = []
-        for p in {e["prospect_id"] for e in due_enrollments}:
-            try:
-                prospect_ids.append(ObjectId(str(p)))
-            except Exception:
-                pass
+                account_values = _account_values(enrollment.get("account_id"))
+                try:
+                    campaign_oid = ObjectId(str(enrollment["campaign_id"]))
+                    prospect_oid = ObjectId(str(enrollment["prospect_id"]))
+                except Exception:
+                    await database.campaign_enrollments_collection.update_one(
+                        {"_id": enrollment["_id"]},
+                        {"$set": {
+                            "status": "failed",
+                            "next_action_at": None,
+                            "last_transition_reason": "invalid_campaign_or_prospect_id",
+                        }},
+                    )
+                    continue
 
-        campaigns_list = await database.campaigns_collection.find(
-            {"_id": {"$in": campaign_ids}, "status": "active"}
-        ).to_list(length=len(campaign_ids))
-        campaigns_by_id = {str(c["_id"]): c for c in campaigns_list}
+                campaign = await database.campaigns_collection.find_one({
+                    "_id": campaign_oid,
+                    "account_id": {"$in": account_values},
+                    "status": "active",
+                })
+                if not campaign:
+                    # Campaign is paused/draft/completed (or missing) — back off for
+                    # hours, not minutes, so a long pause doesn't spin the engine on
+                    # this enrollment every tick.
+                    await database.campaign_enrollments_collection.update_one(
+                        {"_id": enrollment["_id"]},
+                        {"$set": {"next_action_at": now + timedelta(hours=6)}},
+                    )
+                    continue
 
-        prospects_list = await database.prospects_collection.find(
-            {"_id": {"$in": prospect_ids}}
-        ).to_list(length=len(prospect_ids))
-        prospects_by_id = {str(p["_id"]): p for p in prospects_list}
+                prospect = await database.prospects_collection.find_one({"_id": prospect_oid})
+                if not prospect:
+                    await database.campaign_enrollments_collection.update_one(
+                        {"_id": enrollment["_id"]},
+                        {"$set": {
+                            "status": "failed",
+                            "next_action_at": None,
+                            "last_transition_reason": "prospect_missing",
+                        }},
+                    )
+                    continue
 
-        # Execute each enrollment
-        for enrollment in due_enrollments:
-            campaign = campaigns_by_id.get(str(enrollment["campaign_id"]))
-            if not campaign:
-                continue  # Campaign paused or archived
+                if not is_in_send_window(campaign, prospect):
+                    next_window = get_next_send_window(campaign, prospect)
+                    await database.campaign_enrollments_collection.update_one(
+                        {"_id": enrollment["_id"]},
+                        {"$set": {"next_action_at": next_window}},
+                    )
+                    continue
 
-            prospect = prospects_by_id.get(str(enrollment["prospect_id"]))
-            if not prospect:
-                continue
-
-            # Respect the campaign's send window, tailored for prospect timezone if available
-            if not is_in_send_window(campaign, prospect):
-                next_window = get_next_send_window(campaign, prospect)
-                await database.campaign_enrollments_collection.update_one(
-                    {"_id": enrollment["_id"]},
-                    {"$set": {"next_action_at": next_window}},
+                await execute_enrollment(enrollment, campaign, prospect)
+            finally:
+                await release_enrollment_lease(
+                    database.campaign_enrollments_collection, enrollment
                 )
-                continue
 
-            await execute_enrollment(enrollment, campaign, prospect)
+        if processed == 0:
+            logger.info("Campaign engine: no due enrollments")
+        else:
+            logger.info("Campaign engine: processed %s leased enrollments", processed)
 
     except Exception as e:
         logger.error(f"Campaign engine error: {e}", exc_info=True)
+
+
+async def reconcile_ambiguous_send(
+    send_key: str,
+    outcome: str,
+    provider_result: Optional[dict] = None,
+) -> Optional[dict]:
+    """Apply provider evidence and safely re-queue enrollment finalization.
+
+    A reconciled ``sent`` attempt is reprocessed through the normal engine: the
+    attempt state returns the stored provider result without another provider
+    call, then message recording and sequence advancement finish idempotently.
+    ``not_sent`` similarly re-opens the provider dispatch. ``unknown`` stays
+    quarantined.
+    """
+    service = SendAttemptService(database.send_attempts_collection)
+    attempt = await service.reconcile(
+        send_key=send_key,
+        outcome=outcome,
+        provider_result=provider_result,
+    )
+    if not attempt:
+        return None
+    if outcome == "not_sent":
+        # The original provider-boundary attempt consumed both caps. The
+        # ambiguous -> retry_scheduled transition is atomic, so this executes
+        # exactly once and the retry can reserve fresh capacity.
+        from services.daily_cap_service import release_slot, release_sender_slot
+
+        payload = attempt.get("payload") or {}
+        campaign_id = payload.get("campaign_id")
+        channel = attempt.get("channel") or payload.get("channel")
+        if campaign_id and channel:
+            await release_slot(database.db, campaign_id, channel)
+        sender_id = attempt.get("sender_record_id")
+        if sender_id and channel:
+            await release_sender_slot(database.db, str(sender_id), channel)
+    if attempt.get("state") in {
+        SendAttemptState.SENT.value,
+        SendAttemptState.RETRY_SCHEDULED.value,
+    }:
+        await database.campaign_enrollments_collection.update_one(
+            {
+                "_id": ObjectId(str(attempt["enrollment_id"])),
+                "account_id": {"$in": _account_values(attempt["account_id"])},
+                "ambiguous_send_key": send_key,
+            },
+            {
+                "$set": {
+                    "status": "active",
+                    "next_action_at": datetime.utcnow(),
+                    "last_transition_reason": f"send_reconciled_{outcome}",
+                },
+                "$unset": {"ambiguous_send_key": ""},
+            },
+        )
+    return attempt
 
 
 async def compute_campaign_daily_stats():
@@ -1246,6 +2013,7 @@ async def compute_campaign_daily_stats():
         )
         async for campaign in campaigns_cursor:
             campaign_id = campaign["_id"]
+            campaign_id_str = str(campaign_id)
 
             msg_filter = {
                 "campaign_id": campaign_id,
@@ -1275,7 +2043,7 @@ async def compute_campaign_daily_stats():
             )
 
             stat_doc = {
-                "campaign_id": campaign_id,
+                "campaign_id": campaign_id_str,
                 "account_id": campaign["account_id"],
                 "date": yesterday,
                 "emails_sent": emails_sent,
@@ -1286,7 +2054,7 @@ async def compute_campaign_daily_stats():
             }
 
             await database.campaign_daily_stats_collection.update_one(
-                {"campaign_id": campaign_id, "date": yesterday},
+                {"campaign_id": campaign_id_str, "date": yesterday},
                 {"$set": stat_doc},
                 upsert=True,
             )

@@ -287,7 +287,10 @@ async def llm_compose_campaign(captured: dict, company_profile: dict | None) -> 
     settings = get_settings()
     from utils.prompts import get_system_prompt, CAMPAIGN_PREFILL_COMPOSE_SYSTEM_PROMPT
 
-    system_prompt = await get_system_prompt("campaign_prefill_compose")
+    system_prompt = await get_system_prompt(
+        "campaign_prefill_compose",
+        str((company_profile or {}).get("account_id") or "") or None,
+    )
     if not system_prompt:
         system_prompt = CAMPAIGN_PREFILL_COMPOSE_SYSTEM_PROMPT
 

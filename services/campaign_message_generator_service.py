@@ -7,11 +7,12 @@ Uses the campaign's tone/value_prop/pain_point/CTA to produce:
   - linkedin_connection: note (<=280 chars)
   - linkedin_inmail: subject, body
 
-Runs concurrently with a semaphore (5 at a time) via asyncio.gather.
+Runs concurrently with a semaphore (MESSAGE_GEN_BATCH_CONCURRENCY at a time) via asyncio.gather.
 """
 
 import asyncio
 import logging
+import re
 from datetime import datetime
 from bson import ObjectId
 from typing import Optional
@@ -36,30 +37,149 @@ settings = get_settings()
 MESSAGE_GEN_PRIMARY_MODEL = "anthropic/claude-haiku-4-5"
 MESSAGE_GEN_FALLBACK_MODEL = "anthropic/claude-sonnet-4-5"
 MESSAGE_GEN_BATCH_SIZE = 3
-MESSAGE_GEN_BATCH_CONCURRENCY = 4
+# The real throughput bound is OpenRouter's per-model sliding-window bucket
+# (300 req/min for paid models like Haiku — see openrouter_service._PAID_RATE),
+# which throttles safely regardless of how many batches we fan out here. 8
+# keeps wall-clock down for large Day-1 cohorts without risking anything worse
+# than that bucket's own backpressure.
+MESSAGE_GEN_BATCH_CONCURRENCY = 8
+
+
+async def _attach_company_research(prospects_list: list[dict]) -> None:
+    """Batch-load companies_collection.research for a prospect list and set
+    prospect["company_research"] (+ company_news/recent_news fallbacks) in place.
+
+    Join: prospect.company_id → companies._id; fallback prospect.company_linkedin
+    → companies.linkedin_url (normalized, no trailing slash, lowercase).
+    """
+    if not prospects_list:
+        return
+
+    company_oids = []
+    li_urls = []
+    for p in prospects_list:
+        cid = p.get("company_id")
+        if cid and ObjectId.is_valid(str(cid)):
+            company_oids.append(ObjectId(str(cid)))
+        li = (p.get("company_linkedin") or "").rstrip("/").lower()
+        if li:
+            li_urls.append(li)
+
+    research_by_cid: dict[str, dict] = {}
+    research_by_url: dict[str, dict] = {}
+
+    query_or = []
+    if company_oids:
+        query_or.append({"_id": {"$in": list(set(company_oids))}})
+    if li_urls:
+        query_or.append({"linkedin_url": {"$in": list(set(li_urls))}})
+    if not query_or:
+        return
+
+    async for co in database.companies_collection.find(
+        {"$or": query_or, "research": {"$exists": True, "$ne": None}},
+        {"research": 1, "linkedin_url": 1},
+    ):
+        research = co.get("research")
+        if not research:
+            continue
+        research_by_cid[str(co["_id"])] = research
+        url = (co.get("linkedin_url") or "").rstrip("/").lower()
+        if url:
+            research_by_url[url] = research
+
+    attached = 0
+    for p in prospects_list:
+        research = None
+        cid = p.get("company_id")
+        if cid:
+            research = research_by_cid.get(str(cid))
+        if research is None:
+            li = (p.get("company_linkedin") or "").rstrip("/").lower()
+            if li:
+                research = research_by_url.get(li)
+        if not research:
+            continue
+        p["company_research"] = research
+        # Feed the existing prompt fact slots too
+        if research.get("news") and not p.get("company_news"):
+            p["company_news"] = research["news"]
+        if research.get("news") and not p.get("recent_news"):
+            p["recent_news"] = research["news"]
+        if research.get("buying_signals") and not p.get("buying_signals"):
+            p["buying_signals"] = research["buying_signals"]
+        if research.get("competitors") and not p.get("competitors"):
+            p["competitors"] = research["competitors"]
+        # New research contract fields (funding / hiring_signals / tech_stack /
+        # recent_launches) ride along inside p["company_research"] — the whole
+        # dict is attached above, no key whitelist. Feed tech into the existing
+        # prompt fact slot so _select_top_signal can use it too.
+        if research.get("tech_stack") and not p.get("company_technologies"):
+            p["company_technologies"] = research["tech_stack"]
+        attached += 1
+
+    if attached:
+        logger.info(f"[message-gen] attached company research to {attached}/{len(prospects_list)} prospects")
 
 
 async def _resolve_sender_first_name(account_id) -> str:
     """
     Look up the configured sender name for an account and return its first token.
-    Prefers company_profiles.sender_name; falls back to accounts.sender_name.
-    Returns an empty string if neither is set.
+    Fallback chain: company_profiles.sender_name → accounts.sender_name →
+    the account owner's users.name. Returns an empty string only if all are empty.
     """
     if account_id is None:
         return ""
+    account_values = _account_id_variants(account_id)
     profile = await database.company_profiles_collection.find_one(
-        {"account_id": account_id}, {"sender_name": 1}
+        {"account_id": {"$in": account_values}}, {"sender_name": 1}
     )
     name = (profile or {}).get("sender_name") or ""
     if not name:
         account = await database.accounts_collection.find_one(
-            {"_id": account_id}, {"sender_name": 1}
+            {"_id": {"$in": account_values}}, {"sender_name": 1, "name": 1}
         )
         name = (account or {}).get("sender_name") or ""
-    name = name.strip()
+    if not name:
+        # Last resort: the account owner's (or any member's) user record.
+        try:
+            member = await database.account_members_collection.find_one(
+                {"account_id": {"$in": account_values}, "role": "owner"}, {"user_id": 1}
+            )
+            if not member:
+                member = await database.account_members_collection.find_one(
+                    {"account_id": {"$in": account_values}}, {"user_id": 1}
+                )
+            user_id = (member or {}).get("user_id")
+            if user_id and ObjectId.is_valid(str(user_id)):
+                user = await database.users_collection.find_one(
+                    {"_id": ObjectId(str(user_id))}, {"name": 1}
+                )
+                name = (user or {}).get("name") or ""
+        except Exception as e:
+            logger.warning(f"Sender-name user fallback failed for account {account_id}: {e}")
+    name = str(name).strip()
     if not name:
         return ""
     return name.split()[0]
+
+
+def _account_id_variants(account_id) -> list:
+    """Both representations of a tenant id, for collections that disagree.
+
+    campaigns.account_id is an ObjectId while company_profiles.account_id and
+    accounts._id are strings, so an exact-type match silently returns nothing.
+    """
+    if account_id is None:
+        return []
+    variants: list = [str(account_id)]
+    try:
+        oid = ObjectId(str(account_id))
+        if oid not in variants:
+            variants.append(oid)
+    except Exception:
+        pass
+    return variants
 
 
 async def _load_company_profile(account_id) -> dict | None:
@@ -67,11 +187,38 @@ async def _load_company_profile(account_id) -> dict | None:
     if account_id is None:
         return None
     try:
-        profile = await database.company_profiles_collection.find_one({"account_id": account_id})
+        profile = await database.company_profiles_collection.find_one(
+            {"account_id": {"$in": _account_id_variants(account_id)}}
+        )
         return profile
     except Exception as e:
         logger.warning(f"Failed to load company profile for account {account_id}: {e}")
         return None
+
+
+async def prepare_campaign_for_generation(campaign: dict, account_id=None) -> dict:
+    """
+    Stamp resolved sender identity + company profile onto the in-memory campaign
+    dict so prompt builders can include full seller identity. Mutates and returns
+    the same dict. Safe to call multiple times (no-ops once stamped).
+
+    - campaign["sender_name"]: the key the prompt builders actually read
+      (utils/prompts.py). Resolved via company_profile → account → account-owner
+      user when the campaign doesn't already carry a sender_name.
+    - campaign["_company_profile"]: onboarding company profile (services,
+      case studies, sender voice, banned phrases).
+    """
+    if account_id is None:
+        account_id = campaign.get("account_id")
+    if campaign.get("_company_profile") is None:
+        company_profile = await _load_company_profile(account_id)
+        if company_profile:
+            campaign["_company_profile"] = company_profile
+    if not campaign.get("sender_name"):
+        sender_first = await _resolve_sender_first_name(account_id)
+        if sender_first:
+            campaign["sender_name"] = sender_first
+    return campaign
 
 
 def _message_gen_fallback_chain() -> list[str]:
@@ -134,15 +281,11 @@ async def generate_messages_for_campaign(
         if not campaign:
             raise ValueError(f"Campaign {campaign_id} not found")
 
-        # Stamp sender name and company profile onto the in-memory campaign dict
+        # Stamp sender name (under the "sender_name" key the prompt builders
+        # actually read) and company profile onto the in-memory campaign dict
         # so prompt builders can include full seller identity and case studies.
         account_id = campaign.get("account_id")
-        sender_first = await _resolve_sender_first_name(account_id)
-        if sender_first:
-            campaign["_sender_first_name"] = sender_first
-        company_profile = await _load_company_profile(account_id)
-        if company_profile:
-            campaign["_company_profile"] = company_profile
+        await prepare_campaign_for_generation(campaign, account_id)
 
         # Load pending enrollments, optionally scoped to a specific day.
         # For per-day runs, lift Day-N enrollments out of "scheduled_later"
@@ -187,6 +330,15 @@ async def generate_messages_for_campaign(
             {"_id": {"$in": prospect_ids}}
         ).to_list(length=len(prospect_ids))
         prospects_by_id = {p["_id"]: p for p in prospects_list}
+
+        # Batch-load deep company research (companies_collection.research — see
+        # services/company_research_service contract) and attach it to each
+        # prospect so prompts can reference best_performer / buying_signals /
+        # news / free-value CTA facts. Join by company_id, fallback company_linkedin.
+        try:
+            await _attach_company_research(prospects_list)
+        except Exception as _cr_err:
+            logger.warning(f"[Campaign {campaign_id}] company research join failed (non-fatal): {_cr_err}")
 
         total = len(enrollments)
         generated = 0
@@ -429,10 +581,15 @@ async def generate_messages_batch(
                 p["prospect_intelligence"] = {**base, **pitch}
 
     enrollment_by_id = {str(enr["_id"]): enr for enr, _p in enrollments_with_prospects}
+    prospect_by_eid = {str(enr["_id"]): p for enr, p in enrollments_with_prospects}
     prospects_with_ids = [(str(enr["_id"]), p) for enr, p in enrollments_with_prospects]
+    _sender_first = _sender_first_from_campaign(campaign)
 
-    system_prompt = await get_system_prompt("campaign_outreach")
-    user_prompt = build_campaign_batch_outreach_prompt(campaign, prospects_with_ids, channel)
+    system_prompt = await get_system_prompt("campaign_outreach", _account_id or None)
+    user_prompt = build_campaign_batch_outreach_prompt(
+        campaign, prospects_with_ids, channel,
+        company_profile=campaign.get("_company_profile"),
+    )
 
     fallback_chain = _message_gen_fallback_chain()
     primary_model = fallback_chain[0] if fallback_chain else MESSAGE_GEN_PRIMARY_MODEL
@@ -515,6 +672,9 @@ async def generate_messages_batch(
             "tone_used": campaign.get("message_tone", "professional"),
         }
         generated_messages = _strip_em_dashes_from_messages(generated_messages)
+        generated_messages = _enforce_signature(
+            generated_messages, _sender_first, _prospect_first_name(prospect_by_eid.get(eid))
+        )
 
         await database.campaign_enrollments_collection.update_one(
             {"_id": enr["_id"]},
@@ -570,7 +730,9 @@ async def generate_messages_for_enrollment(
     merged_intel = {**intel_base, **_pitch}
 
     # Build prompts
-    system_prompt = await get_system_prompt("campaign_outreach")
+    system_prompt = await get_system_prompt(
+        "campaign_outreach", str(enrollment.get("account_id") or campaign.get("account_id") or "") or None
+    )
     company_profile = campaign.get("_company_profile")
     user_prompt = build_campaign_outreach_prompt(
         prospect, profile, company, campaign,
@@ -614,6 +776,10 @@ async def generate_messages_for_enrollment(
 
     # Strip em dashes from all generated text
     result = _strip_em_dashes_from_messages(result)
+    # Deterministic sign-off: emails end "Best,\n<sender first>"; never the prospect's name
+    result = _enforce_signature(
+        result, _sender_first_from_campaign(campaign), _prospect_first_name(prospect)
+    )
 
     # Enforce LinkedIn connection note 280-char limit
     linkedin_conn = result.get("linkedin_connection", {})
@@ -627,8 +793,16 @@ async def generate_messages_for_enrollment(
     result["tone_used"] = campaign.get("message_tone", "professional")
 
     # Store in enrollment
-    await database.campaign_enrollments_collection.update_one(
-        {"_id": enrollment["_id"]},
+    account_id = str(enrollment.get("account_id") or "")
+    campaign_id = str(enrollment.get("campaign_id") or "")
+    if not ObjectId.is_valid(account_id) or not ObjectId.is_valid(campaign_id):
+        raise PermissionError("enrollment is missing tenant/campaign ownership")
+    write_result = await database.campaign_enrollments_collection.update_one(
+        {
+            "_id": enrollment["_id"],
+            "account_id": {"$in": [account_id, ObjectId(account_id)]},
+            "campaign_id": {"$in": [campaign_id, ObjectId(campaign_id)]},
+        },
         {"$set": {
             "generated_messages": result,
             "message_gen_status": "done",
@@ -636,6 +810,8 @@ async def generate_messages_for_enrollment(
             "message_gen_completed_at": datetime.utcnow(),
         }},
     )
+    if write_result.matched_count != 1:
+        raise PermissionError("enrollment ownership changed during generation")
 
     return result
 
@@ -654,6 +830,18 @@ async def generate_single_channel_message(
     Returns updated generated_messages dict or None on failure.
     """
     channel = enrollment.get("smart_campaign_channel")
+    _linkedin_channels = {"linkedin_connection", "linkedin_inmail", "linkedin_message"}
+    # BYOL email-only leads must never get a LinkedIn/InMail message. Channel
+    # planning already routes them to the email channel; this is a defensive
+    # backstop so a mis-assigned channel (or the generate-all fallback below)
+    # can't produce a LinkedIn node for an email-only prospect.
+    if enrollment.get("channel_eligibility") == "email_only":
+        if channel in _linkedin_channels:
+            logger.warning(
+                f"Skipping {channel} generation for email-only enrollment {enrollment.get('_id')}"
+            )
+            return None
+        channel = "email"
     if not channel:
         # No channel assigned — fall back to generating all
         return await generate_messages_for_enrollment(
@@ -683,7 +871,9 @@ async def generate_single_channel_message(
     intel_base = prospect.get("prospect_intelligence_base") or {}
     merged_intel = {**intel_base, **_pitch}
 
-    system_prompt = await get_system_prompt("campaign_outreach")
+    system_prompt = await get_system_prompt(
+        "campaign_outreach", str(enrollment.get("account_id") or campaign.get("account_id") or "") or None
+    )
     company_profile = campaign.get("_company_profile")
     user_prompt = build_campaign_outreach_prompt(
         prospect, profile, company, campaign,
@@ -749,6 +939,10 @@ async def generate_single_channel_message(
         "generation_model": primary_model,
         "tone_used": campaign.get("message_tone", "professional"),
     }
+    messages = _strip_em_dashes_from_messages(messages)
+    messages = _enforce_signature(
+        messages, _sender_first_from_campaign(campaign), _prospect_first_name(prospect)
+    )
 
     # Store in enrollment
     await database.campaign_enrollments_collection.update_one(
@@ -809,6 +1003,9 @@ async def generate_message_for_step(
         generated = result if isinstance(result, dict) else {}
         # Strip em dashes from all generated text
         generated = _strip_em_dashes_from_messages(generated)
+        generated = _enforce_signature(
+            generated, _sender_first_from_campaign(campaign), _prospect_first_name(prospect)
+        )
     except Exception as e:
         logger.error(f"generate_message_for_step AI call failed: {e}")
         generated = {}
@@ -922,6 +1119,8 @@ async def generate_message_for_node(
     # Load company_profile if not already stamped (e.g. called from campaign_engine directly)
     if company_profile is None and campaign.get("account_id"):
         company_profile = await _load_company_profile(campaign["account_id"])
+        if company_profile:
+            campaign["_company_profile"] = company_profile
 
     user_prompt = build_campaign_followup_prompt(
         prospect=prospect,
@@ -947,6 +1146,9 @@ async def generate_message_for_node(
         )
         generated = result if isinstance(result, dict) else {}
         generated = _strip_em_dashes_from_messages(generated)
+        generated = _enforce_signature(
+            generated, _sender_first_from_campaign(campaign), _prospect_first_name(prospect)
+        )
     except Exception as e:
         logger.error(f"generate_message_for_node AI call failed for node {node_id}: {e}")
         raise
@@ -967,6 +1169,21 @@ async def generate_message_for_node(
         inmail = generated.get("linkedin_inmail", {})
         msg = {"channel": "linkedin_inmail", "subject": inmail.get("subject", ""),
                "body": inmail.get("body", ""),
+               "generated_at": now.isoformat(), "generation_model": MESSAGE_GEN_PRIMARY_MODEL}
+    elif channel == "linkedin_message":
+        # A LinkedIn DM has no shape in the campaign message schema. Prefer the
+        # explicit linkedin_message shape the follow-up prompt asks for, then
+        # fall back across the other shapes so an off-contract reply still
+        # yields copy rather than an empty message.
+        dm = generated.get("linkedin_message") or {}
+        body = (
+            dm.get("body")
+            or generated.get("body")
+            or (generated.get("linkedin_connection") or {}).get("note")
+            or (generated.get("cold_email") or {}).get("body")
+            or ""
+        )
+        msg = {"channel": "linkedin_message", "body": body,
                "generated_at": now.isoformat(), "generation_model": MESSAGE_GEN_PRIMARY_MODEL}
     else:
         msg = {"channel": channel, "body": generated.get("body", ""),
@@ -1007,42 +1224,275 @@ async def generate_message_for_node(
     return msg
 
 
+async def get_pending_followup_draft(account_id, prospect_id) -> Optional[dict]:
+    """Return an editable draft of the next queued touch for a prospect.
+
+    The inbox surfaces this once a connection request is accepted, so the user
+    can review and edit the exact copy the campaign is about to send. Reuses
+    copy that was already generated for the current node when present, and
+    generates it on demand otherwise. Returns None when the prospect has no live
+    sequence enrollment, or when generation fails.
+    """
+    from services import sequence_service as seq
+
+    def _variants(value):
+        out = [str(value)]
+        try:
+            out.append(ObjectId(str(value)))
+        except Exception:
+            pass
+        return out
+
+    enrollment = await database.campaign_enrollments_collection.find_one({
+        "account_id": {"$in": _variants(account_id)},
+        "prospect_id": {"$in": _variants(prospect_id)},
+        "status": {"$in": ["active", "enrolled"]},
+        "sequence_state": {"$exists": True, "$ne": None},
+    })
+    if not enrollment:
+        return None
+
+    state = enrollment.get("sequence_state") or {}
+    node_id = state.get("current_node_id")
+    if state.get("stopped_reason") or not node_id:
+        return None
+
+    try:
+        campaign = await database.campaigns_collection.find_one({
+            "_id": ObjectId(str(enrollment["campaign_id"])),
+            "account_id": {"$in": _variants(account_id)},
+        })
+    except Exception:
+        return None
+    if not campaign:
+        return None
+
+    node = seq.get_node(campaign.get("sequence_graph") or {}, node_id)
+    if not node:
+        return None
+
+    msg = (enrollment.get("generated_messages_by_step") or {}).get(node_id)
+    if not msg:
+        prospect = await database.prospects_collection.find_one(
+            {"_id": ObjectId(str(enrollment["prospect_id"]))}
+        )
+        if not prospect:
+            return None
+        try:
+            msg = await generate_message_for_node(campaign, enrollment, prospect, node)
+        except Exception as e:
+            logger.warning(
+                "Follow-up draft generation failed for enrollment %s node %s: %s",
+                enrollment["_id"], node_id, e,
+            )
+            return None
+
+    return {
+        "enrollment_id": str(enrollment["_id"]),
+        "campaign_id": str(enrollment["campaign_id"]),
+        "node_id": node_id,
+        "channel": msg.get("channel") or node.get("channel"),
+        "subject": msg.get("subject") or "",
+        "body": msg.get("body") or "",
+        "scheduled_at": state.get("next_action_at") or enrollment.get("next_action_at"),
+        "editable": True,
+    }
+
+
 def _truncate_to_280(text: str) -> str:
     """
-    Ensure text is <= 280 characters.
-    Truncates at the last complete word before the limit.
+    Ensure the connection note is <= 280 characters AND reads as a complete
+    message. Prefer trimming back to the last full sentence so we never ship a
+    dangling fragment like "…Would be."; only fall back to a word-boundary cut
+    (closed with a period) when there is no usable sentence break.
     """
+    text = (text or "").strip()
     if len(text) <= 280:
         return text
 
-    # Truncate at last word boundary before 280
-    truncated = text[:280]
-    last_space = truncated.rfind(" ")
+    window = text[:280]
+
+    # Prefer the last COMPLETE sentence that fits within the limit — this keeps
+    # the note short but whole instead of cutting off mid-thought.
+    sentence_end = -1
+    for i, ch in enumerate(window):
+        if ch in ".!?":
+            sentence_end = i
+    if sentence_end >= 100:
+        return window[: sentence_end + 1].rstrip()
+
+    # Fallback: no early sentence break — cut at the last word boundary and
+    # close cleanly with a period.
+    last_space = window.rfind(" ")
     if last_space > 200:  # Don't truncate too aggressively
-        truncated = truncated[:last_space]
+        window = window[:last_space]
+    window = window.rstrip()
+    if window and window[-1] not in ".!?":
+        window = window.rstrip(",;:") + "."
 
-    # Ensure it ends with punctuation
-    truncated = truncated.rstrip()
-    if truncated and truncated[-1] not in ".!?":
-        truncated = truncated.rstrip(",;:") + "."
-
-    return truncated
+    return window
 
 
 def _strip_em_dashes(text: str) -> str:
     """Replace em dashes with a comma+space."""
     if not text:
         return text
-    import re
     return re.sub(r'\s*—\s*', ', ', text)
 
 
+# ── Deterministic sign-off enforcement ───────────────────────────────────────
+# The model occasionally signs emails with the PROSPECT's name instead of the
+# sender's. Prompt rules reduce this but the guarantee is post-processing:
+# strip whatever sign-off the model produced and append the canonical
+# "Best,\n<sender first name>" on email bodies.
+
+_SIGNOFF_LINE_RE = re.compile(
+    r"^(?:best|best regards|kind regards|warm regards|warm wishes|regards|thanks|"
+    r"thank you|many thanks|cheers|sincerely|warmly|all the best|talk soon|speak soon)[,!.]?$",
+    re.IGNORECASE,
+)
+# "Best, John" / "Thanks, John Smith" on a single trailing line
+_INLINE_SIGNOFF_RE = re.compile(
+    r"^(best|best regards|kind regards|warm regards|regards|thanks|thank you|"
+    r"cheers|sincerely|warmly|all the best)[,!.]?\s+(\S[^\n]{0,40})$",
+    re.IGNORECASE,
+)
+
+
+def _sender_first_from_campaign(campaign: dict) -> str:
+    """First token of the sender name the prompts were built with."""
+    name = (
+        campaign.get("sender_name")
+        or (campaign.get("_company_profile") or {}).get("sender_name")
+        or ""
+    )
+    name = str(name).strip()
+    return name.split()[0] if name else ""
+
+
+def _prospect_first_name(prospect: dict | None) -> str:
+    if not isinstance(prospect, dict):
+        return ""
+    first = str(prospect.get("first_name") or "").strip()
+    if not first:
+        full = str(prospect.get("full_name") or "").strip()
+        first = full.split()[0] if full else ""
+    return first
+
+
+def _is_name_line(line: str, candidates: set[str]) -> bool:
+    """True when a short trailing line is (or starts with) one of the names."""
+    text = line.strip().rstrip(",.!")
+    if not text or len(text.split()) > 3:
+        return False
+    first_token = text.split()[0].lower()
+    return any(
+        c and (text.lower() == c.lower() or first_token == c.lower())
+        for c in candidates
+    )
+
+
+def _strip_signoff_block(body: str, name_candidates: set[str], strip_generic: bool) -> str:
+    """
+    Conservatively strip a trailing sign-off block from a message body.
+
+    Only the last ~4 lines are inspected. Removes:
+      - a bare trailing name line matching one of ``name_candidates``
+      - a bare sign-off word line ("Best,", "Regards," ...) when
+        ``strip_generic`` is True or a name line was just stripped above it
+      - an inline "Best, John" line under the same conditions
+    Real content lines are never touched.
+    """
+    if not body:
+        return body
+    lines = body.rstrip().split("\n")
+    inspected = 0
+    stripped_name = False
+    while lines and inspected < 4:
+        last = lines[-1].strip()
+        if not last:
+            lines.pop()
+            inspected += 1
+            continue
+        if _is_name_line(last, name_candidates):
+            lines.pop()
+            inspected += 1
+            stripped_name = True
+            continue
+        if (strip_generic or stripped_name) and _SIGNOFF_LINE_RE.match(last):
+            lines.pop()
+            inspected += 1
+            continue
+        inline = _INLINE_SIGNOFF_RE.match(last)
+        if inline and (strip_generic or _is_name_line(inline.group(2), name_candidates)):
+            lines.pop()
+            inspected += 1
+            continue
+        break
+    return "\n".join(lines).rstrip()
+
+
+def _enforce_signature(messages: dict, sender_first: str, prospect_first: str) -> dict:
+    """
+    Deterministically normalize sign-offs on a generated_messages dict (any of
+    the shapes produced in this module: full 3-channel, single-channel, or raw
+    AI schema).
+
+    EMAIL bodies: strip any model-produced trailing sign-off block, then append
+    exactly "Best,\\n<sender_first>". When sender_first is unknown, only a
+    prospect-name sign-off is stripped and nothing is appended.
+    LinkedIn connection notes / InMail bodies: only strip a trailing
+    prospect-name sign-off (model signing as the prospect) — never append.
+    Mutates nested dicts in place and returns ``messages``.
+    """
+    if not isinstance(messages, dict):
+        return messages
+
+    sender_first = (sender_first or "").strip()
+    prospect_first = (prospect_first or "").strip()
+    email_candidates = {n for n in (prospect_first, sender_first) if n}
+    prospect_candidates = {prospect_first} if prospect_first else set()
+
+    for key in ("cold_email", "email"):
+        payload = messages.get(key)
+        if isinstance(payload, dict) and isinstance(payload.get("body"), str) and payload["body"].strip():
+            original = payload["body"]
+            if sender_first:
+                body = _strip_signoff_block(original, email_candidates, strip_generic=True)
+                if not body.strip():
+                    body = original.rstrip()  # never blank a body — fail-soft
+                payload["body"] = f"{body}\n\nBest,\n{sender_first}"
+            elif prospect_candidates:
+                body = _strip_signoff_block(original, prospect_candidates, strip_generic=False)
+                payload["body"] = body if body.strip() else original.rstrip()
+
+    if prospect_candidates:
+        for key in ("linkedin_inmail",):
+            payload = messages.get(key)
+            if isinstance(payload, dict) and isinstance(payload.get("body"), str) and payload["body"].strip():
+                stripped = _strip_signoff_block(payload["body"], prospect_candidates, strip_generic=False)
+                if stripped.strip():
+                    payload["body"] = stripped
+        li_conn = messages.get("linkedin_connection")
+        if isinstance(li_conn, dict) and isinstance(li_conn.get("note"), str) and li_conn["note"].strip():
+            stripped = _strip_signoff_block(li_conn["note"], prospect_candidates, strip_generic=False)
+            if stripped.strip():
+                li_conn["note"] = stripped
+
+    return messages
+
+
 def _strip_em_dashes_from_messages(data) -> dict:
-    """Recursively strip em dashes from all string values in a messages dict."""
+    """Recursively apply outgoing-copy style rules to a messages dict.
+
+    Covers em dashes and markdown emphasis: neither email nor LinkedIn renders
+    markdown, so `**bold**` would reach the prospect with the asterisks visible.
+    """
     if isinstance(data, dict):
         return {k: _strip_em_dashes_from_messages(v) for k, v in data.items()}
     if isinstance(data, list):
         return [_strip_em_dashes_from_messages(item) for item in data]
     if isinstance(data, str):
-        return _strip_em_dashes(data)
+        from utils.prompts import sanitize_generated_text
+        return sanitize_generated_text(data)
     return data

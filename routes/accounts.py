@@ -4,11 +4,17 @@ from datetime import datetime
 from typing import Optional
 
 from bson import ObjectId
-from fastapi import APIRouter, Depends, HTTPException, status
+from fastapi import APIRouter, Depends, HTTPException, Request, Response, status
 from pydantic import BaseModel
 
 import database
-from auth import create_access_token, get_account_context, get_current_user
+from auth import (
+    get_account_context,
+    get_current_user,
+    is_browser_session_request,
+    rotate_user_access_token,
+    set_session_cookies,
+)
 from models.account import AccountUpdateRequest
 
 router = APIRouter(prefix="/api/accounts", tags=["Accounts"])
@@ -348,6 +354,8 @@ async def update_member_role(
 @router.post("/switch/{account_id}", response_model=None)
 async def switch_account(
     account_id: str,
+    request: Request,
+    response: Response,
     user: dict = Depends(get_current_user),
 ):
     """
@@ -387,13 +395,11 @@ async def switch_account(
         {"$set": {"current_account_id": account_oid, "updated_at": datetime.utcnow()}},
     )
 
-    access_token = create_access_token(
-        data={
-            "sub": user["_id"],
-            "account_id": account_id,
-            "email": user["email"],
-        }
-    )
+    access_token = rotate_user_access_token(user, account_id)
+    if is_browser_session_request(request):
+        set_session_cookies(response, access_token)
+        response.headers["Cache-Control"] = "no-store"
+        return {"switched": True, "account_id": account_id}
     return {"access_token": access_token, "token_type": "bearer"}
 
 

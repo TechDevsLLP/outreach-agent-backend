@@ -1,12 +1,22 @@
 from functools import lru_cache
 from pydantic import Field
-from pydantic_settings import BaseSettings
+from pydantic_settings import BaseSettings, SettingsConfigDict
+
+
+class ProductionConfigurationError(RuntimeError):
+    """Raised before startup when the production security contract is invalid."""
 
 
 class Settings(BaseSettings):
+    model_config = SettingsConfigDict(
+        env_file=".env",
+        env_file_encoding="utf-8",
+        extra="ignore",
+    )
+
     # MongoDB
     mongodb_url: str
-    mongodb_database: str = "LeadAutomation_v2"
+    mongodb_database: str = "outflo_v3"
 
     # API Keys
     apify_api_key: str
@@ -15,13 +25,19 @@ class Settings(BaseSettings):
     gemini_api_key: str = ""
     unipile_token: str = ""  # Unipile LinkedIn automation
     unipile_base_url: str = "https://api29.unipile.com:15901/api/v1"
-    sendgrid_api_key: str = ""  # Phase 6.4: Email sending
-    sendgrid_webhook_secret: str = ""  # Phase 6.4: Inbound parse webhook verification (kept for inbound handler)
-    sendgrid_verification_public_key: str = ""  # ECDSA public key from SendGrid Event Webhook settings page
     sender_email: str = ""  # Set in .env — required for sending
     sender_name: str = ""   # Set in .env — required for sending
     reply_to_email: str = ""  # Inbound parse address (e.g., reply@parse.mentopreneur.com)
     unipile_webhook_secret: str = ""  # Unipile webhook verification
+    # Webhook auth hardening hooks (see routes/webhooks.py):
+    #  - unipile_webhook_signature_header: name of the HMAC signature header
+    #    Unipile sends (documented hook; adjust if Unipile's scheme differs).
+    #  - unipile_webhook_require_hmac: when True, ONLY a valid HMAC-SHA256
+    #    signature is accepted and the plain shared-secret header is rejected.
+    #    Default False keeps backward compatibility (accept either) during the
+    #    transition from the plain-secret scheme to HMAC.
+    unipile_webhook_signature_header: str = "X-Unipile-Signature"
+    unipile_webhook_require_hmac: bool = False
 
     # AI Models
     assessment_model: str = "anthropic/claude-haiku-4-5"
@@ -43,37 +59,27 @@ class Settings(BaseSettings):
     log_level: str = "INFO"
 
     # Apify
-    apify_actor_id: str = "IoSHqwTR9YGhzccez"  # LEADS_FINDER — runs in parallel with Lead Scraper for diversified yield (both actors are active)
-    apify_lead_scraper_id: str = "T1XDXWc1L92AfIJtd"  # Apollo-style lead scraper
-    apify_profile_scraper_id: str = "LpVuK3Zozwuipa5bp"
     apify_company_scraper_id: str = "UwSdACBp7ymaGUJjS"
-    apify_email_finder_actor_id: str = "TthkVR0ZjJt8gbtRy"
     apify_post_scraper_actor_id: str = "r4oNX7IHlW4RQAjKP"
-    apify_bulk_email_finder_actor_id: str = "ddgw2oGFaH645BFAq"
+    # Company-page post scraper (member post actor can't take /company/ URLs).
+    # Called by slug; override with APIFY_COMPANY_POSTS_ACTOR_ID. Fail-soft —
+    # any error yields empty post lists, never breaks the research pipeline.
+    apify_company_posts_actor_id: str = "WI0tj4Ieb5Kq458gB"
+    growthtoolkit_api_key: str = ""
+    growthtoolkit_base_url: str = "https://api.appconnector.pro"
     max_prospects_per_company: int = 2
     enrolled_target_first_campaign: int = 135
-    enrolled_target_floor: int = Field(default=105, description="Minimum acceptable enrolled prospects for first campaign")
 
     # Scraping concurrency
-    industry_concurrency_limit: int = 3      # Max industries scraped in parallel
     apify_actor_concurrency_limit: int = 6   # Max concurrent Apify actor calls globally
 
     # Enrichment
-    enrichment_batch_size: int = 50
     company_scrape_batch_size: int = 10
     ai_concurrency_limit: int = 10
     ai_assessment_concurrency_limit: int = 6  # Phase 3 AI assessment semaphore (paid Haiku tier)
-    scrape_delay_seconds: int = 10
-    enrichment_startup_sweep_enabled: bool = True  # Detect stuck "running" runs on boot
-
-    # Auto-enrichment
-    auto_enrich_enabled: bool = True
-    auto_enrich_threshold: float = 60.0
-    auto_enrich_max_batch: int = 50
-
-    # Auto-discover contacts
-    auto_discover_contacts_enabled: bool = False
-    auto_discover_contacts_threshold: float = 80.0
+    # Legacy process-local recovery path. Durable Mongo jobs supersede it;
+    # production validation requires it disabled.
+    enrichment_startup_sweep_enabled: bool = False
 
     # Contact discovery thresholds (Phase 3.5)
     contact_discovery_company_threshold: float = 60.0
@@ -83,36 +89,26 @@ class Settings(BaseSettings):
     pre_enrichment_triage_enabled: bool = True
     pre_enrichment_company_fit_threshold: float = 30.0
 
-    # Schedule DM triage
-    schedule_dm_triage_enabled: bool = True
-
-    # Scheduler
-    scrape_day_of_week: str = "sat"
-    scrape_hour: int = 6
-    scrape_minute: int = 0
-
     # Daily outreach schedule
     daily_email_quota: int = 20
     daily_linkedin_connection_quota: int = 20
     daily_linkedin_inmail_quota: int = 5
-    outreach_office_hours_start: int = 9   # 9 AM local
-    outreach_office_hours_end: int = 17    # 5 PM local
-    outreach_send_jitter_minutes: int = 15
 
     # Auth
     jwt_secret_key: str
     jwt_algorithm: str = "HS256"
     jwt_expiry_minutes: int = 1440  # 24 hours
-    # Deprecated: single-user admin credentials — kept for backward compatibility
-    # only. New code should use users stored in MongoDB.
-    admin_email: str = ""
-    admin_password_hash: str = ""
+    # Local HTTP development keeps this false. Production forces Secure in
+    # auth._cookie_secure regardless of this override.
+    session_cookie_secure: bool = False
     # Super admin (platform-level) — single email allowlist
     super_admin_email: str | None = None  # set SUPER_ADMIN_EMAIL in .env
 
     # Frontend (for CORS)
     frontend_url: str = "http://localhost:3000"
     cors_origins: str = ""  # comma-separated extra origins, e.g. "http://localhost:3000,https://app.outflo.io"
+    trusted_hosts: str = "localhost,127.0.0.1,testserver"
+    max_request_bytes: int = 10 * 1024 * 1024
 
     # Backend public URL (used for tracking pixel URLs)
     backend_base_url: str = "http://localhost:8002"
@@ -125,33 +121,24 @@ class Settings(BaseSettings):
     google_client_secret: str = ""
     google_redirect_uri: str = ""
 
-    # Microsoft OAuth (per-user email accounts)
-    microsoft_client_id: str = ""
-    microsoft_client_secret: str = ""
-    microsoft_redirect_uri: str = ""
+    # Zoho Mail OAuth (per-user email accounts)
+    zoho_client_id: str = ""
+    zoho_client_secret: str = ""
+    zoho_redirect_uri: str = ""
+
+    # Credential encryption at rest (Fernet key — generate with
+    # `python -c "from cryptography.fernet import Fernet; print(Fernet.generate_key().decode())"`)
+    encryption_key: str = ""
 
     # Quality gates
     quality_gates_enabled: bool = True
     title_gate_enabled: bool = True
-    freshness_gate_enabled: bool = True
     prefilter_gate_enabled: bool = True
-
-    # AI prefilter
-    prefilter_model: str = "google/gemini-3-flash-preview"
-    prefilter_batch_size: int = 20
-    prefilter_concurrency: int = 4
-    prefilter_confidence_threshold: float = 0.25
-
-    # Freshness check
-    freshness_short_mode: bool = True
-    freshness_concurrency: int = 8
 
     # Internal campaign scorer (replaces per-prospect AI calls during discovery)
     min_score_to_enroll: int = 55             # prospects below this fit_score are not enrolled
     score_raw_pool_multiplier: float = 3.0    # top-up: scrape up to target × this before giving up
     score_topup_max_iterations: int = 5       # top-up: max Apify retry rounds
-    enable_ai_assessment_fallback: bool = False   # if True, run AI on a sample for calibration
-    ai_assessment_sample_rate: float = 0.05       # fraction assessed by AI when fallback enabled
 
     # Discovery logging
     discovery_log_dir: str = "logs/campaigns"
@@ -177,12 +164,87 @@ class Settings(BaseSettings):
         "perplexity/sonar-pro": {"prompt": 3.00, "completion": 15.00},
     })
 
-    class Config:
-        env_file = ".env"
-        env_file_encoding = "utf-8"
-        extra = "ignore"
-
-
 @lru_cache()
 def get_settings() -> Settings:
     return Settings()
+
+
+def validate_production_settings(settings: Settings) -> None:
+    """Fail closed on missing launch-critical production configuration."""
+    if settings.app_env.strip().lower() != "production":
+        return
+
+    errors: list[str] = []
+
+    def required(name: str, value: str) -> None:
+        normalized = (value or "").strip()
+        if not normalized or normalized.lower() in {
+            "change-me",
+            "change-me-to-a-random-secret",
+            "replace-me",
+        }:
+            errors.append(f"{name} is required and cannot use a placeholder")
+
+    required("JWT_SECRET_KEY", settings.jwt_secret_key)
+    required("ENCRYPTION_KEY", settings.encryption_key)
+    required("OPENROUTER_API_KEY", settings.openrouter_api_key)
+    required("APIFY_API_KEY", settings.apify_api_key)
+    required("GROWTHTOOLKIT_API_KEY", settings.growthtoolkit_api_key)
+    required("UNIPILE_TOKEN", settings.unipile_token)
+    required("UNIPILE_WEBHOOK_SECRET", settings.unipile_webhook_secret)
+    required("GOOGLE_CLIENT_ID", settings.google_client_id)
+    required("GOOGLE_CLIENT_SECRET", settings.google_client_secret)
+    required("GOOGLE_REDIRECT_URI", settings.google_redirect_uri)
+
+    if len((settings.jwt_secret_key or "").encode("utf-8")) < 32:
+        errors.append("JWT_SECRET_KEY must contain at least 32 bytes")
+    if settings.debug:
+        errors.append("DEBUG must be false in production")
+    if settings.discovery_mock_mode:
+        errors.append("DISCOVERY_MOCK_MODE must be false in production")
+    if settings.enrichment_startup_sweep_enabled:
+        errors.append("ENRICHMENT_STARTUP_SWEEP_ENABLED must be false in production")
+
+    allowed_roles = {"web", "scheduler", "worker"}
+    if settings.app_role not in allowed_roles:
+        errors.append(
+            "APP_ROLE must be web, scheduler, or worker in production; "
+            "the combined all role is not deployment-safe"
+        )
+
+    for name, value in {
+        "FRONTEND_URL": settings.frontend_url,
+        "BACKEND_BASE_URL": settings.backend_base_url,
+        "API_BASE_URL": settings.api_base_url,
+        "GOOGLE_REDIRECT_URI": settings.google_redirect_uri,
+    }.items():
+        if not (value or "").startswith("https://"):
+            errors.append(f"{name} must use https:// in production")
+
+    origins = [
+        origin.strip()
+        for origin in (settings.cors_origins or settings.frontend_url).split(",")
+        if origin.strip()
+    ]
+    if not origins or any(origin == "*" or not origin.startswith("https://") for origin in origins):
+        errors.append("CORS_ORIGINS must contain only explicit HTTPS origins")
+
+    trusted_hosts = [
+        host.strip() for host in settings.trusted_hosts.split(",") if host.strip()
+    ]
+    if not trusted_hosts or any(host == "*" for host in trusted_hosts):
+        errors.append("TRUSTED_HOSTS must contain only explicit hostnames")
+    if settings.max_request_bytes <= 0:
+        errors.append("MAX_REQUEST_BYTES must be greater than zero")
+
+    try:
+        from cryptography.fernet import Fernet
+
+        Fernet((settings.encryption_key or "").encode("utf-8"))
+    except Exception:
+        errors.append("ENCRYPTION_KEY must be a valid Fernet key")
+
+    if errors:
+        raise ProductionConfigurationError(
+            "Invalid production configuration: " + "; ".join(errors)
+        )

@@ -123,7 +123,7 @@ async def source_preview_prospects(
         bulk_scrape_employees_for_companies,
         transform_employee_to_prospect,
     )
-    from services.email_finder_service import find_emails_for_linkedin_urls
+    from services.email_finder_service import find_emails, EmailLookupEntry
 
     # Apply per-reroll overrides without mutating the caller's profile
     working_profile = dict(profile)
@@ -227,15 +227,20 @@ async def source_preview_prospects(
         return []
 
     # Find emails for prospects that don't have one (Short mode rarely returns emails)
-    missing_email_lis = [
-        p["linkedin"] for p in prospects if not p.get("email") and p.get("linkedin")
+    email_entries = [
+        EmailLookupEntry(
+            first_name=p["first_name"],
+            last_name=p["last_name"],
+            domain=p["company_domain"],
+            key=p["linkedin"],
+        )
+        for p in prospects
+        if not p.get("email") and p.get("linkedin")
+        and p.get("first_name") and p.get("last_name") and p.get("company_domain")
     ]
-    if missing_email_lis:
+    if email_entries:
         try:
-            email_map = await find_emails_for_linkedin_urls(
-                missing_email_lis,
-                account_id=account_id,
-            )
+            email_map = await find_emails(email_entries, account_id=str(account_id) if account_id else None)
             for p in prospects:
                 if not p.get("email") and p.get("linkedin"):
                     found = email_map.get(p["linkedin"])
@@ -317,7 +322,7 @@ async def _launch_onboarding_first_campaign_legacy(
     Returns the new campaign_id (string).
     """
     from services.curated_discovery_service import _upsert_curated_prospect, _run_day1_message_gen
-    from services.campaign_prospect_finder_service import _pre_enroll_prospects
+    from services.prospect_enrollment_service import _pre_enroll_prospects
 
     account_oid = ObjectId(account_id)
     user_oid = ObjectId(user_id)

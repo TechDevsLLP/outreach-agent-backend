@@ -19,6 +19,47 @@ from services.daily_cap_service import DEFAULT_CAPS as DEFAULT_DAILY_CAPS, SEND_
 
 logger = logging.getLogger(__name__)
 
+SEQUENCE_GRAPH_CONTRACT = "sequence_graph_v1"
+
+
+class SequenceLaunchValidationError(ValueError):
+    """Raised before launch when a canonical sequence is missing or invalid."""
+
+    status_code = 409
+
+
+def ensure_sequence_ready_for_launch(campaign: dict) -> None:
+    """Validate the persisted execution graph for canonical multi-touch campaigns.
+
+    Legacy campaigns do not declare a sequence contract and continue through
+    their existing execution path. A campaign becomes canonical when creation
+    stores ``sequence_contract=sequence_graph_v1`` or when it already carries a
+    ``sequence_graph`` field. The explicit marker makes a later missing graph a
+    launch-blocking data error instead of silently falling back to another flow.
+    """
+    uses_sequence_graph = (
+        campaign.get("sequence_contract") == SEQUENCE_GRAPH_CONTRACT
+        or "sequence_graph" in campaign
+    )
+    if not uses_sequence_graph:
+        return
+
+    graph = campaign.get("sequence_graph")
+    if not graph:
+        raise SequenceLaunchValidationError(
+            "Campaign sequence is not saved. Open the Sequence tab, save a valid "
+            "sequence, and try launching again."
+        )
+
+    from services.sequence_service import validate_sequence_graph
+
+    errors = validate_sequence_graph(graph)
+    if errors:
+        raise SequenceLaunchValidationError(
+            f"Campaign sequence is invalid: {errors[0]} Open the Sequence tab, "
+            "fix and save the sequence, then try launching again."
+        )
+
 # Seniority levels that qualify for InMail
 _INMAIL_SENIORITY = {
     "c_suite", "c-suite", "csuite",
@@ -99,6 +140,7 @@ def plan_channel_assignments(
     prospects_by_id: dict,
     start_day: int = 1,
     min_score: float | None = None,
+    existing_counts: dict[tuple[int, str], int] | None = None,
 ) -> tuple[list[tuple[dict, str, int]], dict[str, int]]:
     """
     Assign a channel + send_day to every enrollment without setting any times.
@@ -136,8 +178,16 @@ def plan_channel_assignments(
         p = prospects_by_id.get(e["prospect_id"], {})
         return p.get("ai_prospect_score") or p.get("prospect_score") or 0
 
-    from config import get_settings as _get_settings
-    _min_enroll = min_score if min_score is not None else _get_settings().min_score_to_enroll
+    # Channel-planning enrollment floor. When a caller doesn't pass min_score,
+    # use the same per-campaign override + 25 default that finalize_channel_plan
+    # applies — NOT settings.min_score_to_enroll (55), which is the discovery
+    # *pool* floor, a different concept. Keeping them separate stops callers that
+    # omit min_score (e.g. replan_channels_on_sender_add) from silently dropping
+    # every prospect scoring 25–54.
+    _min_enroll = (
+        min_score if min_score is not None
+        else float(campaign.get("discovery_min_enroll_score") or 25)
+    )
 
     def _channel_ok(enrollment: dict, channel: str) -> bool:
         """Return True if this enrollment can use the given channel (ignoring caps)."""
@@ -158,6 +208,14 @@ def plan_channel_assignments(
     assignments: list[tuple[dict, str, int]] = []
     skip_reasons: dict[str, int] = {}
     day_counts: dict[int, dict[str, int]] = {}
+
+    # Seed per-day channel usage from enrollments already planned by earlier
+    # top-up generations so this batch continues from the first day with room
+    # instead of re-piling onto day 1 past the caps.
+    if existing_counts:
+        for (_d, _ch), _n in existing_counts.items():
+            bucket = day_counts.setdefault(int(_d), {k: 0 for k in caps})
+            bucket[_ch] = bucket.get(_ch, 0) + int(_n)
 
     # Pre-scan: globally exclude prospects with no valid channel at all.
     # This maintains the same skip_reasons telemetry as before.
@@ -387,23 +445,48 @@ async def approve_day(campaign: dict, day_n: int) -> dict:
     if not campaign.get("is_smart_campaign"):
         raise ValueError("approve_day is only for smart campaigns")
 
+    ensure_sequence_ready_for_launch(campaign)
+
     approved_days = set(campaign.get("approved_send_days") or [])
-    if day_n in approved_days:
-        raise ValueError(f"Day {day_n} has already been approved")
+    is_reapproval = day_n in approved_days
+
+    # A sequence-graph campaign's start node id isn't always "n1" (hybrid
+    # campaigns declare one start node per route) — derive the real set from
+    # the graph instead of hardcoding the classic single-route id.
+    from services import sequence_service as seq
+    graph = campaign.get("sequence_graph") or {}
+    start_node_ids = seq.get_start_node_ids(graph) if graph else []
+    message_ready_conditions = [
+        {"message_gen_status": "done"},
+        {"generated_messages": {"$exists": True, "$ne": None}},
+    ] + [
+        {f"generated_messages_by_step.{nid}": {"$exists": True}}
+        for nid in start_node_ids
+    ]
 
     # Load all enrollments planned for this day that have a message ready.
-    enrollments = await database.campaign_enrollments_collection.find({
+    enrollment_query: dict = {
         "campaign_id": campaign_oid,
         "smart_campaign_send_day": day_n,
-        "status": {"$nin": ["archived", "skipped_no_channel", "pending_teammate_review"]},
-        "$or": [
-            {"message_gen_status": "done"},
-            {"generated_messages": {"$exists": True, "$ne": None}},
-            {"generated_messages_by_step.n1": {"$exists": True}},
-        ],
-    }).to_list(length=5000)
+        "status": {"$nin": ["archived", "skipped_no_channel", "pending_teammate_review", "cascade_waiting"]},
+        "$or": message_ready_conditions,
+    }
+    if is_reapproval:
+        # Re-approving an already-approved day must be idempotent: only pick up
+        # enrollments that missed the first pass (e.g. message-gen failed and
+        # was regenerated afterwards) — never re-touch ones already scheduled.
+        enrollment_query["next_action_at"] = None
+
+    enrollments = await database.campaign_enrollments_collection.find(
+        enrollment_query
+    ).to_list(length=5000)
 
     if not enrollments:
+        if is_reapproval:
+            raise ValueError(
+                f"Day {day_n} is already approved and has no newly-ready "
+                f"enrollments to pick up."
+            )
         raise ValueError(
             f"No enrollments with generated messages found for Day {day_n}. "
             f"Messages may still be generating — try again in a minute."
@@ -427,30 +510,60 @@ async def approve_day(campaign: dict, day_n: int) -> dict:
         for enr in enrollments_sorted
     ]
 
-    # Pick the calendar date
-    campaign_tz_str = campaign.get("timezone", "America/New_York")
-    send_days = campaign.get("send_days") or ["monday", "tuesday", "wednesday", "thursday", "friday"]
-    send_hour_end = campaign.get("send_hour_end", 17)
-
-    try:
-        campaign_tz = pytz.timezone(campaign_tz_str)
-        now_local = datetime.utcnow().replace(tzinfo=pytz.utc).astimezone(campaign_tz)
-    except Exception:
-        now_local = datetime.utcnow().replace(tzinfo=pytz.utc)
-    today_local = now_local.date()
-
-    if day_n == 1:
-        send_hour_start = campaign.get("send_hour_start", 9)
-        # First launch: today if we're inside the send window on an eligible day
-        outside_window = now_local.hour < send_hour_start or now_local.hour >= send_hour_end
-        not_send_day = today_local.strftime("%A").lower() not in [d.lower() for d in send_days]
-        if outside_window or not_send_day:
-            target_date = next_eligible_day(today_local + timedelta(days=1), send_days)
+    # Enforce the per-channel daily cap at schedule-write time. Upstream day
+    # bucketing (plan_route_first_touch_days) is *supposed* to keep each
+    # send_day within cap, but other enrollment paths (cascade-primary
+    # activation, top-up generations) can pin many prospects to a single
+    # send_day. Without this guard, approve_day would schedule all of them on
+    # one calendar date — e.g. 33 LinkedIn connection requests in a day when the
+    # cap is 20. Schedule up to the cap (top-score-first, already sorted) and
+    # bump the overflow to the next send day so it flows through the next
+    # approval instead of blowing the quota.
+    from services.daily_cap_service import DEFAULT_CAPS
+    caps = campaign.get("daily_caps") or DEFAULT_CAPS
+    placed: list[tuple[dict, str]] = []
+    overflow: list[dict] = []
+    per_channel_used: dict[str, int] = {}
+    for enr, channel in day_enrollments:
+        cap = int(caps.get(channel, DEFAULT_CAPS.get(channel, 20)) or 0)
+        used = per_channel_used.get(channel, 0)
+        if cap > 0 and used >= cap:
+            overflow.append(enr)
         else:
-            target_date = today_local
+            placed.append((enr, channel))
+            per_channel_used[channel] = used + 1
+    day_enrollments = placed
+
+    # Pick the calendar date. A re-approval must land newly-ready stragglers on
+    # the SAME calendar date as the rest of that day's cohort, not a fresh
+    # "today"/"tomorrow" computed at the (later) re-approval moment.
+    existing_day_approval = (campaign.get("day_approvals") or {}).get(str(day_n))
+    if is_reapproval and existing_day_approval and existing_day_approval.get("target_date"):
+        target_date = date.fromisoformat(str(existing_day_approval["target_date"])[:10])
     else:
-        # Day 2+ always shifts to "tomorrow from approval date" (or next eligible day)
-        target_date = next_eligible_day(today_local + timedelta(days=1), send_days)
+        campaign_tz_str = campaign.get("timezone", "America/New_York")
+        send_days = campaign.get("send_days") or ["monday", "tuesday", "wednesday", "thursday", "friday"]
+        send_hour_end = campaign.get("send_hour_end", 17)
+
+        try:
+            campaign_tz = pytz.timezone(campaign_tz_str)
+            now_local = datetime.utcnow().replace(tzinfo=pytz.utc).astimezone(campaign_tz)
+        except Exception:
+            now_local = datetime.utcnow().replace(tzinfo=pytz.utc)
+        today_local = now_local.date()
+
+        if day_n == 1:
+            send_hour_start = campaign.get("send_hour_start", 9)
+            # First launch: today if we're inside the send window on an eligible day
+            outside_window = now_local.hour < send_hour_start or now_local.hour >= send_hour_end
+            not_send_day = today_local.strftime("%A").lower() not in [d.lower() for d in send_days]
+            if outside_window or not_send_day:
+                target_date = next_eligible_day(today_local + timedelta(days=1), send_days)
+            else:
+                target_date = today_local
+        else:
+            # Day 2+ always shifts to "tomorrow from approval date" (or next eligible day)
+            target_date = next_eligible_day(today_local + timedelta(days=1), send_days)
 
     # Compute per-enrollment send times
     times = compute_send_times_for_day(campaign, day_enrollments, target_date, prospects_by_id)
@@ -459,9 +572,10 @@ async def approve_day(campaign: dict, day_n: int) -> dict:
     now = datetime.utcnow()
     bulk_ops = []
     channel_counts: dict[str, int] = {}
+    times_by_id = dict(times)
 
     for enr, channel in day_enrollments:
-        scheduled_utc = next((t for (eid, t) in times if eid == enr["_id"]), None)
+        scheduled_utc = times_by_id.get(enr["_id"])
         channel_counts[channel] = channel_counts.get(channel, 0) + 1
         bulk_ops.append(UpdateOne(
             {"_id": enr["_id"]},
@@ -478,6 +592,36 @@ async def approve_day(campaign: dict, day_n: int) -> dict:
     if bulk_ops:
         await database.campaign_enrollments_collection.bulk_write(bulk_ops, ordered=False)
 
+    # Bump over-cap enrollments to the next send day. They keep their generated
+    # messages; clearing the schedule fields makes them re-appear as unscheduled
+    # day-(N+1) work for the next approval, which will again cap + bump as needed
+    # until everything is scheduled across enough days to respect the quota.
+    if overflow:
+        # Bump to the first day beyond day_n that isn't already approved — if
+        # day_n + 1 was already approved (e.g. by an earlier top-up
+        # generation), landing overflow there strands it: that day's approval
+        # already ran and nothing re-scans it for newly-added stragglers.
+        overflow_target_day = day_n + 1
+        while overflow_target_day in approved_days:
+            overflow_target_day += 1
+        overflow_ops = [
+            UpdateOne(
+                {"_id": enr["_id"]},
+                {"$set": {
+                    "smart_campaign_send_day": overflow_target_day,
+                    "smart_campaign_scheduled_utc": None,
+                    "next_action_at": None,
+                    "last_activity_at": now,
+                }},
+            )
+            for enr in overflow
+        ]
+        await database.campaign_enrollments_collection.bulk_write(overflow_ops, ordered=False)
+        logger.info(
+            f"[approve_day:{campaign_oid}] day {day_n}: scheduled {len(bulk_ops)} within "
+            f"caps {dict(per_channel_used)}, bumped {len(overflow)} over-cap enrollments to day {overflow_target_day}"
+        )
+
     # Update campaign state
     campaign_update: dict = {
         "$addToSet": {"approved_send_days": day_n},
@@ -488,10 +632,11 @@ async def approve_day(campaign: dict, day_n: int) -> dict:
                 "target_date": target_date.isoformat(),
                 "total_scheduled": len(bulk_ops),
                 "channel_counts": channel_counts,
+                "bumped_to_next_day": len(overflow),
             },
         },
     }
-    if day_n == 1:
+    if day_n == 1 and not is_reapproval:
         campaign_update["$set"].update({
             "status": "active",
             "approval_status": "launched",
@@ -532,6 +677,8 @@ async def run_approve_and_launch(campaign: dict, account_id: ObjectId) -> dict:
     if not campaign.get("is_smart_campaign"):
         raise ValueError("run_approve_and_launch is only for smart campaigns")
 
+    ensure_sequence_ready_for_launch(campaign)
+
     if campaign.get("message_gen_status") != "completed":
         raise ValueError(
             f"Message generation must be completed before launch "
@@ -559,7 +706,7 @@ async def run_approve_and_launch(campaign: dict, account_id: ObjectId) -> dict:
     # Load all ready enrollments — accept both "done" status and any with generated_messages set
     enrollments = await database.campaign_enrollments_collection.find({
         "campaign_id": campaign_oid,
-        "status": {"$nin": ["archived", "skipped_no_channel", "pending_teammate_review"]},
+        "status": {"$nin": ["archived", "skipped_no_channel", "pending_teammate_review", "cascade_waiting"]},
         "$or": [
             {"message_gen_status": "done"},
             {"generated_messages": {"$exists": True, "$ne": None}},

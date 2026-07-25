@@ -18,6 +18,7 @@ from database import (
     campaign_enrollments_collection,
 )
 from models.reply_classification import REPLY_CATEGORIES
+from services.conversation_service import _account_filter
 from services.openrouter_service import OpenRouterClient
 from utils.prompts import (
     REPLY_CLASSIFIER_SYSTEM_PROMPT,
@@ -84,14 +85,16 @@ async def classify_reply(
     except Exception:
         logger.error(f"Classifier returned non-JSON for conversation {conversation_id}: {content[:200]}")
         parsed = {
-            "category": "QUESTION",
-            "confidence": 0.5,
+            "category": "PARSE_FAILED",
+            "confidence": 0.0,
             "signals": {"sentiment": "neutral", "hostility_score": 0.0},
         }
 
-    category = parsed.get("category", "QUESTION")
+    # An unparseable or unrecognized category is never auto-sent — it falls
+    # through handle_classified_reply's handler_map lookup and escalates.
+    category = parsed.get("category", "PARSE_FAILED")
     if category not in REPLY_CATEGORIES:
-        category = "QUESTION"
+        category = "PARSE_FAILED"
 
     confidence = float(parsed.get("confidence", 0.5))
     signals = parsed.get("signals", {})
@@ -200,6 +203,20 @@ async def process_due_conversations() -> dict:
 
     async for conv in cursor:
         conv_id = str(conv["_id"])
+
+        # Atomically claim this conversation before the AI call — otherwise a
+        # second replica/tick polling the same due window can classify (and
+        # auto-reply to) the same message twice.
+        claimed = await conversations_collection.find_one_and_update(
+            {"_id": conv["_id"], "needs_classification": True},
+            {"$set": {
+                "needs_classification": False,
+                "classifier_claimed_at": datetime.now(timezone.utc),
+            }},
+        )
+        if not claimed:
+            continue
+
         try:
             # Find the latest inbound message to classify
             messages = conv.get("messages") or []
@@ -210,11 +227,7 @@ async def process_due_conversations() -> dict:
                     break
 
             if not inbound_msg:
-                # Nothing to classify — clear the flag
-                await conversations_collection.update_one(
-                    {"_id": conv["_id"]},
-                    {"$set": {"needs_classification": False}},
-                )
+                # Nothing to classify — flag already cleared by the claim above
                 continue
 
             message_text = inbound_msg.get("content_text") or ""
@@ -227,8 +240,21 @@ async def process_due_conversations() -> dict:
             if prospect_id:
                 enr = await campaign_enrollments_collection.find_one(
                     {
+                        **_account_filter(account_id),
                         "prospect_id": {"$in": [prospect_id, ObjectId(prospect_id)]},
-                        "status": {"$in": ["active", "enrolled", "replied"]},
+                        # Include the post-proposal states: a prospect who replies
+                        # again after we proposed or booked a meeting must still
+                        # resolve to their enrollment, otherwise the handler loses
+                        # all campaign context and falls back to a generic reply.
+                        "status": {
+                            "$in": [
+                                "active",
+                                "enrolled",
+                                "replied",
+                                "meeting_proposed",
+                                "meeting_booked",
+                            ]
+                        },
                     },
                     {"_id": 1},
                 )
@@ -245,15 +271,9 @@ async def process_due_conversations() -> dict:
                 prospect_id=prospect_id,
             )
 
-            # Clear the flag immediately (before handler — idempotent on retry)
             await conversations_collection.update_one(
                 {"_id": conv["_id"]},
-                {
-                    "$set": {
-                        "needs_classification": False,
-                        "classifier_processed_at": datetime.now(timezone.utc),
-                    }
-                },
+                {"$set": {"classifier_processed_at": datetime.now(timezone.utc)}},
             )
 
             # Trigger the handler
@@ -267,11 +287,22 @@ async def process_due_conversations() -> dict:
 
         except Exception as e:
             logger.error(f"Error processing classification for conversation {conv_id}: {e}", exc_info=True)
-            # Clear the flag to prevent infinite retry loop — a human can re-trigger if needed
+            # The claim already cleared needs_classification — record the
+            # failure and escalate instead of silently dropping the reply.
             try:
                 await conversations_collection.update_one(
                     {"_id": conv["_id"]},
-                    {"$set": {"needs_classification": False}},
+                    {"$set": {"classification_error": str(e)[:500]}},
+                )
+            except Exception:
+                pass
+            try:
+                from services.reply_handler_service import _escalate_to_human
+                await _escalate_to_human(
+                    enrollment_id=None,
+                    conversation_id=conv_id,
+                    account_id=conv.get("account_id", ""),
+                    reason=f"Classification error: {e}",
                 )
             except Exception:
                 pass

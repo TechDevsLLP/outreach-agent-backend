@@ -467,15 +467,6 @@ def get_default_flow(prospect: dict, campaign: dict) -> dict:
     return DEFAULT_FLOW_LINKEDIN_FIRST
 
 
-def get_preset_flow(preset: str) -> dict:
-    """Return the preset flow dict for a given aggression preset name."""
-    return {
-        "aggressive": AGGRESSIVE_PRESET_FLOW,
-        "moderate": MODERATE_PRESET_FLOW,
-        "conservative": CONSERVATIVE_PRESET_FLOW,
-    }.get(preset, AGGRESSIVE_PRESET_FLOW)
-
-
 # ─── State management ────────────────────────────────────────────────────────
 
 def build_initial_state(enrollment: dict, flow: dict, prospect: dict) -> dict:
@@ -627,14 +618,3 @@ def get_current_node(flow_state: dict, flow: dict) -> Optional[dict]:
 
 def is_stopped(flow_state: dict) -> bool:
     return flow_state.get("current_node_id") == "STOP" or flow_state.get("stopped", False)
-
-
-def compute_no_response_timeout(flow_state: dict) -> Optional[datetime]:
-    """Parse the next_timeout_check field into a datetime, or None."""
-    ts = flow_state.get("next_timeout_check")
-    if not ts:
-        return None
-    try:
-        return datetime.fromisoformat(ts)
-    except Exception:
-        return None

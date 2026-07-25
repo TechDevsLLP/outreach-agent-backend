@@ -1,6 +1,6 @@
 """
 Notification Service.
-Handles notification CRUD, SSE broadcasting, and real-time event streaming.
+Handles tenant-scoped notification persistence and database-backed SSE replay.
 """
 
 import asyncio
@@ -15,21 +15,7 @@ from database import notifications_collection
 
 logger = logging.getLogger(__name__)
 
-# In-process SSE clients: set of asyncio.Queue instances
-_sse_clients: set[asyncio.Queue] = set()
 _shutdown_event = asyncio.Event()
-
-
-def _register_client() -> asyncio.Queue:
-    queue: asyncio.Queue = asyncio.Queue()
-    _sse_clients.add(queue)
-    logger.info(f"SSE client connected (total: {len(_sse_clients)})")
-    return queue
-
-
-def _unregister_client(queue: asyncio.Queue):
-    _sse_clients.discard(queue)
-    logger.info(f"SSE client disconnected (total: {len(_sse_clients)})")
 
 
 def shutdown_sse():
@@ -37,28 +23,26 @@ def shutdown_sse():
     _shutdown_event.set()
 
 
-async def _broadcast(event_type: str, data: dict, event_id: Optional[str] = None):
-    """Send an event to all connected SSE clients."""
-    for queue in _sse_clients.copy():
-        try:
-            await queue.put({"event": event_type, "data": data, "id": event_id})
-        except Exception:
-            pass
-
-
 async def create_notification(
+    account_id: str,
     type: str,
     title: str,
     body: str,
+    campaign_id: Optional[str] = None,
     prospect_id: Optional[str] = None,
     conversation_id: Optional[str] = None,
     channel: Optional[str] = None,
 ) -> dict:
-    """Create a notification and broadcast to SSE clients."""
+    """Persist one canonical, tenant-owned notification."""
+    account_id = str(account_id).strip()
+    if not account_id:
+        raise ValueError("account_id is required for notifications")
     doc = {
+        "account_id": account_id,
         "type": type,
         "title": title,
         "body": body,
+        "campaign_id": str(campaign_id) if campaign_id else None,
         "prospect_id": prospect_id,
         "conversation_id": conversation_id,
         "channel": channel,
@@ -70,39 +54,19 @@ async def create_notification(
     result = await notifications_collection.insert_one(doc)
     doc["_id"] = result.inserted_id
     notification_id = str(result.inserted_id)
-
-    # Get current unread count
-    unread = await notifications_collection.count_documents({"is_read": False})
-
-    # Broadcast to SSE clients
-    await _broadcast(
-        "notification",
-        {
-            "id": notification_id,
-            "type": type,
-            "title": title,
-            "body": body,
-            "prospect_id": prospect_id,
-            "conversation_id": conversation_id,
-            "channel": channel,
-            "created_at": doc["created_at"].isoformat(),
-            "unread_count": unread,
-        },
-        event_id=notification_id,
-    )
-
-    logger.info(f"Notification created: {type} - {title} (id={notification_id})")
+    logger.info("Notification created: type=%s id=%s", type, notification_id)
     return doc
 
 
 async def list_notifications(
+    account_id: str,
     page: int = 1,
     page_size: int = 20,
     is_read: Optional[bool] = None,
     type: Optional[str] = None,
 ) -> dict:
     """List notifications with pagination and filtering."""
-    query: dict = {}
+    query: dict = {"account_id": str(account_id)}
     if is_read is not None:
         query["is_read"] = is_read
     if type is not None:
@@ -126,93 +90,114 @@ async def list_notifications(
     }
 
 
-async def get_unread_count() -> int:
-    return await notifications_collection.count_documents({"is_read": False})
+async def get_unread_count(account_id: str) -> int:
+    return await notifications_collection.count_documents(
+        {"account_id": str(account_id), "is_read": False}
+    )
 
 
-async def mark_read(notification_id: str) -> bool:
+async def mark_read(account_id: str, notification_id: str) -> bool:
     result = await notifications_collection.update_one(
-        {"_id": ObjectId(notification_id), "is_read": False},
+        {
+            "_id": ObjectId(notification_id),
+            "account_id": str(account_id),
+            "is_read": False,
+        },
         {"$set": {"is_read": True, "read_at": datetime.utcnow()}},
     )
-    if result.modified_count > 0:
-        unread = await get_unread_count()
-        await _broadcast("count", {"unread_count": unread})
     return result.modified_count > 0
 
 
-async def mark_all_read() -> int:
+async def mark_all_read(account_id: str) -> int:
     result = await notifications_collection.update_many(
-        {"is_read": False},
+        {"account_id": str(account_id), "is_read": False},
         {"$set": {"is_read": True, "read_at": datetime.utcnow()}},
     )
-    if result.modified_count > 0:
-        await _broadcast("count", {"unread_count": 0})
     return result.modified_count
 
 
-async def delete_notification(notification_id: str) -> bool:
-    # Check if it was unread before deleting
-    doc = await notifications_collection.find_one({"_id": ObjectId(notification_id)})
-    result = await notifications_collection.delete_one({"_id": ObjectId(notification_id)})
-    if result.deleted_count > 0 and doc and not doc.get("is_read"):
-        unread = await get_unread_count()
-        await _broadcast("count", {"unread_count": unread})
+async def delete_notification(account_id: str, notification_id: str) -> bool:
+    result = await notifications_collection.delete_one(
+        {"_id": ObjectId(notification_id), "account_id": str(account_id)}
+    )
     return result.deleted_count > 0
 
 
-async def event_stream(last_event_id: Optional[str] = None) -> AsyncGenerator[str, None]:
+async def event_stream(
+    account_id: str,
+    last_event_id: Optional[str] = None,
+) -> AsyncGenerator[str, None]:
     """
     SSE async generator.
     - Sends initial unread count
-    - Replays missed notifications if Last-Event-ID provided
-    - Streams new events from queue
+    - Replays missed tenant notifications if Last-Event-ID is provided
+    - Polls durable Mongo state so events from worker/scheduler replicas appear
     - 30s keepalive heartbeat
     """
-    queue = _register_client()
+    account_id = str(account_id)
     try:
         # Send initial unread count
-        unread = await get_unread_count()
+        unread = await get_unread_count(account_id)
         yield _format_sse("count", {"unread_count": unread})
 
-        # Replay missed notifications since last_event_id
+        last_seen: Optional[ObjectId] = None
         if last_event_id:
             try:
-                replay_query = {
-                    "_id": {"$gt": ObjectId(last_event_id)},
-                }
-                cursor = notifications_collection.find(replay_query).sort("_id", 1)
-                async for doc in cursor:
-                    notification_id = str(doc["_id"])
-                    yield _format_sse(
-                        "notification",
-                        {
-                            "id": notification_id,
-                            "type": doc["type"],
-                            "title": doc["title"],
-                            "body": doc["body"],
-                            "prospect_id": doc.get("prospect_id"),
-                            "conversation_id": doc.get("conversation_id"),
-                            "channel": doc.get("channel"),
-                            "created_at": doc["created_at"].isoformat(),
-                        },
-                        event_id=notification_id,
-                    )
-            except Exception as e:
-                logger.warning(f"Failed to replay notifications: {e}")
+                last_seen = ObjectId(last_event_id)
+            except Exception:
+                last_seen = None
+        if last_seen is None:
+            latest = await notifications_collection.find_one(
+                {"account_id": account_id},
+                {"_id": 1},
+                sort=[("_id", -1)],
+            )
+            last_seen = latest.get("_id") if latest else None
 
-        # Stream events from queue with heartbeat
+        heartbeat_elapsed = 0
         while not _shutdown_event.is_set():
-            try:
-                event = await asyncio.wait_for(queue.get(), timeout=30.0)
-                yield _format_sse(event["event"], event["data"], event.get("id"))
-            except asyncio.TimeoutError:
-                # Send heartbeat
+            query: dict = {"account_id": account_id}
+            if last_seen is not None:
+                query["_id"] = {"$gt": last_seen}
+            cursor = notifications_collection.find(query).sort("_id", 1).limit(100)
+            emitted = False
+            async for doc in cursor:
+                emitted = True
+                last_seen = doc["_id"]
+                notification_id = str(last_seen)
+                yield _format_sse(
+                    "notification",
+                    _notification_event(doc),
+                    event_id=notification_id,
+                )
+            if emitted:
+                heartbeat_elapsed = 0
+                yield _format_sse(
+                    "count",
+                    {"unread_count": await get_unread_count(account_id)},
+                )
+            await asyncio.sleep(2)
+            heartbeat_elapsed += 2
+            if heartbeat_elapsed >= 30:
                 yield ": heartbeat\n\n"
+                heartbeat_elapsed = 0
     except (asyncio.CancelledError, GeneratorExit):
         pass
-    finally:
-        _unregister_client(queue)
+
+
+def _notification_event(doc: dict) -> dict:
+    created_at = doc.get("created_at")
+    return {
+        "id": str(doc["_id"]),
+        "type": doc["type"],
+        "title": doc["title"],
+        "body": doc.get("body", ""),
+        "campaign_id": doc.get("campaign_id"),
+        "prospect_id": doc.get("prospect_id"),
+        "conversation_id": doc.get("conversation_id"),
+        "channel": doc.get("channel"),
+        "created_at": created_at.isoformat() if created_at else None,
+    }
 
 
 def _format_sse(event: str, data: dict, event_id: Optional[str] = None) -> str:

@@ -79,124 +79,6 @@ PRIORITY_COUNTRIES = ["united states", "united kingdom", "germany", "france",
                       "ireland", "poland"]
 
 
-def score_prospect(lead: dict) -> tuple[float, dict]:
-    """
-    Score a prospect against the configured ICP.
-    Returns (total_score, breakdown_dict).
-    """
-    breakdown = {}
-
-    # 1. Seniority (max 25)
-    seniority = (lead.get("seniority_level") or "").lower().strip()
-    seniority_score = 0
-    for key, points in TARGET_SENIORITY.items():
-        if key in seniority:
-            seniority_score = points
-            break
-    breakdown["seniority"] = seniority_score
-
-    # 2. Industry match (max 20)
-    industry = (lead.get("industry") or "").lower().strip()
-    industry_score = 0
-    for key, points in TARGET_INDUSTRIES.items():
-        if key in industry or industry in key:
-            industry_score = max(industry_score, points)
-    breakdown["industry"] = industry_score
-
-    # 3. Company size (max 15)
-    company_size = lead.get("company_size")
-    size_score = 0
-    if company_size is not None:
-        try:
-            company_size = int(company_size)
-        except (ValueError, TypeError):
-            company_size = None
-    if company_size is not None:
-        if 20 <= company_size <= 5000:
-            size_score = 15  # Sweet spot
-        elif 10 <= company_size < 20:
-            size_score = 8
-        elif 5000 < company_size <= 10000:
-            size_score = 10
-        elif company_size > 10000:
-            size_score = 5
-    breakdown["company_size"] = size_score
-
-    # 4. Revenue match (max 15)
-    revenue = lead.get("company_annual_revenue_clean")
-    revenue_score = 0
-    if revenue is not None:
-        try:
-            revenue = float(revenue)
-        except (ValueError, TypeError):
-            revenue = None
-    if revenue is not None:
-        rev_m = revenue / 1_000_000  # Convert to millions
-        if 20 <= rev_m <= 250:
-            revenue_score = 15  # Sweet spot
-        elif 5 <= rev_m < 20:
-            revenue_score = 10
-        elif 250 < rev_m <= 2000:
-            revenue_score = 10
-        elif rev_m > 2000:
-            revenue_score = 5
-        elif 1 <= rev_m < 5:
-            revenue_score = 3
-    breakdown["revenue"] = revenue_score
-
-    # 5. Location match (max 10)
-    city = (lead.get("city") or "").lower().strip()
-    country = (lead.get("country") or "").lower().strip()
-    location_score = 0
-    all_priority_cities = PRIORITY_CITIES_USA + PRIORITY_CITIES_EUROPE
-    if city in all_priority_cities:
-        location_score = 10
-    elif country in PRIORITY_COUNTRIES:
-        location_score = 7
-    elif country:
-        location_score = 3
-    breakdown["location"] = location_score
-
-    # 6. Job title keywords (max 10)
-    job_title = (lead.get("job_title") or "").lower()
-    headline = (lead.get("headline") or "").lower()
-    combined_title = f"{job_title} {headline}"
-    title_score = 0
-    matches = sum(1 for kw in TARGET_JOB_KEYWORDS if kw in combined_title)
-    title_score = min(10, matches * 3)  # 3 pts per keyword match, max 10
-    breakdown["job_title"] = title_score
-
-    # 7. Email verified (max 5)
-    email = lead.get("email")
-    email_score = 5 if email and email.strip() else 0
-    breakdown["email_verified"] = email_score
-
-    total = sum(breakdown.values())
-    return min(100.0, total), breakdown
-
-
-def build_icp_context(industry_doc: dict) -> dict:
-    """
-    Extract ICP context from an industry document's apify_base_params.
-    Used to boost scoring when a prospect matches the search industry's target criteria.
-
-    Args:
-        industry_doc: Industry document from MongoDB
-
-    Returns:
-        Dict with target industry keywords, job titles, locations, etc.
-    """
-    params = industry_doc.get("apify_base_params", {})
-    return {
-        "target_industry": industry_doc.get("name", ""),
-        "target_job_titles": params.get("job_title", []) if isinstance(params.get("job_title"), list) else [params.get("job_title", "")],
-        "target_seniority": params.get("seniority_level", []) if isinstance(params.get("seniority_level"), list) else [],
-        "target_locations": params.get("contact_location", []) if isinstance(params.get("contact_location"), list) else [],
-        "target_industries": params.get("industry", []) if isinstance(params.get("industry"), list) else [params.get("industry", "")],
-        "target_keywords": params.get("keywords", []) if isinstance(params.get("keywords"), list) else [],
-    }
-
-
 def score_prospect_v2(lead: dict, icp_context: dict | None = None) -> tuple[float, dict]:
     """
     Score a prospect against the configured ICP (v2).
@@ -221,13 +103,16 @@ def score_prospect_v2(lead: dict, icp_context: dict | None = None) -> tuple[floa
     breakdown["seniority"] = seniority_score
 
     # 2. Industry match (max 15, was 20)
+    # NB: the empty-string guard matters — "" is a substring of every key, so
+    # a missing industry used to earn the full 15 points.
     industry = (lead.get("industry") or "").lower().strip()
     industry_score = 0
-    for key, points in TARGET_INDUSTRIES.items():
-        if key in industry or industry in key:
-            # Rescale: old max 20 -> new max 15
-            rescaled = round(points * 15 / 20)
-            industry_score = max(industry_score, rescaled)
+    if industry:
+        for key, points in TARGET_INDUSTRIES.items():
+            if key in industry or industry in key:
+                # Rescale: old max 20 -> new max 15
+                rescaled = round(points * 15 / 20)
+                industry_score = max(industry_score, rescaled)
     breakdown["industry"] = industry_score
 
     # 3. Company size (max 12, was 15)
@@ -470,12 +355,14 @@ def score_company_fit_rule_based(prospect: dict) -> tuple[float, dict]:
     breakdown = {}
 
     # Industry match (max 15) — same as score_prospect_v2
+    # (empty-string guard: "" is a substring of every key)
     industry = (prospect.get("industry") or "").lower().strip()
     industry_score = 0
-    for key, points in TARGET_INDUSTRIES.items():
-        if key in industry or industry in key:
-            rescaled = round(points * 15 / 20)
-            industry_score = max(industry_score, rescaled)
+    if industry:
+        for key, points in TARGET_INDUSTRIES.items():
+            if key in industry or industry in key:
+                rescaled = round(points * 15 / 20)
+                industry_score = max(industry_score, rescaled)
     breakdown["industry"] = industry_score
 
     # Company size (max 12) — same as score_prospect_v2
@@ -536,6 +423,19 @@ def score_company_fit_rule_based(prospect: dict) -> tuple[float, dict]:
     return total, breakdown
 
 
+# Generic seniority/level/scope words that carry NO functional targeting signal
+# on their own. Sharing only these between a target title and a prospect title
+# must never earn word-overlap credit — "marketing manager" vs "district
+# merchandise manager" share only "manager" and are NOT the same role.
+_GENERIC_TITLE_TOKENS = {
+    "manager", "director", "head", "chief", "officer", "president", "vp",
+    "vice", "senior", "junior", "lead", "principal", "global", "regional",
+    "district", "associate", "assistant", "executive", "specialist",
+    "coordinator", "analyst", "consultant", "supervisor", "staff", "group",
+    "team",
+}
+
+
 def _title_match_score(prospect: dict, campaign: dict, max_pts: float) -> float:
     """Score title/headline alignment against campaign target titles. Returns 0 if no targets specified."""
     import re
@@ -549,6 +449,11 @@ def _title_match_score(prospect: dict, campaign: dict, max_pts: float) -> float:
     if not haystack:
         return 0.0
 
+    def _tokens(s: str) -> set[str]:
+        # Strip surrounding punctuation so "manager," == "manager" for both
+        # the overlap check and the generic-token stoplist.
+        return {w.strip(".,;:()[]&|") for w in re.split(r"[\s\-/]+", s)}
+
     best = 0.0
     for tt in target_titles:
         if tt == pt:
@@ -557,11 +462,11 @@ def _title_match_score(prospect: dict, campaign: dict, max_pts: float) -> float:
         if tt in haystack or haystack in tt:
             best = max(best, max_pts * 0.8)
             continue
-        # Word-overlap fallback: at least one shared word ≥4 chars
-        tt_words = set(re.split(r"[\s\-/]+", tt))
-        hay_words = set(re.split(r"[\s\-/]+", haystack))
-        common = tt_words & hay_words
-        if common and any(len(w) >= 4 for w in common):
+        # Word-overlap fallback: requires at least one shared *qualifier* word
+        # ≥4 chars that is NOT a generic seniority/scope token. Sharing only
+        # generic words like "manager"/"director" earns nothing.
+        common = _tokens(tt) & _tokens(haystack)
+        if any(len(w) >= 4 and w not in _GENERIC_TITLE_TOKENS for w in common):
             best = max(best, max_pts * 0.5)
 
     # Bonus: functional department match
@@ -710,16 +615,18 @@ def score_prospect_for_campaign(prospect: dict, campaign: dict) -> float:
     if linkedin and ("linkedin.com" in linkedin or linkedin.startswith("http")):
         score += W_LINKEDIN
 
-    # Stale-employer penalty: prospect still in pool but employer data is outdated.
-    # 0.7× keeps strong-fit stale prospects above the min_score_to_enroll threshold
-    # while ranking them below verified-fresh peers.
-    if prospect.get("freshness_check_status") == "stale":
-        score *= 0.7
-
     return min(100.0, score)
 
 
-_DM_SENIORITY_TRIGGER = {"c_suite", "csuite", "founder", "owner", "vp", "director", "head", "partner", "senior"}
+# Seniority tokens that arm the non-decision-maker title blocklist in
+# passes_title_gate. Includes "manager" and "lead": manager-targeted campaigns
+# still must not enroll interns/trainees/assistants and other blocklisted
+# titles. Only "mid"/"junior"-targeted campaigns run with the blocklist off
+# (those legitimately target individual contributors).
+_DM_SENIORITY_TRIGGER = {
+    "c_suite", "csuite", "founder", "owner", "vp", "director", "head",
+    "partner", "senior", "manager", "lead",
+}
 
 
 def passes_title_gate(
@@ -751,6 +658,297 @@ def passes_title_gate(
     return True, None
 
 
+# ── Person-fit hard gate (deterministic, no AI) ──────────────────────────────
+# Used by curated discovery to reject off-target employees BEFORE enrollment.
+# The additive score_prospect_for_campaign lets company-level signals carry a
+# wrong-role person over the threshold; this gate enforces person-level fit.
+
+# Lightweight function inference from job title / headline keywords.
+# Canonical tokens match CAMPAIGN_PREFILL_FIELD_OPTIONS["icp_functional_departments"].
+_FUNCTION_KEYWORDS: dict[str, list[str]] = {
+    "sales": [
+        "sales", "account executive", " ae ", "sdr", "bdr", "business development",
+        "revenue", "revops", "revenue operations", "partnerships", "gtm",
+        "go-to-market", "go to market", "commercial director", "commercial manager",
+    ],
+    "marketing": [
+        "marketing", "growth", "brand", "demand gen", "demand generation",
+        "content", "seo", "sem", "communications", "public relations",
+        "social media", "cmo",
+        # Ad-buying titles are marketing, but "buyer"/"planner" also key the
+        # merchandising function below — listing them here makes the inference
+        # ambiguous ({marketing, merchandising}) so the disjointness gate
+        # PASSES them for marketing campaigns instead of hard-rejecting.
+        "media buyer", "media buying", "media planner", "media planning",
+    ],
+    "engineering": [
+        "engineer", "engineering", "developer", "software", "cto", "devops",
+        "sre", "architect", "technical lead", "technology officer",
+    ],
+    "product": ["product manager", "product management", "head of product", "cpo", "product owner", "product lead"],
+    "operations": [
+        "operations", "coo", "supply chain", "logistics", "procurement",
+        "operational excellence",
+    ],
+    "finance": ["finance", "financial", "cfo", "accounting", "accountant", "controller", "treasury", "fp&a"],
+    "hr": [
+        "human resources", "hr business", "hr director", "hr manager", "head of hr",
+        "chief people", "people officer", "people operations", "talent", "recruiting",
+        "recruiter", "chro",
+    ],
+    "it": [
+        "information technology", "it director", "it manager", "head of it",
+        "infrastructure", "cio", "ciso", "information security", "cybersecurity",
+        "sysadmin", "system administrator",
+    ],
+    "legal": ["legal", "counsel", "compliance", "attorney", "lawyer"],
+    "customer_success": [
+        "customer success", "customer support", "customer service", "customer experience",
+        "account manager", "account management", "client success",
+    ],
+    "data": ["data scientist", "data analyst", "data engineer", "analytics", "machine learning", "chief data"],
+    "design": ["designer", "design lead", "head of design", "ux ", "ui ", "creative director"],
+    # Retail merchandising / buying / store-ops family. These titles are NOT
+    # marketing even though they sound adjacent ("District Merchandise Manager",
+    # "Allocation Manager", "Display Manager"). Substring matching on the
+    # lowercase title+headline text, same as every other key: "merchandis"
+    # catches merchandise/merchandiser/merchandising.
+    "merchandising": [
+        "merchandis", "allocation", "planner", "buying", "buyer",
+        "visual display", "display", "store operations", "retail operations",
+        "assortment", "inventory",
+    ],
+}
+
+# ICP functional-department label → canonical token set. Handles synonyms
+# ("GTM", "RevOps", "People", "Tech" …). Multi-token expansions allowed.
+_FUNCTION_LABEL_SYNONYMS: dict[str, set[str]] = {
+    "sales": {"sales"},
+    "marketing": {"marketing"},
+    "engineering": {"engineering"},
+    "eng": {"engineering"},
+    "tech": {"engineering", "it"},
+    "technology": {"engineering", "it"},
+    "software": {"engineering"},
+    "product": {"product"},
+    "product_management": {"product"},
+    "operations": {"operations"},
+    "ops": {"operations"},
+    "finance": {"finance"},
+    "accounting": {"finance"},
+    "hr": {"hr"},
+    "human_resources": {"hr"},
+    "people": {"hr"},
+    "talent": {"hr"},
+    "recruiting": {"hr"},
+    "it": {"it"},
+    "information_technology": {"it"},
+    "security": {"it"},
+    "legal": {"legal"},
+    "compliance": {"legal"},
+    "customer_success": {"customer_success"},
+    "customer_support": {"customer_success"},
+    "support": {"customer_success"},
+    "cs": {"customer_success"},
+    "data": {"data"},
+    "analytics": {"data"},
+    "design": {"design"},
+    "merchandising": {"merchandising"},
+    "merchandise": {"merchandising"},
+    "buying": {"merchandising"},
+    "retail": {"merchandising", "operations"},
+    "store_operations": {"merchandising", "operations"},
+    "gtm": {"sales", "marketing"},
+    "go_to_market": {"sales", "marketing"},
+    "revops": {"sales", "operations"},
+    "revenue_operations": {"sales", "operations"},
+    "revenue": {"sales"},
+    "growth": {"sales", "marketing"},
+    "business_development": {"sales"},
+    "biz_dev": {"sales"},
+    "bd": {"sales"},
+    "partnerships": {"sales"},
+    "commercial": {"sales"},
+}
+
+
+def _normalize_label(label: str) -> str:
+    """lowercase, strip punctuation, collapse separators to underscores."""
+    import re
+    s = (label or "").lower().strip()
+    s = re.sub(r"[^\w\s-]", "", s)
+    s = re.sub(r"[\s\-]+", "_", s).strip("_")
+    return s
+
+
+def normalize_function_labels(labels: list[str]) -> set[str]:
+    """Map campaign icp_functional_departments labels to canonical function tokens.
+    Unknown labels map to nothing (caller decides how to handle)."""
+    out: set[str] = set()
+    for label in labels or []:
+        key = _normalize_label(label)
+        out |= _FUNCTION_LABEL_SYNONYMS.get(key, set())
+    return out
+
+
+def infer_function(title: str | None, headline: str | None = None) -> set[str]:
+    """Infer the functional department(s) of a person from their job title/headline.
+
+    Returns a set of canonical tokens (subset of _FUNCTION_KEYWORDS keys).
+    Empty set = unknown (callers must treat unknown as PASS, not reject)."""
+    text = f" {(title or '').lower()} {(headline or '').lower()} "
+    if not text.strip():
+        return set()
+    matched: set[str] = set()
+    for token, keywords in _FUNCTION_KEYWORDS.items():
+        for kw in keywords:
+            if kw in text:
+                matched.add(token)
+                break
+    return matched
+
+
+# Seniority label → canonical token (mirrors employee_scraper_service._map_seniority_canonical
+# but kept local so utils has no service dependency).
+_SENIORITY_LABEL_CANONICAL: dict[str, str] = {
+    "c_suite": "c_suite", "csuite": "c_suite", "c_level": "c_suite", "clevel": "c_suite",
+    "cxo": "c_suite", "executive": "c_suite", "exec": "c_suite", "chief": "c_suite",
+    "founder": "founder", "co_founder": "founder", "cofounder": "founder",
+    "owner": "owner", "partner": "partner", "president": "c_suite",
+    "vp": "vp", "vice_president": "vp", "svp": "vp", "evp": "vp",
+    "director": "director", "head": "director", "head_of": "director",
+    "manager": "manager", "lead": "senior", "principal": "senior", "senior": "senior",
+    "mid": "mid", "junior": "junior", "entry": "junior",
+}
+
+
+def canonical_seniority_from_label(label: str) -> str | None:
+    """Normalize a free-text seniority label ('C-Level', 'VP', 'Head of') to a canonical token."""
+    key = _normalize_label(label)
+    if key in _SENIORITY_LABEL_CANONICAL:
+        return _SENIORITY_LABEL_CANONICAL[key]
+    # substring fallback for compound labels like "c_level_executive"
+    for lk, canon in _SENIORITY_LABEL_CANONICAL.items():
+        if lk in key:
+            return canon
+    return None
+
+
+def infer_seniority_from_title(title: str | None) -> str | None:
+    """Infer canonical seniority token from a job title when the scrape omitted it."""
+    t = (title or "").lower()
+    if not t:
+        return None
+    if any(k in t for k in ("ceo", "cto", "cfo", "coo", "cmo", "cro", "chief", "president")):
+        return "c_suite"
+    if "founder" in t or "co-founder" in t:
+        return "founder"
+    if "owner" in t:
+        return "owner"
+    if "partner" in t:
+        return "partner"
+    if t.startswith("vp") or " vp" in t or "vice president" in t:
+        return "vp"
+    if "director" in t or "head of" in t or t.startswith("head "):
+        return "director"
+    if "manager" in t:
+        return "manager"
+    if any(k in t for k in ("senior ", "sr.", " sr ", "principal", "lead ")):
+        return "senior"
+    return None
+
+
+def person_fit_gate(prospect: dict, campaign: dict) -> tuple[bool, str | None]:
+    """Deterministic person-level hard gate for curated discovery.
+
+    Rejects a prospect when:
+      1. passes_title_gate fails (non-decision-maker blocklist / icp_exclude_keywords) →
+         "title_keyword_blocklisted" | "non_decision_maker_title"
+      2. Campaign targets functional departments, the person's inferred function is
+         non-empty, and the two sets are disjoint → "function_mismatch"
+      3. Campaign specifies icp_job_titles or seniority targets, and the person
+         matches NEITHER (title match score == 0 AND seniority mismatch) →
+         "no_title_or_seniority_match"
+
+    Unknown/empty inference always PASSES (never over-filter on missing data).
+    Returns (True, None) or (False, reason).
+    """
+    target_seniorities_raw = list(campaign.get("seniorities") or []) + list(
+        campaign.get("icp_seniority_levels") or []
+    )
+    # 1. Title blocklist + campaign exclude keywords.
+    # Canonicalize labels first: passes_title_gate only arms the blocklist for
+    # canonical decision-maker tokens, so free-text labels like "C-Level" must
+    # be mapped (→ "c_suite") or the blocklist silently stays off.
+    _gate_seniorities = [
+        canonical_seniority_from_label(str(s)) or str(s)
+        for s in target_seniorities_raw if s
+    ]
+    ok, reason = passes_title_gate(
+        prospect,
+        icp_seniority_levels=_gate_seniorities,
+        exclude_keywords=campaign.get("icp_exclude_keywords") or None,
+    )
+    if not ok:
+        return False, reason
+
+    # 2. Function inference vs icp_functional_departments
+    target_functions = normalize_function_labels(
+        campaign.get("icp_functional_departments") or []
+    )
+    if target_functions:
+        inferred = infer_function(
+            prospect.get("job_title") or prospect.get("title"),
+            prospect.get("headline"),
+        )
+        if inferred and inferred.isdisjoint(target_functions):
+            return False, "function_mismatch"
+
+    # 3. Title-or-seniority sub-gate (only when the campaign specified either)
+    has_title_targets = bool(
+        [t for t in (campaign.get("icp_job_titles") or []) if t and str(t).strip()]
+    )
+    target_seniorities = {
+        c for s in target_seniorities_raw
+        if s and (c := canonical_seniority_from_label(str(s)))
+    }
+    if not has_title_targets and not target_seniorities:
+        return True, None
+
+    # With the _GENERIC_TITLE_TOKENS stoplist in _title_match_score, a
+    # title_score > 0 now implies a real qualifier match (shared functional
+    # word, substring, or exact match) — never a generic-only overlap like
+    # "manager". Generic-only-overlap prospects score 0 here and fall through
+    # to the seniority check below; if that also misses they are rejected with
+    # the existing (relaxable) "no_title_or_seniority_match" reason.
+    title_score = _title_match_score(prospect, campaign, 1.0) if has_title_targets else 0.0
+    if title_score > 0:
+        return True, None
+
+    prospect_seniority = (
+        prospect.get("seniority") or prospect.get("seniority_level") or ""
+    ).lower().strip()
+    if not prospect_seniority:
+        prospect_seniority = infer_seniority_from_title(
+            prospect.get("job_title") or prospect.get("title") or prospect.get("headline")
+        ) or ""
+    if target_seniorities and prospect_seniority:
+        canon = canonical_seniority_from_label(prospect_seniority) or prospect_seniority
+        if canon in target_seniorities:
+            return True, None
+        # founder/owner/partner/c_suite are interchangeable at the top of most ICPs
+        _top = {"c_suite", "founder", "owner", "partner"}
+        if canon in _top and target_seniorities & _top:
+            return True, None
+    if not target_seniorities:
+        # only titles were specified and none matched
+        return False, "no_title_or_seniority_match"
+    if not prospect_seniority:
+        # seniority targets exist but person's seniority is unknown — don't over-filter
+        return True, None
+    return False, "no_title_or_seniority_match"
+
+
 def tier_from_score(score: float | None) -> str | None:
     """Canonical priority tier from ai_prospect_score. hot>=80, warm>=60, cold<60."""
     if score is None:
@@ -760,44 +958,3 @@ def tier_from_score(score: float | None) -> str | None:
     if score >= 60:
         return "warm"
     return "cold"
-
-
-def generate_tags(lead: dict) -> list[str]:
-    """Generate auto-tags based on prospect attributes."""
-    tags = []
-
-    seniority = (lead.get("seniority_level") or "").lower()
-    if seniority in ("owner", "c_suite", "founder"):
-        tags.append("c_suite")
-    elif seniority in ("vp", "director"):
-        tags.append("senior_leader")
-
-    industry = (lead.get("industry") or "").lower()
-    for key in ["oil", "gas", "mining", "power", "energy", "utilities"]:
-        if key in industry:
-            tags.append("heavy_industry")
-            break
-    for key in ["automotive", "aerospace", "chemical", "steel", "manufacturing", "machinery"]:
-        if key in industry:
-            tags.append("manufacturing")
-            break
-    for key in ["information technology", "software", "saas", "internet"]:
-        if key in industry:
-            tags.append("tech")
-            break
-    for key in ["engineering", "consulting"]:
-        if key in industry:
-            tags.append("consulting")
-            break
-    for key in ["financial", "investment", "banking", "private equity"]:
-        if key in industry:
-            tags.append("finance")
-            break
-
-    country = (lead.get("country") or "").lower()
-    if country == "united states":
-        tags.append("usa")
-    elif country in PRIORITY_COUNTRIES:
-        tags.append("europe")
-
-    return tags

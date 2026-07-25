@@ -31,6 +31,12 @@ class LinkedInAccountBase(BaseModel):
     # Account config
     is_default: bool = False
     daily_connection_limit: int = 80
+    daily_inmail_limit: int = 10
+    daily_message_limit: int = 30
+    warmup_enabled: bool = True
+    warmup_status: str = "warming"
+    warmup_day: int = 0
+    warmup_started_at: Optional[datetime] = None
 
     # ── Daily connection counters ──
     connections_sent_today: int = 0

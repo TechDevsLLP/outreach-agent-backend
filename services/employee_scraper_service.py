@@ -8,6 +8,7 @@ For each company URL:
 """
 
 import asyncio
+import threading
 
 from apify_client import ApifyClient
 from config import get_settings
@@ -21,7 +22,28 @@ from bson import ObjectId
 logger = logging.getLogger(__name__)
 
 settings = get_settings()
-apify_client = ApifyClient(settings.apify_api_key)
+
+
+class _LazyApifyClient:
+    """Construct the synchronous Apify client only on first dataset access."""
+
+    def __init__(self, api_key: str):
+        self._api_key = api_key
+        self._client = None
+        self._lock = threading.Lock()
+
+    def _get_client(self):
+        if self._client is None:
+            with self._lock:
+                if self._client is None:
+                    self._client = ApifyClient(self._api_key)
+        return self._client
+
+    def dataset(self, dataset_id: str):
+        return self._get_client().dataset(dataset_id)
+
+
+apify_client = _LazyApifyClient(settings.apify_api_key)
 
 # Apify Actor IDs
 COMPANY_SCRAPER_ACTOR_ID = settings.apify_company_scraper_id
@@ -113,9 +135,6 @@ async def scrape_companies_and_employees(
             else:
                 stats["employees_duplicate"] += 1
 
-        # Update company's employee count
-        await _update_company_employee_count(company_id)
-
     logger.info("Scrape workflow completed")
     logger.info(f"Summary: {stats}")
 
@@ -134,8 +153,9 @@ async def _scrape_companies(company_urls: list[str]) -> list[dict]:
 
     run_input = {"companies": company_urls}
 
-    # Blocking call to Apify
-    run = apify_client.actor(COMPANY_SCRAPER_ACTOR_ID).call(run_input=run_input)
+    # Retried, semaphore-bounded call to Apify (see services/apify_service.py)
+    from services.apify_service import call_actor_with_retry
+    run = await call_actor_with_retry(COMPANY_SCRAPER_ACTOR_ID, run_input)
     apify_run_id = run.get("id", "unknown")
 
     logger.info(f"Company scrape completed: {apify_run_id}")
@@ -173,8 +193,9 @@ async def _scrape_employees_for_company(
         "recentlyChangedJobs": False,
     }
 
-    # Blocking call to Apify
-    run = apify_client.actor(EMPLOYEE_SCRAPER_ACTOR_ID).call(run_input=run_input)
+    # Retried, semaphore-bounded call to Apify (see services/apify_service.py)
+    from services.apify_service import call_actor_with_retry
+    run = await call_actor_with_retry(EMPLOYEE_SCRAPER_ACTOR_ID, run_input)
     apify_run_id = run.get("id", "unknown")
 
     logger.info(f"Employee scrape completed: {apify_run_id}")
@@ -245,15 +266,8 @@ async def _save_company(apify_data: dict) -> Optional[tuple[str, str, dict]]:
             "continent": location_result.get("continent"),
             "raw": raw_hq,
         }
-        if location_result.get("place_id"):
-            try:
-                place_doc = await geo_places_collection.find_one(
-                    {"place_id": location_result["place_id"]}, {"location": 1}
-                )
-                if place_doc and place_doc.get("location"):
-                    geo_doc = place_doc["location"]
-            except Exception:
-                pass
+        # coordinates come straight from the SQLite gazetteer result
+        geo_doc = location_result.get("geo")
     elif raw_hq:
         location_doc = {"raw": raw_hq}
 
@@ -293,7 +307,7 @@ async def _save_company(apify_data: dict) -> Optional[tuple[str, str, dict]]:
     try:
         result = await companies_collection.update_one(
             {"linkedin_url": linkedin_url},
-            {"$set": set_doc, "$setOnInsert": {"created_at": now, "prospect_count": 0}},
+            {"$set": set_doc, "$setOnInsert": {"created_at": now}},
             upsert=True,
         )
         company_id = str(result.upserted_id) if result.upserted_id else None
@@ -323,6 +337,16 @@ async def _save_company(apify_data: dict) -> Optional[tuple[str, str, dict]]:
         except Exception as ve:
             logger.warning(f"profile_vec failed for {linkedin_url}: {ve}")
 
+        # Best-effort website scrape → structured website_data (shared pool,
+        # tenant-neutral). Only when a website/domain exists and website_data
+        # is missing or stale (>90 days). Failures are recorded, never raised.
+        await _maybe_scrape_website_data(
+            company_id,
+            website=set_doc.get("website"),
+            domain=set_doc.get("domain"),
+            now=now,
+        )
+
         full_doc = await companies_collection.find_one({"_id": ObjectId(company_id)})
         logger.info(f"Saved company: {set_doc.get('name')} ({company_id})")
         return (company_id, linkedin_url, full_doc or set_doc)
@@ -330,6 +354,58 @@ async def _save_company(apify_data: dict) -> Optional[tuple[str, str, dict]]:
     except Exception as e:
         logger.error(f"Error saving company {linkedin_url}: {e}")
         return None
+
+
+async def _maybe_scrape_website_data(
+    company_id: str,
+    *,
+    website: str | None,
+    domain: str | None,
+    now: datetime,
+) -> None:
+    """
+    Populate companies.website_data from the company's website/domain when it is
+    missing or stale (>90 days). Tenant-neutral (shared pool) — never touches
+    tenant fields. Errors are swallowed and recorded as a failure marker with a
+    timestamp so a failed attempt is distinguishable from never-tried.
+    """
+    target = website or (f"https://{domain}" if domain else None)
+    if not target:
+        return
+
+    try:
+        from services.website_scraper_service import (
+            fetch_website_data,
+            is_website_data_stale,
+            website_data_failure_marker,
+        )
+
+        existing = await companies_collection.find_one(
+            {"_id": ObjectId(company_id)}, {"website_data": 1}
+        )
+        current = (existing or {}).get("website_data")
+        if not is_website_data_stale(current):
+            return
+
+        data = await fetch_website_data(target)
+        website_data = data if data is not None else website_data_failure_marker(target)
+
+        await companies_collection.update_one(
+            {"_id": ObjectId(company_id)},
+            {"$set": {"website_data": website_data, "last_updated_at": now}},
+        )
+    except Exception as e:
+        # Must never fail the enrichment pipeline.
+        logger.warning(f"website_data scrape failed for company {company_id}: {e}")
+        try:
+            await companies_collection.update_one(
+                {"_id": ObjectId(company_id)},
+                {"$set": {"website_data": {
+                    "url": target, "scraped_at": now, "error": f"exception:{type(e).__name__}",
+                }}},
+            )
+        except Exception:
+            pass
 
 
 def transform_apify_employee(apify_data: dict, company_id: str, company_doc: dict | None = None) -> dict:
@@ -424,18 +500,6 @@ async def _save_employee(prospect_doc: dict) -> bool:
         return False
 
 
-async def _update_company_employee_count(company_id: str):
-    """Update prospect_count on company from prospects_collection."""
-    try:
-        count = await prospects_collection.count_documents({"company_id": company_id})
-        await companies_collection.update_one(
-            {"_id": ObjectId(company_id)},
-            {"$set": {"prospect_count": count}},
-        )
-    except Exception as e:
-        logger.error(f"Error updating company prospect count: {e}")
-
-
 def _normalize_url(url: Optional[str]) -> Optional[str]:
     """Normalize LinkedIn URL for consistency."""
     if not url:
@@ -503,72 +567,6 @@ def _map_seniority_canonical(raw: str | None, title: str = "") -> str | None:
 # ══════════════════════════════════════════════════════════════════
 
 
-async def get_company_by_id(company_id: str) -> Optional[dict]:
-    """Get a company by its MongoDB ID."""
-    try:
-        company = await companies_collection.find_one({"_id": ObjectId(company_id)})
-        if company:
-            company["_id"] = str(company["_id"])
-        return company
-    except Exception as e:
-        logger.error(f"Error fetching company: {e}")
-        return None
-
-
-async def get_employees_by_company(company_id: str, limit: int = 100) -> list[dict]:
-    """Get all employees for a specific company."""
-    cursor = employees_collection.find(
-        {"company_id": company_id}
-    ).sort("created_at", -1).limit(limit)
-
-    employees = await cursor.to_list(limit)
-
-    # Convert ObjectId to string
-    for emp in employees:
-        emp["_id"] = str(emp["_id"])
-
-    return employees
-
-
-async def get_employee_stats() -> dict:
-    """Get statistics about scraped employees and companies."""
-    total_employees = await employees_collection.count_documents({})
-    total_companies = await companies_collection.count_documents({})
-
-    if total_employees == 0:
-        return {
-            "total_employees": 0,
-            "total_companies": 0,
-            "by_company": [],
-            "by_title": [],
-        }
-
-    # By company
-    company_pipeline = [
-        {"$match": {"company_name": {"$ne": None}}},
-        {"$group": {"_id": "$company_name", "count": {"$sum": 1}}},
-        {"$sort": {"count": -1}},
-        {"$limit": 20},
-    ]
-    by_company = await employees_collection.aggregate(company_pipeline).to_list(20)
-
-    # By title (top 20)
-    title_pipeline = [
-        {"$match": {"current_position.title": {"$ne": None}}},
-        {"$group": {"_id": "$current_position.title", "count": {"$sum": 1}}},
-        {"$sort": {"count": -1}},
-        {"$limit": 20},
-    ]
-    by_title = await employees_collection.aggregate(title_pipeline).to_list(20)
-
-    return {
-        "total_employees": total_employees,
-        "total_companies": total_companies,
-        "by_company": by_company,
-        "by_title": by_title,
-    }
-
-
 async def get_company_stats() -> dict:
     """Get statistics about scraped companies."""
     total = await companies_collection.count_documents({})
@@ -608,46 +606,42 @@ async def get_company_stats() -> dict:
 # Curated-mode helpers — used by curated_discovery_service only
 # ══════════════════════════════════════════════════════════════════
 
-# TODO: Update this constant after running scripts/verify_employee_email_mode.py
-# Set to whichever mode string returns emails from the actor.
-EMPLOYEE_EMAIL_MODE = "Full ($8 per 1k)"
 
-
-async def scrape_employees_for_company_with_emails(
-    company_linkedin_url: str,
+async def _run_one_employee_scrape(
+    company_urls: list[str],
     *,
-    max_items: int = 25,
-    seniority_level_ids: list[str] | None = None,
-    functional_level_ids: list[str] | None = None,
-    account_id: str | None = None,
-    campaign_id: str | None = None,
+    max_items_per_company: int,
+    max_items: int,
+    seniority_level_ids: list[str] | None,
+    functional_level_ids: list[str] | None,
+    profile_scraper_mode: str,
+    account_id: str | None,
+    campaign_id: str | None,
+    chunk_label: str = "",
+    company_headcount_bands: list[str] | None = None,
 ) -> list[dict]:
-    """
-    Curated-mode employee scrape: returns raw Apify employee dicts, with email
-    when the actor's email-finding mode populates it.
-    """
-    seniority_level_ids = seniority_level_ids or []
-    functional_level_ids = functional_level_ids or []
-
+    """One Apify actor run over a chunk of companies. Returns raw employee dicts.
+    Isolated so a single failed chunk doesn't sink the whole scrape."""
     run_input: dict = {
-        "companies": [company_linkedin_url],
+        "companies": company_urls,
+        "companyBatchMode": "one_by_one",
+        "maxItemsPerCompany": max_items_per_company,
         "maxItems": max_items,
-        "profileScraperMode": EMPLOYEE_EMAIL_MODE,
-        "companyBatchMode": "all_at_once",
+        "profileScraperMode": profile_scraper_mode,
         "recentlyChangedJobs": False,
     }
     if seniority_level_ids:
         run_input["seniorityLevelIds"] = seniority_level_ids
     if functional_level_ids:
-        run_input["functionalLevelIds"] = functional_level_ids
-
-    logger.info(f"[curated] employee scrape for {company_linkedin_url} ({max_items} max)")
+        # Actor input key is `functionIds` — NOT `functionalLevelIds`, which the
+        # actor silently ignores (unknown keys are dropped, not rejected).
+        run_input["functionIds"] = functional_level_ids
+    if company_headcount_bands:
+        run_input["companyHeadcount"] = company_headcount_bands
 
     loop = asyncio.get_event_loop()
-    run = await loop.run_in_executor(
-        None,
-        lambda: apify_client.actor(EMPLOYEE_SCRAPER_ACTOR_ID).call(run_input=run_input),
-    )
+    from services.apify_service import call_actor_with_retry
+    run = await call_actor_with_retry(EMPLOYEE_SCRAPER_ACTOR_ID, run_input)
 
     try:
         from services.apify_service import track_apify_run
@@ -658,13 +652,17 @@ async def scrape_employees_for_company_with_emails(
         ) as tracker:
             tracker.set_run_id(run.get("id", ""))
     except Exception as e:
-        logger.warning(f"[curated] track_apify_run failed: {e}")
+        logger.warning(f"[bulk_scrape{chunk_label}] track_apify_run failed: {e}")
 
     employees: list[dict] = []
     dataset_id = run.get("defaultDatasetId")
     if dataset_id:
-        for item in apify_client.dataset(dataset_id).iterate_items():
-            employees.append(item)
+        # Dataset iteration is blocking I/O — run it off the event loop.
+        def _drain() -> list[dict]:
+            return list(apify_client.dataset(dataset_id).iterate_items())
+        employees = await loop.run_in_executor(None, _drain)
+
+    logger.info(f"[bulk_scrape{chunk_label}] {len(employees)} employees from {len(company_urls)} companies")
     return employees
 
 
@@ -678,60 +676,64 @@ async def bulk_scrape_employees_for_companies(
     profile_scraper_mode: str = "Short ($4 per 1k)",
     account_id: str | None = None,
     campaign_id: str | None = None,
+    max_concurrency: int = 1,
+    company_headcount_bands: list[str] | None = None,
 ) -> list[dict]:
     """
-    Single Apify run scraping employees from many companies via companyBatchMode=one_by_one.
-    Returns flat list of raw Apify employee dicts.
+    Scrape employees from many companies. With max_concurrency > 1 the company list
+    is split into ~equal chunks run as CONCURRENT Apify actor runs (the actor itself
+    processes companies serially within a run via companyBatchMode=one_by_one, so
+    splitting is what actually parallelizes the scrape). Datasets are merged.
+    `company_headcount_bands` maps to the actor's `companyHeadcount` param (bands
+    A-I; see _icp_size_to_headcount_bands in curated_discovery_service).
+    Returns a flat list of raw Apify employee dicts.
     """
     if not company_urls:
         return []
 
-    run_input: dict = {
-        "companies": company_urls,
-        "companyBatchMode": "one_by_one",
-        "maxItemsPerCompany": max_items_per_company,
-        "maxItems": (
-            min(max_total_items, len(company_urls) * max_items_per_company)
-            if max_total_items is not None
-            else len(company_urls) * max_items_per_company
-        ),
-        "profileScraperMode": profile_scraper_mode,
-        "recentlyChangedJobs": False,
-    }
-    if seniority_level_ids:
-        run_input["seniorityLevelIds"] = seniority_level_ids
-    if functional_level_ids:
-        run_input["functionalLevelIds"] = functional_level_ids
+    import math as _math
+    _overall_max = (
+        min(max_total_items, len(company_urls) * max_items_per_company)
+        if max_total_items is not None
+        else len(company_urls) * max_items_per_company
+    )
+
+    concurrency = max(1, min(max_concurrency, len(company_urls)))
+    if concurrency == 1:
+        chunks = [company_urls]
+    else:
+        chunk_size = _math.ceil(len(company_urls) / concurrency)
+        chunks = [company_urls[i:i + chunk_size] for i in range(0, len(company_urls), chunk_size)]
 
     logger.info(
-        f"[bulk_scrape] {len(company_urls)} companies, maxPerCo={max_items_per_company}, "
-        f"maxItems={run_input['maxItems']}, mode={profile_scraper_mode}"
+        f"[bulk_scrape] {len(company_urls)} companies → {len(chunks)} parallel run(s), "
+        f"maxPerCo={max_items_per_company}, totalMaxItems={_overall_max}, mode={profile_scraper_mode}"
     )
 
-    loop = asyncio.get_event_loop()
-    run = await loop.run_in_executor(
-        None,
-        lambda: apify_client.actor(EMPLOYEE_SCRAPER_ACTOR_ID).call(run_input=run_input),
-    )
+    async def _chunk(idx: int, urls: list[str]) -> list[dict]:
+        # Give each chunk its proportional slice of the global item budget.
+        chunk_max = min(len(urls) * max_items_per_company, _math.ceil(_overall_max * len(urls) / len(company_urls)))
+        try:
+            return await _run_one_employee_scrape(
+                urls,
+                max_items_per_company=max_items_per_company,
+                max_items=max(chunk_max, len(urls) * max_items_per_company if chunk_max == 0 else chunk_max),
+                seniority_level_ids=seniority_level_ids,
+                functional_level_ids=functional_level_ids,
+                profile_scraper_mode=profile_scraper_mode,
+                account_id=account_id,
+                campaign_id=campaign_id,
+                chunk_label=f":{idx + 1}/{len(chunks)}" if len(chunks) > 1 else "",
+                company_headcount_bands=company_headcount_bands,
+            )
+        except Exception as e:
+            logger.warning(f"[bulk_scrape:{idx + 1}/{len(chunks)}] chunk failed: {e}")
+            return []
 
-    try:
-        from services.apify_service import track_apify_run
-        async with track_apify_run(
-            EMPLOYEE_SCRAPER_ACTOR_ID,
-            account_id=account_id,
-            campaign_id=campaign_id,
-        ) as tracker:
-            tracker.set_run_id(run.get("id", ""))
-    except Exception as e:
-        logger.warning(f"[bulk_scrape] track_apify_run failed: {e}")
+    results = await asyncio.gather(*[_chunk(i, c) for i, c in enumerate(chunks)])
+    employees: list[dict] = [emp for chunk_result in results for emp in chunk_result]
 
-    employees: list[dict] = []
-    dataset_id = run.get("defaultDatasetId")
-    if dataset_id:
-        for item in apify_client.dataset(dataset_id).iterate_items():
-            employees.append(item)
-
-    logger.info(f"[bulk_scrape] returned {len(employees)} employees from {len(company_urls)} companies")
+    logger.info(f"[bulk_scrape] merged {len(employees)} employees from {len(company_urls)} companies across {len(chunks)} run(s)")
     return employees
 
 
@@ -744,6 +746,14 @@ def transform_employee_to_prospect(
     """
     Map raw Apify employee record to new prospect schema.
     `sourced_company` is the SourcedCompany dict from company_sourcing_service.
+
+    Handles both actor response shapes:
+    - Short mode (primary, $4/1k): `currentPositions` (plural), title in
+      `position`, no email fields — email is filled separately via
+      services/email_finder_service.find_emails.
+    - Full / Full+email mode (legacy, $8-12/1k): `currentPosition` (singular)
+      or `currentPositions`, title in `title`, plus email fields directly on
+      the record — kept for backward compatibility only.
     """
     current_positions = (
         apify_employee.get("currentPositions")
@@ -752,6 +762,8 @@ def transform_employee_to_prospect(
     )
     current = current_positions[0] if current_positions else {}
 
+    # Full+email mode only — absent entirely in Short mode, so this naturally
+    # falls through to None and the GrowthToolkit email finder fills it later.
     _emails_list = apify_employee.get("emails") or []
     email = (
         (_emails_list[0] if _emails_list else None)

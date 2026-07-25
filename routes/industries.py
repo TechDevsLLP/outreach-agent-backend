@@ -1,7 +1,8 @@
 """
 Industries router - replaces icp_profiles.py.
-Simplified creation: admin enters industry name, AI generates params + description,
-3 default regions (USA, Europe, India) are created automatically.
+Industries are DB-backed prospect-source tags. The legacy Apollo-actor scraping
+endpoints (scrape / scrape-all / reset-pagination) and AI Apify-param generation
+were removed along with the actors that consumed them.
 """
 
 from fastapi import APIRouter, Depends, HTTPException, Query
@@ -15,9 +16,6 @@ from models.industry import (
     IndustryCreate, IndustryCreateFull, IndustryUpdate,
     ApifyBaseParams, DEFAULT_REGIONS,
 )
-from services.industry_param_generator import generate_industry_params
-from services.openrouter_service import OpenRouterClient
-from services.scheduler_service import scrape_industry, scheduled_scrape_all_industries, reset_industry_pagination
 import logging
 
 logger = logging.getLogger(__name__)
@@ -36,8 +34,8 @@ async def list_industries(account_ctx=Depends(get_account_context)):
 @router.post("")
 async def create_industry(request: IndustryCreate, account_ctx=Depends(get_account_context)):
     """
-    Simplified industry creation.
-    Admin provides only a name; AI generates Apify params and description.
+    Simplified industry creation: admin provides a name.
+    (AI Apify-param generation was retired with the Apollo prospect actors.)
     3 default regions (USA, Europe, India) are created automatically.
     """
     account_id = ObjectId(account_ctx["account"]["_id"])
@@ -46,52 +44,32 @@ async def create_industry(request: IndustryCreate, account_ctx=Depends(get_accou
     if existing:
         raise HTTPException(status_code=409, detail=f"Industry '{request.name}' already exists")
 
-    client = OpenRouterClient()
-    try:
-        logger.info(f"Generating AI-powered industry params for: {request.name}")
-        generated_params, description = await generate_industry_params(
-            industry_name=request.name,
-            client=client,
-        )
+    # Build default regions
+    regions = [r.model_dump() for r in DEFAULT_REGIONS]
 
-        # Build default regions
-        regions = [r.model_dump() for r in DEFAULT_REGIONS]
+    doc = {
+        "account_id": account_id,
+        "name": request.name,
+        "description": f"{request.name} industry prospects",
+        "is_active": True,
+        "apify_base_params": {},
+        "regions": regions,
+        "total_fetch_count": 100,
+        "scrape_day": "saturday",
+        "scrape_enabled": False,
+        "created_at": datetime.utcnow(),
+        "last_run_at": None,
+        "total_runs": 0,
+        "total_prospects_generated": 0,
+        "ai_generated": False,
+        "user_edited_params": False,
+    }
 
-        doc = {
-            "account_id": account_id,
-            "name": request.name,
-            "description": description,
-            "is_active": True,
-            "apify_base_params": generated_params,
-            "regions": regions,
-            "total_fetch_count": 100,
-            "scrape_day": "saturday",
-            "scrape_enabled": True,
-            "created_at": datetime.utcnow(),
-            "last_run_at": None,
-            "total_runs": 0,
-            "total_prospects_generated": 0,
-            # AI generation tracking
-            "ai_generated": True,
-            "ai_generation_model": "nvidia/nemotron-3-super-120b-a12b:free",
-            "ai_generation_timestamp": datetime.utcnow(),
-            "user_edited_params": False,
-        }
+    result = await industries_collection.insert_one(doc)
+    doc["_id"] = str(result.inserted_id)
 
-        result = await industries_collection.insert_one(doc)
-        doc["_id"] = str(result.inserted_id)
-
-        logger.info(f"Created AI-generated industry: {request.name} (ID: {doc['_id']})")
-        return doc
-
-    except Exception as e:
-        logger.error(f"Failed to create industry: {e}", exc_info=True)
-        raise HTTPException(
-            status_code=500,
-            detail=f"Failed to generate industry parameters: {str(e)}",
-        )
-    finally:
-        await client.close()
+    logger.info(f"Created industry: {request.name} (ID: {doc['_id']})")
+    return doc
 
 
 @router.post("/full")
@@ -159,10 +137,6 @@ async def update_industry(
         existing = await industries_collection.find_one({"_id": oid, "account_id": account_id})
         if existing and existing.get("ai_generated"):
             update_data["user_edited_params"] = True
-        # Reset pagination when search params change so new criteria get fresh results
-        if existing and existing.get("apify_base_params") != update_data["apify_base_params"]:
-            await reset_industry_pagination(industry_id)
-            logger.info(f"Auto-reset pagination for {industry_id} due to param change")
     if update.regions is not None:
         update_data["regions"] = [r.model_dump() for r in update.regions]
     if update.total_fetch_count is not None:
@@ -198,66 +172,6 @@ async def delete_industry(industry_id: str, account_ctx=Depends(get_account_cont
         raise HTTPException(status_code=404, detail="Industry not found")
 
     return {"message": "Industry deleted"}
-
-
-@router.post("/{industry_id}/reset-pagination")
-async def reset_pagination(industry_id: str, account_ctx=Depends(get_account_context)):
-    """
-    Reset pagination and exhaustion state for an industry.
-    Use this to re-scrape from page 0 (e.g., after changing params or to retry).
-    """
-    account_id = ObjectId(account_ctx["account"]["_id"])
-    try:
-        oid = ObjectId(industry_id)
-    except Exception:
-        raise HTTPException(status_code=400, detail="Invalid industry ID")
-    # Verify ownership
-    if not await industries_collection.find_one({"_id": oid, "account_id": account_id}):
-        raise HTTPException(status_code=404, detail="Industry not found")
-
-    try:
-        result = await reset_industry_pagination(industry_id)
-        return result
-    except ValueError as e:
-        raise HTTPException(status_code=404, detail=str(e))
-
-
-@router.post("/{industry_id}/scrape")
-async def scrape_single_industry(industry_id: str, account_ctx=Depends(get_account_context)):
-    """
-    Manually trigger scraping for a single industry.
-    Scrapes from all non-exhausted regions with redistribution.
-    """
-    account_id = ObjectId(account_ctx["account"]["_id"])
-    try:
-        oid = ObjectId(industry_id)
-    except Exception:
-        raise HTTPException(status_code=400, detail="Invalid industry ID")
-
-    industry = await industries_collection.find_one({"_id": oid, "account_id": account_id})
-    if not industry:
-        raise HTTPException(status_code=404, detail="Industry not found")
-
-    try:
-        result = await scrape_industry(industry)
-        return result
-    except Exception as e:
-        logger.error(f"Manual scrape failed for {industry['name']}: {e}", exc_info=True)
-        raise HTTPException(status_code=500, detail=str(e))
-
-
-@router.post("/scrape-all")
-async def scrape_all_industries(account_ctx=Depends(get_account_context)):
-    """
-    Manually trigger scraping for all active industries.
-    Same logic as the scheduled job.
-    """
-    try:
-        result = await scheduled_scrape_all_industries()
-        return result
-    except Exception as e:
-        logger.error(f"Scrape-all failed: {e}", exc_info=True)
-        raise HTTPException(status_code=500, detail=str(e))
 
 
 @router.get("/{industry_id}/companies")

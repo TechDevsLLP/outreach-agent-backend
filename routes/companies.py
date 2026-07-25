@@ -8,17 +8,25 @@ from bson import ObjectId
 from fastapi import APIRouter, BackgroundTasks, Depends, File, Form, HTTPException, Query, UploadFile
 from pydantic import BaseModel, Field
 
-from auth import get_account_context
+from auth import get_account_context, get_super_admin
 from database import (
     companies_collection,
     employees_collection,
+    prospect_state_collection,
     prospects_collection,
 )
-from services.employee_scraper_service import scrape_companies_and_employees
-
 logger = logging.getLogger(__name__)
 
 router = APIRouter(prefix="/api/companies", tags=["Companies"])
+
+
+async def scrape_companies_and_employees(*args, **kwargs):
+    """Load the paid-provider scraper only when an authorized job executes."""
+    from services.employee_scraper_service import (
+        scrape_companies_and_employees as run_scraper,
+    )
+
+    return await run_scraper(*args, **kwargs)
 
 
 def _str_id(doc: dict) -> dict:
@@ -38,58 +46,113 @@ async def list_companies(
     industry_id: Optional[str] = Query(None),
     search: Optional[str] = Query(None),
     min_prospects: int = Query(0, ge=0),
+    sort_by: str = "name",
+    sort_order: str = "desc",
     page: int = Query(1, ge=1),
     page_size: int = Query(20, ge=1, le=100),
     ctx: dict = Depends(get_account_context),
 ):
-    """Browse companies with optional filters."""
-    query: dict = {}
-    if min_prospects > 0:
-        query["prospect_count"] = {"$gte": min_prospects}
+    """Browse companies with optional filters, sort, and pagination.
 
+    prospect_count is computed live via a $lookup against prospects.company_id
+    (prospects store company_id as the stringified company _id) — there is no
+    longer a denormalized prospect_count stored on the company doc.
+    """
+    query: dict = {}
     if search:
         query["$text"] = {"$search": search}
 
     if industry:
-        # Match against canonical industry label or raw string
         query["$or"] = [
             {"industry.label": {"$regex": industry, "$options": "i"}},
             {"industry.raw": {"$regex": industry, "$options": "i"}},
         ]
 
     if industry_id:
-        # industry_id is the canonical id (e.g. "software_development")
         query["industry.id"] = industry_id
 
-    skip = (page - 1) * page_size
-    sort = [("prospect_count", -1)]
+    sort_direction = -1 if sort_order == "desc" else 1
+    allowed_sorts = {"name", "industry", "employee_count", "prospect_count"}
+    sort_field = sort_by if sort_by in allowed_sorts else "name"
 
-    total = await companies_collection.count_documents(query)
-    cursor = (
-        companies_collection.find(
-            query,
+    skip = (page - 1) * page_size
+
+    projection = {
+        "_id": 1,
+        "name": 1,
+        "domain": 1,
+        "linkedin_url": 1,
+        "website": 1,
+        "industry": 1,
+        "employee_count": 1,
+        "employee_band": 1,
+        "prospect_count": 1,
+        "location": 1,
+        "founded_year": 1,
+        "company_type": 1,
+        "description": 1,
+        "tagline": 1,
+    }
+
+    # Live prospect_count via $lookup against prospects.company_id.
+    lookup_stages = [
+        {
+            "$lookup": {
+                "from": "prospects",
+                "let": {"cid": {"$toString": "$_id"}},
+                "pipeline": [
+                    {"$match": {"$expr": {"$eq": ["$company_id", "$$cid"]}}},
+                    {"$count": "n"},
+                ],
+                "as": "_pc",
+            }
+        },
+        {"$addFields": {"prospect_count": {"$ifNull": [{"$arrayElemAt": ["$_pc.n", 0]}, 0]}}},
+    ]
+
+    needs_prospect_count_first = min_prospects > 0 or sort_field == "prospect_count"
+
+    pipeline: list[dict] = [{"$match": query}]
+
+    if needs_prospect_count_first:
+        # Must compute counts before filtering/sorting/paginating on them.
+        pipeline += lookup_stages
+        if min_prospects > 0:
+            pipeline.append({"$match": {"prospect_count": {"$gte": min_prospects}}})
+        pipeline.append(
             {
-                "_id": 1,
-                "name": 1,
-                "domain": 1,
-                "linkedin_url": 1,
-                "website": 1,
-                "industry": 1,
-                "employee_count": 1,
-                "employee_band": 1,
-                "prospect_count": 1,
-                "location": 1,
-                "founded_year": 1,
-                "company_type": 1,
-                "description": 1,
-                "tagline": 1,
-            },
+                "$facet": {
+                    "total": [{"$count": "count"}],
+                    "rows": [
+                        {"$sort": {sort_field: sort_direction, "_id": 1}},
+                        {"$skip": skip},
+                        {"$limit": page_size},
+                        {"$project": projection},
+                    ],
+                }
+            }
         )
-        .sort(sort)
-        .skip(skip)
-        .limit(page_size)
-    )
-    companies = [_str_id(doc) async for doc in cursor]
+    else:
+        # Paginate first, then look up counts for just the current page.
+        pipeline.append(
+            {
+                "$facet": {
+                    "total": [{"$count": "count"}],
+                    "rows": [
+                        {"$sort": {sort_field: sort_direction, "_id": 1}},
+                        {"$skip": skip},
+                        {"$limit": page_size},
+                        *lookup_stages,
+                        {"$project": projection},
+                    ],
+                }
+            }
+        )
+
+    result = await companies_collection.aggregate(pipeline).to_list(length=1)
+    data = result[0] if result else {}
+    total = (data.get("total") or [{}])[0].get("count", 0) if data.get("total") else 0
+    companies = [_str_id(doc) for doc in data.get("rows", [])]
 
     return {"companies": companies, "total": total, "page": page, "page_size": page_size}
 
@@ -100,8 +163,23 @@ async def list_companies(
 # ---------------------------------------------------------------------------
 @router.get("/by-industry")
 async def companies_by_industry():
-    """Aggregate company and prospect counts grouped by industry (public endpoint)."""
+    """Aggregate company and prospect counts grouped by industry (public endpoint).
+
+    prospect_count is computed live via $lookup against prospects.company_id.
+    """
     pipeline = [
+        {
+            "$lookup": {
+                "from": "prospects",
+                "let": {"cid": {"$toString": "$_id"}},
+                "pipeline": [
+                    {"$match": {"$expr": {"$eq": ["$company_id", "$$cid"]}}},
+                    {"$count": "n"},
+                ],
+                "as": "_pc",
+            }
+        },
+        {"$addFields": {"prospect_count": {"$ifNull": [{"$arrayElemAt": ["$_pc.n", 0]}, 0]}}},
         {
             "$group": {
                 "_id": {"id": "$industry.id", "label": "$industry.label"},
@@ -193,7 +271,7 @@ class BulkCompanyIdsRequest(BaseModel):
 @router.post("/scrape")
 async def scrape_companies(
     body: ScrapeCompaniesRequest,
-    ctx: dict = Depends(get_account_context),
+    _admin: dict = Depends(get_super_admin),
 ):
     """Scrape company pages and their employees from a list of LinkedIn URLs."""
     urls = [u.strip() for u in body.company_urls if u.strip()]
@@ -236,7 +314,7 @@ async def scrape_from_excel(
     max_employees_per_company: int = Form(50),
     seniority_levels: List[str] = Form(default=[]),
     scraper_mode: str = Form("Short ($4 per 1k)"),
-    ctx: dict = Depends(get_account_context),
+    _admin: dict = Depends(get_super_admin),
 ):
     """Parse an Excel or CSV file to extract LinkedIn company URLs and start scraping."""
     filename = file.filename or ""
@@ -313,7 +391,7 @@ async def _delete_company_and_employees(company_id_str: str) -> tuple[bool, int]
 @router.post("/bulk-delete")
 async def bulk_delete_companies(
     body: BulkCompanyIdsRequest,
-    ctx: dict = Depends(get_account_context),
+    _admin: dict = Depends(get_super_admin),
 ):
     """Delete multiple companies and their scraped employees. Prospects are retained."""
     deleted = []
@@ -364,7 +442,7 @@ async def _run_rescrape(company_id_str: str, linkedin_url: str):
 async def bulk_rescrape_companies(
     body: BulkCompanyIdsRequest,
     background_tasks: BackgroundTasks,
-    ctx: dict = Depends(get_account_context),
+    _admin: dict = Depends(get_super_admin),
 ):
     """Re-trigger employee scraping for multiple companies as background tasks."""
     queued = []
@@ -407,7 +485,7 @@ async def get_company(
         raise HTTPException(status_code=404, detail="Company not found")
     company = _str_id(company)
 
-    account_id = ObjectId(ctx["account"]["_id"])
+    account_id_str = str(ctx["account"]["_id"])
 
     # Top 10 employees (match both ObjectId and string forms of company_id)
     emp_cursor = employees_collection.find(
@@ -425,23 +503,53 @@ async def get_company(
         e = _str_id(emp)
         employees.append(e)
 
-    # Top 5 prospects sorted by enhanced_score
-    linkedin_url = company.get("linkedin_url")
+    # Top 5 prospects. Canonical linkage: prospects.company_id == str(company._id)
+    # (prospects are a SHARED pool with no account_id field; the old
+    # account_id + company_linkedin query always returned zero rows).
+    # Tenant-relative score/status/tier live in prospect_state — overlay them.
+    prospect_docs = await prospects_collection.find(
+        {"company_id": company_id},
+        {
+            "_id": 1,
+            "full_name": 1,
+            "job_title": 1,
+            "email": 1,
+            "linkedin": 1,
+            "enrichment_status": 1,
+            "prospect_score": 1,
+        },
+    ).limit(100).to_list(length=100)
+
     top_prospects = []
-    if linkedin_url:
-        pros_cursor = prospects_collection.find(
-            {"company_linkedin": linkedin_url, "account_id": account_id},
-            {
-                "_id": 1,
-                "full_name": 1,
-                "job_title": 1,
-                "email": 1,
-                "enhanced_score": 1,
-                "status": 1,
-            },
-        ).sort("enhanced_score", -1).limit(5)
-        async for p in pros_cursor:
-            top_prospects.append(_str_id(p))
+    if prospect_docs:
+        pids = [str(p["_id"]) for p in prospect_docs]
+        state_by_pid: dict = {}
+        async for st in prospect_state_collection.find(
+            {"account_id": account_id_str, "prospect_id": {"$in": pids}},
+            {"prospect_id": 1, "ai_score": 1, "priority_tier": 1, "status": 1,
+             "enrichment_status": 1},
+        ):
+            state_by_pid[str(st["prospect_id"])] = st
+
+        for p in prospect_docs:
+            _str_id(p)
+            st = state_by_pid.get(p["_id"], {})
+            ai_score = st.get("ai_score")
+            # Tenant state score wins; legacy shared-pool base score is a
+            # sort fallback only.
+            p["score"] = ai_score if ai_score is not None else p.get("prospect_score")
+            p["status"] = st.get("status")
+            p["priority_tier"] = st.get("priority_tier")
+            if st.get("enrichment_status"):
+                p["enrichment_status"] = st["enrichment_status"]
+            p.pop("prospect_score", None)
+
+        # Highest score first; unscored (None) sort last.
+        prospect_docs.sort(
+            key=lambda p: (p.get("score") is not None, p.get("score") or 0),
+            reverse=True,
+        )
+        top_prospects = prospect_docs[:5]
 
     return {"company": company, "employees": employees, "top_prospects": top_prospects}
 
@@ -458,7 +566,14 @@ async def get_company_prospects(
     enrichment_status: Optional[str] = Query(None),
     ctx: dict = Depends(get_account_context),
 ):
-    """Paginated prospect list for a company."""
+    """Paginated prospect list for a company.
+
+    Canonical linkage: prospects.company_id == str(company._id) — the prospects
+    collection is a SHARED pool with no account_id field. Tenant-relative
+    score/status/tier come from the prospect_state overlay (account_id +
+    prospect_id, string-keyed), which also drives the status filter and the
+    score sort.
+    """
     try:
         oid = ObjectId(company_id)
     except Exception:
@@ -468,30 +583,58 @@ async def get_company_prospects(
     if company is None:
         raise HTTPException(status_code=404, detail="Company not found")
 
-    account_id = ObjectId(ctx["account"]["_id"])
-    linkedin_url = company.get("linkedin_url")
+    account_id_str = str(ctx["account"]["_id"])
 
-    query: dict = {"account_id": account_id}
-    if linkedin_url:
-        query["company_linkedin"] = linkedin_url
-    else:
-        # Fall back to company_id match if no linkedin_url
-        query["company_id"] = oid
-
-    if status:
-        query["status"] = status
+    # Canonical match is the string form; keep the ObjectId form for any
+    # legacy docs written before the string-key migration.
+    query: dict = {"company_id": {"$in": [company_id, oid]}}
     if enrichment_status:
+        # enrichment_status is canonical on the shared prospect doc.
         query["enrichment_status"] = enrichment_status
 
-    skip = (page - 1) * page_size
-    total = await prospects_collection.count_documents(query)
-    cursor = (
-        prospects_collection.find(query)
-        .sort("enhanced_score", -1)
-        .skip(skip)
-        .limit(page_size)
+    projection = {
+        "_id": 1, "full_name": 1, "first_name": 1, "last_name": 1,
+        "job_title": 1, "email": 1, "linkedin": 1, "company_name": 1,
+        "company_id": 1, "seniority_level": 1, "industry": 1,
+        "country": 1, "city": 1, "location": 1,
+        "enrichment_status": 1, "enrichment_completed_at": 1,
+    }
+    # Companies have a bounded prospect set; fetch them all so we can overlay
+    # tenant state, filter by state status, and sort by state score correctly.
+    docs = await prospects_collection.find(query, projection).limit(2000).to_list(length=2000)
+
+    state_by_pid: dict = {}
+    if docs:
+        pids = [str(d["_id"]) for d in docs]
+        async for st in prospect_state_collection.find(
+            {"account_id": account_id_str, "prospect_id": {"$in": pids}},
+            {"prospect_id": 1, "ai_score": 1, "priority_tier": 1, "status": 1,
+             "enrichment_status": 1},
+        ):
+            state_by_pid[str(st["prospect_id"])] = st
+
+    rows = []
+    for d in docs:
+        _str_id(d)
+        st = state_by_pid.get(d["_id"], {})
+        d["score"] = st.get("ai_score")
+        d["status"] = st.get("status", "new")
+        d["priority_tier"] = st.get("priority_tier")
+        if st.get("enrichment_status"):
+            d["enrichment_status"] = st["enrichment_status"]
+        if status and d["status"] != status:
+            continue
+        rows.append(d)
+
+    # Highest tenant score first; unscored (None) sort last.
+    rows.sort(
+        key=lambda p: (p.get("score") is not None, p.get("score") or 0),
+        reverse=True,
     )
-    prospects = [_str_id(doc) async for doc in cursor]
+
+    total = len(rows)
+    skip = (page - 1) * page_size
+    prospects = rows[skip:skip + page_size]
 
     return {"prospects": prospects, "total": total, "page": page, "page_size": page_size}
 
@@ -505,9 +648,11 @@ async def get_company_employees(
     page: int = Query(1, ge=1),
     page_size: int = Query(50, ge=1, le=200),
     enriched_only: bool = Query(False),
+    sort_by: str = "name",
+    sort_order: str = "desc",
     ctx: dict = Depends(get_account_context),
 ):
-    """Paginated employee list for a company with optional prospect info embedded."""
+    """Paginated employee list for a company with optional sort and prospect info."""
     try:
         oid = ObjectId(company_id)
     except Exception:
@@ -523,9 +668,13 @@ async def get_company_employees(
     if enriched_only:
         query["enriched"] = True
 
+    sort_direction = -1 if sort_order == "desc" else 1
+    allowed_sorts = {"name", "title", "location", "enriched"}
+    sort_field = sort_by if sort_by in allowed_sorts else "name"
+
     skip = (page - 1) * page_size
     total = await employees_collection.count_documents(query)
-    cursor = employees_collection.find(query).skip(skip).limit(page_size)
+    cursor = employees_collection.find(query).sort(sort_field, sort_direction).skip(skip).limit(page_size)
 
     result_employees = []
     async for emp in cursor:
@@ -626,7 +775,7 @@ class PromoteEmployeesRequest(BaseModel):
 async def promote_employees_to_prospects(
     company_id: str,
     body: PromoteEmployeesRequest,
-    ctx: dict = Depends(get_account_context),
+    _admin: dict = Depends(get_super_admin),
 ):
     """
     Convert selected scraped employees into prospect documents so they can
@@ -641,8 +790,6 @@ async def promote_employees_to_prospects(
     company = await companies_collection.find_one({"_id": company_oid})
     if not company:
         raise HTTPException(status_code=404, detail="Company not found")
-
-    account_id = ObjectId(ctx["account"]["_id"])
 
     employee_oids = []
     for eid in body.employee_ids:
@@ -687,8 +834,6 @@ async def promote_employees_to_prospects(
             "company_website": company.get("website"),
             "industry": company.get("industry"),
             "company_size": company.get("employee_count"),
-            "account_id": account_id,
-            "status": "new",
             "enrichment_status": "not_started",
             "source": "employee_scrape",
             "ai_prospect_score": None,
@@ -717,7 +862,7 @@ async def promote_employees_to_prospects(
 async def enrich_company(
     company_id: str,
     background_tasks: BackgroundTasks,
-    ctx: dict = Depends(get_account_context),
+    _admin: dict = Depends(get_super_admin),
 ):
     """Trigger background employee scraping for a company."""
     try:
@@ -775,10 +920,9 @@ class FromLinkedinRequest(BaseModel):
 async def add_company_from_linkedin(
     body: FromLinkedinRequest,
     background_tasks: BackgroundTasks,
-    ctx: dict = Depends(get_account_context),
+    _admin: dict = Depends(get_super_admin),
 ):
     """Add a company (and discover its employees) from a LinkedIn URL."""
-    account_id = ctx.get("account_id")
     linkedin_url = body.linkedin_url.strip().rstrip("/")
 
     # Normalise: ensure https://
@@ -803,12 +947,8 @@ async def add_company_from_linkedin(
         "enrichment_started_at": now,
         "created_at": now,
         "last_updated_at": now,
-        "prospect_count": 0,
         "enriched_prospect_count": 0,
     }
-    if account_id:
-        new_doc["account_id"] = account_id
-
     result = await companies_collection.insert_one(new_doc)
     company_id = str(result.inserted_id)
 
@@ -844,7 +984,7 @@ async def add_company_from_linkedin(
 @router.delete("/{company_id}")
 async def delete_company(
     company_id: str,
-    ctx: dict = Depends(get_account_context),
+    _admin: dict = Depends(get_super_admin),
 ):
     """Delete a company and its scraped employees. Enriched prospects are retained."""
     found, employees_deleted = await _delete_company_and_employees(company_id)

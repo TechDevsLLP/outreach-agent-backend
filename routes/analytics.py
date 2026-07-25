@@ -237,7 +237,7 @@ async def get_enrichment_roi(account_ctx=Depends(get_account_context)):
     COST_PER_NEWS_RESEARCH = 0.006    # Apify Google News + Gemini Flash validation
     COST_PER_AI_ASSESSMENT = 0.015    # Claude
     COST_PER_OUTREACH_GEN = 0.0008    # Gemini
-    COST_PER_EMAIL = 0.0004           # SendGrid
+    COST_PER_EMAIL = 0.0004           # rough per-send estimate (Gmail/Zoho/SMTP)
 
     # Aggregate stats — counts via prospect_state (new multi-tenant schema)
     total_prospects = await prospect_state_collection.count_documents({"account_id": account_id_str})
@@ -720,7 +720,7 @@ async def get_funnel_analytics(
         return round(n / sourced * 100, 1)
 
     # ── Stage 2: enrolled — status not in (created, pending) ──────────────
-    enrolled_match = {**enroll_match, "status": {"$nin": ["created", "pending"]}}
+    enrolled_match = {**enroll_match, "status": {"$nin": ["created", "pending", "cascade_waiting"]}}
     enrolled = await campaign_enrollments_collection.count_documents(enrolled_match)
 
     # ── Stage 3: sent — messages_sent > 0 OR last_sent_at exists ──────────

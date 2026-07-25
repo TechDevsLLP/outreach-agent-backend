@@ -552,6 +552,20 @@ async def resolve(
     return None
 
 
+def _build_group_index() -> tuple[dict[str, list[str]], dict[str, str]]:
+    """
+    Build the group-name → member ids index and the lowercase group-alias map
+    from the static taxonomy. Shared by expand_icp_to_industry_ids() and
+    suggest_industry_expansions() so both use an identical group definition.
+    """
+    group_to_ids: dict[str, list[str]] = {}
+    for entry in LINKEDIN_INDUSTRIES:
+        group_to_ids.setdefault(entry["group"], []).append(entry["id"])
+
+    group_alias: dict[str, str] = {g.lower(): g for g in group_to_ids}
+    return group_to_ids, group_alias
+
+
 async def expand_icp_to_industry_ids(
     icp_industries: list[str],
     *,
@@ -561,20 +575,21 @@ async def expand_icp_to_industry_ids(
     Given free-text ICP industry strings, return a deduplicated list of
     canonical industry_ids.
 
-    If an input resolves to an industry_id whose group matches a group-level
-    label (e.g. "Technology, Information & Media"), all ids in that group are
-    also included.
+    A term maps to an entire group only on exact normalized equality with a
+    group alias (e.g. the input is literally "Retail & Consumer"). Anything
+    less precise — e.g. "retail" alone — no longer expands into the whole
+    group (previously "retail" silently pulled in food_beverage, wholesale,
+    supermarkets, consumer_goods, etc. via substring matching). Terms that
+    don't name a group exactly fall through to the strict per-term resolve()
+    path, which yields at most one industry_id.
+
+    The ids a loose group match would additionally have pulled in are
+    available (for user-approved opt-in) via suggest_industry_expansions().
     """
     if not icp_industries:
         return []
 
-    # Build group-name → member ids index from static taxonomy
-    group_to_ids: dict[str, list[str]] = {}
-    for entry in LINKEDIN_INDUSTRIES:
-        group_to_ids.setdefault(entry["group"], []).append(entry["id"])
-
-    # Also build a group-name alias map (lowercase group → group name)
-    group_alias: dict[str, str] = {g.lower(): g for g in group_to_ids}
+    group_to_ids, group_alias = _build_group_index()
 
     seen: set[str] = set()
     result: list[str] = []
@@ -585,12 +600,8 @@ async def expand_icp_to_industry_ids(
 
         normalized = _normalize_industry(raw)
 
-        # Check if the input directly names a group
-        matched_group: str | None = None
-        for g_lower, g_label in group_alias.items():
-            if normalized == g_lower or normalized in g_lower or g_lower in normalized:
-                matched_group = g_label
-                break
+        # Strict group match: exact equality only.
+        matched_group = group_alias.get(normalized)
 
         if matched_group:
             for gid in group_to_ids.get(matched_group, []):
@@ -609,6 +620,54 @@ async def expand_icp_to_industry_ids(
             result.append(industry_id)
 
     return result
+
+
+async def suggest_industry_expansions(terms: list[str]) -> list[str]:
+    """
+    Return the additional industry_ids that the old loose (bidirectional
+    substring) group matching would have added for the given ICP industry
+    terms, minus any ids already reachable through strict resolution.
+
+    This is suggestions only — expand_icp_to_industry_ids() never includes
+    these automatically. Callers (icp_canonicalizer.canonicalize_icp) surface
+    the result as `suggested_industry_ids`, and a user must explicitly
+    approve them (POST /api/campaigns/{id}/industries/approve) before they
+    are merged into the campaign's `industry_ids`.
+    """
+    if not terms:
+        return []
+
+    group_to_ids, group_alias = _build_group_index()
+
+    strict_ids = set(await expand_icp_to_industry_ids(terms))
+
+    seen: set[str] = set()
+    suggestions: list[str] = []
+
+    for raw in terms:
+        if not raw or not raw.strip():
+            continue
+
+        normalized = _normalize_industry(raw)
+
+        # Reproduce the previous loose matching rule to compute what it
+        # *would* have expanded to, purely for suggestion purposes.
+        matched_group: str | None = None
+        for g_lower, g_label in group_alias.items():
+            if normalized == g_lower or normalized in g_lower or g_lower in normalized:
+                matched_group = g_label
+                break
+
+        if not matched_group:
+            continue
+
+        for gid in group_to_ids.get(matched_group, []):
+            if gid in strict_ids or gid in seen:
+                continue
+            seen.add(gid)
+            suggestions.append(gid)
+
+    return suggestions
 
 
 async def build_taxonomy_in_db(collection) -> int:

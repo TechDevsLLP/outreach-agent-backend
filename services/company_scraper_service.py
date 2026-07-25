@@ -3,6 +3,9 @@ Apify LinkedIn company page scraper integration.
 Uses actor UwSdACBp7ymaGUJjS with deduplication across leads.
 """
 
+import asyncio
+import threading
+
 from apify_client import ApifyClient
 from config import get_settings
 import logging
@@ -10,7 +13,28 @@ import logging
 logger = logging.getLogger(__name__)
 
 settings = get_settings()
-apify_client = ApifyClient(settings.apify_api_key)
+
+
+class _LazyApifyClient:
+    """Construct the synchronous dataset client only on first provider use."""
+
+    def __init__(self, api_key: str):
+        self._api_key = api_key
+        self._client = None
+        self._lock = threading.Lock()
+
+    def _get_client(self):
+        if self._client is None:
+            with self._lock:
+                if self._client is None:
+                    self._client = ApifyClient(self._api_key)
+        return self._client
+
+    def dataset(self, dataset_id: str):
+        return self._get_client().dataset(dataset_id)
+
+
+apify_client = _LazyApifyClient(settings.apify_api_key)
 
 
 def extract_unique_company_urls(leads_with_profiles: list[dict]) -> dict[str, list[str]]:
@@ -52,12 +76,16 @@ def extract_unique_company_urls(leads_with_profiles: list[dict]) -> dict[str, li
     return company_to_leads
 
 
-def scrape_company_pages(urls: list[str]) -> tuple[str, list[dict]]:
+async def scrape_company_pages(urls: list[str]) -> tuple[str, list[dict]]:
     """
     Scrape LinkedIn company pages via Apify actor.
     Batches up to 50 URLs per actor call.
     Returns (run_id, list_of_company_dicts).
-    This is a blocking call.
+
+    The actor call itself is retried/semaphore-bounded via
+    services.apify_service.call_actor_with_retry; dataset iteration stays
+    off the event loop via asyncio.to_thread, same as when this whole
+    function was run in an executor by its callers.
     """
     if not urls:
         return "no_urls", []
@@ -68,14 +96,16 @@ def scrape_company_pages(urls: list[str]) -> tuple[str, list[dict]]:
         "companies": urls,
     }
 
-    run = apify_client.actor(settings.apify_company_scraper_id).call(run_input=run_input)
+    from services.apify_service import call_actor_with_retry
+    run = await call_actor_with_retry(settings.apify_company_scraper_id, run_input)
     run_id = run.get("id", "unknown")
 
     logger.info(f"Company scrape completed: {run_id}")
 
     results = []
-    for item in apify_client.dataset(run["defaultDatasetId"]).iterate_items():
-        results.append(item)
+    dataset_id = run.get("defaultDatasetId")
+    if dataset_id:
+        results = await asyncio.to_thread(lambda: list(apify_client.dataset(dataset_id).iterate_items()))
 
     logger.info(f"Fetched {len(results)} company results from Apify")
     return run_id, results

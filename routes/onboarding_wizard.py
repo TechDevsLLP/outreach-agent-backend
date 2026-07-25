@@ -15,7 +15,7 @@ from fastapi.responses import StreamingResponse
 from pydantic import BaseModel
 
 import database
-from auth import get_account_context, get_current_user
+from auth import get_account_context
 from config import get_settings
 from services.onboarding_analyzer_service import analyze_company, run_analysis, create_job, get_job
 from services.sender_voice_service import update_sender_voice_from_unipile
@@ -35,10 +35,12 @@ class StartSessionRequest(BaseModel):
 @router.post("/start")
 async def start_wizard_session(
     body: StartSessionRequest,
-    user: dict = Depends(get_current_user),
+    account_ctx: dict = Depends(get_account_context),
 ):
     """Create or resume an onboarding wizard session."""
-    account_id = str(user.get("current_account_id", ""))
+    logger.info(f"account ctx1:: {account_ctx}")
+
+    account_id = str(account_ctx["account"]["_id"])
     session_id = str(uuid.uuid4())
     now = datetime.now(timezone.utc)
 
@@ -50,7 +52,7 @@ async def start_wizard_session(
                 "_id": ObjectId(),
                 "session_id": session_id,
                 "account_id": account_id,
-                "user_id": str(user["_id"]),
+                "user_id": str(account_ctx["user"]["_id"]),
                 "current_stage": 1,
                 "stage_data": {},
                 "refinement_chat_history": [],
@@ -81,9 +83,10 @@ class ScrapeCompanyRequest(BaseModel):
 async def stage1_scrape_company(
     body: ScrapeCompanyRequest,
     background_tasks: BackgroundTasks,
-    user: dict = Depends(get_current_user),
+    account_ctx: dict = Depends(get_account_context),
 ):
     """Start a company scrape + AI analysis job for stage 1."""
+    account_id = str(account_ctx["account"]["_id"])
     job_id = create_job()
     background_tasks.add_task(
         run_analysis,
@@ -91,6 +94,21 @@ async def stage1_scrape_company(
         company_name=body.company_name or "",
         url=body.url,
         description=body.description or "",
+    )
+    # Persist the user-typed identity fields immediately — these never come
+    # back from the analyzer, and dropping them left Settings' Company Name /
+    # Website URL / description blank after onboarding.
+    identity: dict = {"updated_at": datetime.now(timezone.utc)}
+    if (body.company_name or "").strip():
+        identity["company_name"] = body.company_name.strip()
+    if (body.url or "").strip():
+        identity["website_url"] = body.url.strip()
+    if (body.description or "").strip():
+        identity["description"] = body.description.strip()
+    await database.company_profiles_collection.update_one(
+        {"account_id": account_id},
+        {"$set": identity},
+        upsert=True,
     )
     # Persist job_id against session
     await database.onboarding_sessions_collection.update_one(
@@ -101,7 +119,7 @@ async def stage1_scrape_company(
 
 
 @router.get("/stage-1/result/{job_id}")
-async def stage1_result(job_id: str, user: dict = Depends(get_current_user)):
+async def stage1_result(job_id: str, account_ctx: dict = Depends(get_account_context)):
     """Poll stage 1 analysis job status."""
     job = get_job(job_id)
     if not job:
@@ -117,7 +135,6 @@ async def stage1_result(job_id: str, user: dict = Depends(get_current_user)):
 @router.post("/stage-1/save")
 async def stage1_save(
     body: dict,
-    user: dict = Depends(get_current_user),
     account_ctx: dict = Depends(get_account_context),
 ):
     """Save stage 1 analysis results (possibly edited) to company_profile."""
@@ -137,6 +154,24 @@ async def stage1_save(
         update_doc["icp_description"] = analysis["icp_description"]
     if analysis.get("case_studies"):
         update_doc["case_studies"] = analysis["case_studies"]
+    # Fields the analyzer returns that Settings reads — previously dropped,
+    # leaving Target Market / Differentiators / Value Props empty post-onboarding.
+    if analysis.get("target_market"):
+        update_doc["target_market"] = analysis["target_market"]
+    if analysis.get("differentiators"):
+        update_doc["differentiators"] = analysis["differentiators"]
+    if analysis.get("value_propositions"):
+        update_doc["value_propositions"] = analysis["value_propositions"]
+    if analysis.get("description"):
+        update_doc["description"] = analysis["description"]
+    if analysis.get("company_industries"):
+        update_doc["industries"] = analysis["company_industries"]
+    # Identity fields: analyzer-extracted company_name first, body overrides
+    if (analysis.get("company_name") or "").strip():
+        update_doc["company_name"] = analysis["company_name"].strip()
+    for key in ("company_name", "website_url"):
+        if (body.get(key) or "").strip():
+            update_doc[key] = body[key].strip()
     update_doc["updated_at"] = now
     update_doc["onboarding_stage"] = 1
 
@@ -162,7 +197,6 @@ class LinkedInVoiceRequest(BaseModel):
 @router.post("/stage-2/linkedin-voice")
 async def stage2_linkedin_voice(
     body: LinkedInVoiceRequest,
-    user: dict = Depends(get_current_user),
     account_ctx: dict = Depends(get_account_context),
 ):
     """Pull the user's OWN voice data from their connected LinkedIn (Unipile only)."""
@@ -201,12 +235,30 @@ class ICPRequest(BaseModel):
 async def stage3_icp(
     body: ICPRequest,
     background_tasks: BackgroundTasks,
-    user: dict = Depends(get_current_user),
     account_ctx: dict = Depends(get_account_context),
 ):
-    """Save ICP definition to company_profile."""
+    """Save ICP definition to company_profile, create the onboarding campaign
+    synchronously, and kick off background discovery + preview prefetch."""
     account_id = str(account_ctx["account"]["_id"])
     now = datetime.now(timezone.utc)
+
+    # locked_industry drives the onboarding campaign. Default to the first ICP
+    # industry when the frontend didn't send it explicitly; 422 if neither exists
+    # (previously a missing locked_industry silently skipped campaign creation,
+    # making launch-first-campaign 404 later).
+    locked_industry = (body.locked_industry or "").strip()
+    if not locked_industry and body.industries:
+        locked_industry = (body.industries[0] or "").strip()
+        if locked_industry:
+            logger.info(
+                f"[onboarding] account={account_id}: locked_industry not provided, "
+                f"defaulting to first ICP industry {locked_industry!r}"
+            )
+    if not locked_industry:
+        raise HTTPException(
+            status_code=422,
+            detail="locked_industry is required (or provide at least one industry in `industries`).",
+        )
 
     icp_data = {
         "target_industries": body.industries,
@@ -233,21 +285,44 @@ async def stage3_icp(
             {"$set": {"current_stage": 4, "updated_at": now}},
         )
 
-    # Fire-and-forget: canonicalize ICP into structured filters
+    # Fire-and-forget: canonicalize ICP into structured filters (strong ref so
+    # the task cannot be GC'd before running)
+    from services.onboarding_scrape_service import _spawn
     account_oid_str = account_id
-    asyncio.create_task(_canonicalize_and_save_company_profile_icp(account_oid_str, body))
+    _spawn(_canonicalize_and_save_company_profile_icp(account_oid_str, body))
 
-    if body.locked_industry and body.session_id:
-        from services.onboarding_scrape_service import start_onboarding_scrape
+    campaign_id: Optional[str] = None
+    if body.session_id:
+        from services.onboarding_scrape_service import create_onboarding_campaign, start_onboarding_scrape
+
+        # Create the campaign synchronously so the response carries campaign_id
+        # and launch-first-campaign can never 404 on a missing campaign.
+        campaign_id = await create_onboarding_campaign(
+            account_id=account_id,
+            session_id=body.session_id,
+            locked_industry=locked_industry,
+            icp_data=icp_data,
+        )
+
+        # Discovery itself stays in the background
         background_tasks.add_task(
             start_onboarding_scrape,
             account_id=account_id,
             session_id=body.session_id,
-            locked_industry=body.locked_industry,
+            locked_industry=locked_industry,
             icp_data=icp_data,
+            campaign_id=campaign_id,
         )
 
-    return {"ok": True}
+        # Prefetch preview prospects now that the ICP exists (idempotent — the
+        # task skips if a preview is already cached on the session).
+        background_tasks.add_task(
+            _prefetch_preview_prospects,
+            account_id=account_id,
+            session_id=body.session_id,
+        )
+
+    return {"ok": True, "campaign_id": campaign_id, "locked_industry": locked_industry}
 
 
 async def _canonicalize_and_save_company_profile_icp(account_id: str, body) -> None:
@@ -286,7 +361,6 @@ class OfferRequest(BaseModel):
 async def stage4_offer(
     body: OfferRequest,
     background_tasks: BackgroundTasks,
-    user: dict = Depends(get_current_user),
     account_ctx: dict = Depends(get_account_context),
 ):
     """Save offer details to company_profile."""
@@ -328,7 +402,6 @@ async def stage4_offer(
 @router.post("/stage-5/oauth/init")
 async def stage5_oauth_init(
     body: dict,
-    user: dict = Depends(get_current_user),
     account_ctx: dict = Depends(get_account_context),
 ):
     """Return the OAuth authorization URL for the requested provider."""
@@ -336,10 +409,17 @@ async def stage5_oauth_init(
     provider = body.get("provider", "google")
 
     if provider == "google":
-        import json, base64
-        # Encode return destination in state so the callback can redirect back to onboarding
-        state_payload = json.dumps({"return_to": "/home", "account_id": str(account_ctx["account"]["_id"])})
-        state = base64.urlsafe_b64encode(state_payload.encode()).decode()
+        # Use the same signed, expiring, account/provider/redirect-bound and
+        # one-time state contract as the connections page. The callback may
+        # decode return_to for navigation, but exchange verifies every binding.
+        from routes.email_accounts import _issue_oauth_state
+
+        state = await _issue_oauth_state(
+            account_id=str(account_ctx["account"]["_id"]),
+            provider="google",
+            redirect_uri=settings.google_redirect_uri,
+            return_to="/home",
+        )
         params = {
             "client_id": settings.google_client_id,
             "redirect_uri": settings.google_redirect_uri,
@@ -356,7 +436,7 @@ async def stage5_oauth_init(
             "state": state,
         }
         auth_url = "https://accounts.google.com/o/oauth2/v2/auth?" + urllib.parse.urlencode(params)
-        return {"redirect_url": auth_url, "provider": "google"}
+        return {"auth_url": auth_url, "provider": "google"}
 
     raise HTTPException(status_code=400, detail=f"Unsupported provider: {provider}")
 
@@ -371,7 +451,6 @@ class RefinementChatRequest(BaseModel):
 @router.post("/stage-6/chat")
 async def stage6_chat(
     body: RefinementChatRequest,
-    user: dict = Depends(get_current_user),
     account_ctx: dict = Depends(get_account_context),
 ):
     """Multi-turn AI chat to capture objection bank, competitor bank, banned phrases."""
@@ -471,7 +550,6 @@ async def stage6_chat(
 @router.post("/wizard/complete")
 async def complete_wizard(
     body: dict,
-    user: dict = Depends(get_current_user),
     account_ctx: dict = Depends(get_account_context),
 ):
     """Mark wizard complete; mark user onboarding_complete flag."""
@@ -487,14 +565,14 @@ async def complete_wizard(
 
     from database import users_collection
     await users_collection.update_one(
-        {"_id": ObjectId(str(user["_id"]))},
+        {"_id": ObjectId(str(account_ctx["user"]["_id"]))},
         {"$set": {"onboarding_complete": True}},
     )
 
     if session_id:
         await database.onboarding_sessions_collection.update_one(
             {"session_id": session_id},
-            {"$set": {"status": "completed", "completed_at": now, "updated_at": now}},
+            {"$set": {"current_stage": 7, "status": "completed", "completed_at": now, "updated_at": now}},
         )
 
     # Return AI campaign suggestion
@@ -513,7 +591,6 @@ async def complete_wizard(
 
 @router.get("/session")
 async def get_onboarding_session(
-    user: dict = Depends(get_current_user),
     account_ctx: dict = Depends(get_account_context),
 ):
     """
@@ -523,7 +600,9 @@ async def get_onboarding_session(
       { current_stage, status, session_id, profile: {...}, prospect_preview: [...], prospect_preview_excluded_companies: [...] }
     """
     account_id = str(account_ctx["account"]["_id"])
-    user_id = str(user["_id"])
+    user_id = str(account_ctx["user"]["_id"])
+
+    logger.info(f"account ctx:: {account_ctx}")
 
     # Fetch most recent session for this user/account
     session = await database.onboarding_sessions_collection.find_one(
@@ -605,9 +684,19 @@ def _serialise_prospect_for_table(p: dict) -> dict:
 
 
 async def _prefetch_preview_prospects(account_id: str, session_id: str) -> None:
-    """Background task: pre-source 5 prospects after offer is saved so preview is instant."""
+    """Background task: pre-source 5 prospects (after stage 3 / stage 4) so preview is instant.
+
+    Idempotent: skips if a preview is already cached on the session, so being
+    triggered from both stage 3 and stage 4 never double-spends sourcing.
+    """
     from services.onboarding_prospect_service import source_preview_prospects
     try:
+        session = await database.onboarding_sessions_collection.find_one(
+            {"session_id": session_id}, {"prospect_preview": 1}
+        )
+        if session and session.get("prospect_preview"):
+            logger.info(f"[prefetch] Preview already cached for session {session_id}, skipping")
+            return
         profile = await database.company_profiles_collection.find_one({"account_id": account_id})
         if not profile:
             return
@@ -634,7 +723,6 @@ async def _prefetch_preview_prospects(account_id: str, session_id: str) -> None:
 @router.post("/prospect-preview")
 async def get_prospect_preview(
     body: ProspectPreviewRequest,
-    user: dict = Depends(get_current_user),
     account_ctx: dict = Depends(get_account_context),
 ):
     """
@@ -658,6 +746,12 @@ async def get_prospect_preview(
         )
         if existing_session and existing_session.get("prospect_preview"):
             cached = list(existing_session["prospect_preview"])
+            # Advance stage to 8 (preview confirmed) on first view
+            if (existing_session.get("current_stage") or 0) < 8:
+                await database.onboarding_sessions_collection.update_one(
+                    {"session_id": session_id},
+                    {"$set": {"current_stage": 8, "updated_at": datetime.now(timezone.utc)}},
+                )
             return {
                 "prospects": [_serialise_prospect_for_table(p) for p in cached],
                 "count": len(cached),
@@ -679,6 +773,7 @@ async def get_prospect_preview(
         await database.onboarding_sessions_collection.update_one(
             {"session_id": session_id},
             {"$set": {
+                "current_stage": 8,
                 "prospect_preview": prospects,
                 "prospect_preview_excluded_companies": sourced_company_names,
                 "prospect_preview_at": now,
@@ -696,7 +791,6 @@ async def get_prospect_preview(
 @router.post("/prospect-preview/reroll")
 async def reroll_prospect_preview(
     body: ProspectPreviewRerollRequest,
-    user: dict = Depends(get_current_user),
     account_ctx: dict = Depends(get_account_context),
 ):
     """
@@ -758,6 +852,100 @@ async def reroll_prospect_preview(
     }
 
 
+class PreviewMessageRequest(BaseModel):
+    session_id: str
+    regenerate: bool = False
+
+
+@router.post("/preview-message")
+async def get_preview_message(
+    body: PreviewMessageRequest,
+    account_ctx: dict = Depends(get_account_context),
+):
+    """
+    Generate (and cache on the session) a sample outreach message to the first
+    preview prospect, written in the sender's synthesized voice when available.
+
+    Returns { message, voice_used, prospect, cached }.
+    Pass regenerate=true to bypass the cache and produce a fresh message.
+    """
+    from services.openrouter_service import OpenRouterClient
+    from utils.prompts import (
+        ONBOARDING_PREVIEW_MESSAGE_PROMPT,
+        build_onboarding_preview_message_prompt,
+    )
+
+    account_id = str(account_ctx["account"]["_id"])
+
+    session = await database.onboarding_sessions_collection.find_one(
+        {"session_id": body.session_id}
+    )
+    if not session:
+        raise HTTPException(status_code=404, detail="Session not found")
+
+    # Serve from cache unless regeneration was requested
+    cached = session.get("preview_message") or {}
+    if cached.get("message") and not body.regenerate:
+        return {
+            "message": cached["message"],
+            "voice_used": bool(cached.get("voice_used")),
+            "prospect": cached.get("prospect"),
+            "cached": True,
+        }
+
+    preview = list(session.get("prospect_preview") or [])
+    if not preview:
+        raise HTTPException(
+            status_code=422,
+            detail="No preview prospects available yet — complete stage 3 (ICP) and wait for prospect sourcing.",
+        )
+    prospect = _serialise_prospect_for_table(preview[0])
+
+    profile = await database.company_profiles_collection.find_one({"account_id": account_id}) or {}
+    voice_profile = profile.get("sender_voice_profile") or None
+    voice_used = bool(voice_profile)
+
+    user_prompt = build_onboarding_preview_message_prompt(
+        company_profile=profile,
+        prospect=prospect,
+        voice_profile=voice_profile,
+    )
+
+    client = OpenRouterClient()
+    result = await client.chat_completion(
+        messages=[
+            {"role": "system", "content": ONBOARDING_PREVIEW_MESSAGE_PROMPT},
+            {"role": "user", "content": user_prompt},
+        ],
+        model="anthropic/claude-haiku-4-5",
+        max_tokens=300,
+        temperature=0.7 if body.regenerate else 0.5,
+    )
+    message = (result.get("content") or "").strip().strip('"')
+    if not message:
+        raise HTTPException(status_code=502, detail="Message generation returned no content — try again.")
+
+    now = datetime.now(timezone.utc)
+    await database.onboarding_sessions_collection.update_one(
+        {"session_id": body.session_id},
+        {"$set": {
+            "preview_message": {
+                "message": message,
+                "voice_used": voice_used,
+                "prospect": prospect,
+                "generated_at": now,
+            },
+            "updated_at": now,
+        }},
+    )
+    logger.info(
+        f"[onboarding] preview message generated account={account_id} "
+        f"session={body.session_id} voice_used={voice_used} regenerate={body.regenerate}"
+    )
+
+    return {"message": message, "voice_used": voice_used, "prospect": prospect, "cached": False}
+
+
 @router.post("/launch-first-campaign")
 async def launch_first_campaign(
     request: Request,
@@ -793,18 +981,112 @@ async def launch_first_campaign(
         campaign_id = str(job_doc.get("campaign_id") or "") if job_doc else ""
 
     if not campaign_id:
-        raise HTTPException(
-            status_code=404,
-            detail="Onboarding campaign not found. Ensure your industry was locked at stage 3."
+        # Self-heal: the stage-3 campaign creation failed or never ran (e.g. old
+        # session, or a crash between ICP save and campaign insert). Rebuild the
+        # campaign from the saved company profile and kick discovery now instead
+        # of 404ing the user at the finish line.
+        logger.warning(
+            f"[onboarding] launch-first-campaign: no campaign for session={session_id} "
+            f"account={account_id} — self-healing from company profile"
         )
+        profile = await database.company_profiles_collection.find_one({"account_id": account_id}) or {}
+        industries = profile.get("target_industries") or []
+        locked_industry = (industries[0] if industries else "").strip() if industries else ""
+        if not locked_industry:
+            raise HTTPException(
+                status_code=404,
+                detail="Onboarding campaign not found and no target industry saved. "
+                       "Complete stage 3 (ICP) first."
+            )
+        icp_data = {
+            "target_industries": industries,
+            "target_job_titles": profile.get("target_job_titles") or [],
+            "target_seniority": profile.get("target_seniority") or [],
+            "target_geographies": profile.get("target_geographies") or [],
+            "target_company_sizes": profile.get("target_company_sizes") or [],
+        }
+        from services.onboarding_scrape_service import (
+            create_onboarding_campaign,
+            start_onboarding_scrape,
+            _spawn,
+        )
+        campaign_id = await create_onboarding_campaign(
+            account_id=account_id,
+            session_id=session_id,
+            locked_industry=locked_industry,
+            icp_data=icp_data,
+        )
+        # Kick discovery in the background; replan below will assign whatever
+        # is enrolled so far (frontend polls scrape-status for progress).
+        _spawn(start_onboarding_scrape(
+            account_id=account_id,
+            session_id=session_id,
+            locked_industry=locked_industry,
+            icp_data=icp_data,
+            campaign_id=campaign_id,
+        ))
+        logger.info(f"[onboarding] self-healed campaign {campaign_id} for session={session_id}")
 
-    # Re-plan channels now that sender accounts are connected
-    from services.curated_discovery_service import replan_and_launch
-    result = await replan_and_launch(campaign_id, account_id)
+    # Self-heal a stalled campaign: exists but discovery never ran (or died)
+    # and nothing is enrolled — e.g. the stage-3 background task was lost to a
+    # dev-server reload before it could queue any work. Re-kick discovery via
+    # the durable job queue; enqueue_onboarding_discovery is idempotent against
+    # an in-flight run.
+    discovery_rekicked = False
+    campaign_state = await database.campaigns_collection.find_one(
+        {"_id": ObjectId(campaign_id)},
+        {"discovery_status": 1},
+    )
+    if campaign_state:
+        discovery_status = campaign_state.get("discovery_status")
+        enrolled_count = await database.campaign_enrollments_collection.count_documents(
+            {"campaign_id": ObjectId(campaign_id)}
+        )
+        needs_discovery = (
+            discovery_status in (None, "pending", "failed")
+            or (enrolled_count == 0 and discovery_status not in (
+                "queued", "searching_db", "scraping", "enriching", "scoring",
+                "sourcing_companies", "scraping_employees",
+            ))
+        )
+        if needs_discovery:
+            from services.onboarding_scrape_service import enqueue_onboarding_discovery
+            logger.warning(
+                f"[onboarding] launch-first-campaign: campaign {campaign_id} stalled "
+                f"(discovery_status={discovery_status!r}, enrolled={enrolled_count}) — re-kicking discovery"
+            )
+            discovery_rekicked = await enqueue_onboarding_discovery(
+                campaign_id=campaign_id,
+                account_id=account_id,
+                session_id=session_id,
+            )
+
+    # Re-plan channels now that sender accounts are connected. Skip when we
+    # just (re)queued discovery — there is nothing to plan yet; the frontend
+    # follows progress via scrape-status/SSE instead.
+    if discovery_rekicked:
+        result = {"assigned": 0, "day_totals": {}}
+    else:
+        from services.curated_discovery_service import replan_and_launch
+        result = await replan_and_launch(campaign_id, account_id)
+
+    await database.onboarding_sessions_collection.update_one(
+        {"session_id": session_id},
+        {"$set": {"current_stage": 9, "updated_at": datetime.now(timezone.utc)}},
+    )
+
+    # Fetch campaign for prospect_count_target and day1_enrolled
+    campaign_doc = await database.campaigns_collection.find_one(
+        {"_id": ObjectId(campaign_id)},
+        {"prospect_count_target": 1, "day1_enrolled": 1},
+    )
 
     return {
         "success": True,
         "campaign_id": campaign_id,
+        "building": discovery_rekicked,
+        "prospect_count_target": (campaign_doc or {}).get("prospect_count_target", 50),
+        "day1_enrolled": (campaign_doc or {}).get("day1_enrolled", 0),
         "assigned": result.get("assigned", 0),
         "day_totals": result.get("day_totals", {}),
     }
@@ -837,7 +1119,6 @@ async def get_scrape_status(
 @router.get("/scrape-progress/{session_id}")
 async def scrape_progress_stream(
     session_id: str,
-    user: dict = Depends(get_current_user),
     account_ctx: dict = Depends(get_account_context),
 ):
     """

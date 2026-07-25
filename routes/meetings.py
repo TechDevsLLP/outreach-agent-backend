@@ -11,7 +11,11 @@ from pydantic import BaseModel
 
 import database
 from auth import get_account_context
-from services.meeting_service import confirm_slot_and_send_invite
+from services.conversation_service import _account_filter
+from services.meeting_service import (
+    MeetingConfirmationInProgress,
+    confirm_slot_and_send_invite,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -32,7 +36,7 @@ async def _join_prospect_info(meeting: dict) -> dict:
     if conv_id:
         try:
             conv = await database.conversations_collection.find_one(
-                {"_id": ObjectId(conv_id)},
+                {"_id": ObjectId(conv_id), **_account_filter(meeting.get("account_id"))},
                 {"prospect_name": 1, "prospect_email": 1, "prospect_company": 1},
             )
             if conv:
@@ -116,7 +120,7 @@ async def confirm_slot(
     # Verify meeting belongs to this account
     try:
         meeting = await database.meetings_collection.find_one(
-            {"_id": ObjectId(meeting_id), "account_id": account_id},
+            {"_id": ObjectId(meeting_id), **_account_filter(account_id)},
             {"_id": 1, "status": 1},
         )
     except Exception:
@@ -125,19 +129,16 @@ async def confirm_slot(
     if not meeting:
         raise HTTPException(status_code=404, detail="Meeting not found")
 
-    if meeting.get("status") not in ("proposed", "rescheduling"):
-        raise HTTPException(
-            status_code=409,
-            detail=f"Meeting is already {meeting.get('status')} — cannot confirm again",
-        )
-
     try:
         result = await confirm_slot_and_send_invite(
             meeting_id=meeting_id,
             slot_index=body.slot_index,
+            account_id=account_id,
             prospect_email=body.prospect_email or "",
             agenda=body.agenda or "",
         )
+    except MeetingConfirmationInProgress as exc:
+        raise HTTPException(status_code=409, detail=str(exc))
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc))
     except Exception as exc:
@@ -171,7 +172,7 @@ async def cancel_meeting(
 
     # Update meeting status
     await database.meetings_collection.update_one(
-        {"_id": ObjectId(meeting_id)},
+        {"_id": ObjectId(meeting_id), **_account_filter(account_id)},
         {"$set": {"status": "cancelled", "updated_at": now}},
     )
 
@@ -180,7 +181,7 @@ async def cancel_meeting(
     if enrollment_id:
         try:
             await database.campaign_enrollments_collection.update_one(
-                {"_id": ObjectId(enrollment_id)},
+                {"_id": ObjectId(enrollment_id), **_account_filter(account_id)},
                 {
                     "$set": {
                         "status": "active",
@@ -210,7 +211,7 @@ async def reschedule_meeting(
     """
     Set meeting to rescheduling status, clear calendar event ID, and regenerate proposed slots.
     """
-    from datetime import datetime
+    from datetime import datetime, timedelta
     from services.meeting_service import _build_proposed_slots
     from services.calendar_service import propose_three_slots
 
@@ -237,7 +238,7 @@ async def reschedule_meeting(
         pass  # Keep deterministic slots
 
     await database.meetings_collection.update_one(
-        {"_id": ObjectId(meeting_id)},
+        {"_id": ObjectId(meeting_id), **_account_filter(account_id)},
         {
             "$set": {
                 "status": "rescheduling",
@@ -246,6 +247,7 @@ async def reschedule_meeting(
                 "confirmed_slot_index": None,
                 "booked_at": None,
                 "proposed_slots": new_slots,
+                "booking_expires_at": now + timedelta(days=30),
                 "reschedule_reason": body.reason or "",
                 "updated_at": now,
             }
@@ -257,11 +259,13 @@ async def reschedule_meeting(
     if enrollment_id:
         try:
             await database.campaign_enrollments_collection.update_one(
-                {"_id": ObjectId(enrollment_id)},
+                {"_id": ObjectId(enrollment_id), **_account_filter(account_id)},
                 {"$set": {"status": "meeting_proposed", "last_activity_at": now}},
             )
         except Exception as exc:
             logger.error(f"Failed to update enrollment {enrollment_id} to meeting_proposed on reschedule: {exc}", exc_info=True)
 
-    updated = await database.meetings_collection.find_one({"_id": ObjectId(meeting_id)})
+    updated = await database.meetings_collection.find_one(
+        {"_id": ObjectId(meeting_id), **_account_filter(account_id)}
+    )
     return _serialize_meeting(updated) if updated else {"meeting_id": meeting_id, "status": "rescheduling"}

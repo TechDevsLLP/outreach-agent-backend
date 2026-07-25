@@ -30,7 +30,13 @@ async def assess_lead(
     user_prompt = build_assessment_user_prompt(lead, profile, company, company_profile=company_profile, campaign=campaign)
 
     messages = [
-        {"role": "system", "content": await get_system_prompt("assessment")},
+        {
+            "role": "system",
+            "content": await get_system_prompt(
+                "assessment",
+                str((campaign or {}).get("account_id") or "") or None,
+            ),
+        },
         {"role": "user", "content": user_prompt},
     ]
 
@@ -81,7 +87,9 @@ async def batch_assess_leads(
     ]
 
     user_prompt = build_batch_assessment_user_prompt(prospects_data, campaign=campaign)
-    system_prompt = await get_system_prompt("assessment")
+    system_prompt = await get_system_prompt(
+        "assessment", str((campaign or {}).get("account_id") or "") or None
+    )
 
     messages = [
         {"role": "system", "content": system_prompt},
@@ -162,7 +170,7 @@ async def batch_assess_leads(
             if i > 0:
                 await _asyncio.sleep(0.1)  # Brief pause between sequential calls to avoid rate-limit spikes
             try:
-                assessment = await assess_lead(lead, profile, company, client, company_profile=company_profile)
+                assessment = await assess_lead(lead, profile, company, client, company_profile=company_profile, campaign=campaign)
                 assessment.setdefault("fit_rating", "unknown")
                 assessment.setdefault("reasoning", "")
                 assessment.setdefault("fit_score", 0)

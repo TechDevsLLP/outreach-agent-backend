@@ -14,10 +14,32 @@ from pydantic import BaseModel
 
 import database
 from auth import get_account_context
+from services.conversation_service import _account_filter
 
 logger = logging.getLogger(__name__)
 
 router = APIRouter(prefix="/api/replies", tags=["replies"])
+
+
+async def _find_active_enrollment_id(account_id: str, prospect_id) -> Optional[str]:
+    """Look up the in-flight enrollment for a prospect so classify/override/
+    escalate can thread enrollment-side effects instead of silently skipping them."""
+    if not prospect_id:
+        return None
+    candidates = [str(prospect_id)]
+    try:
+        candidates.append(ObjectId(str(prospect_id)))
+    except Exception:
+        pass
+    enrollment = await database.campaign_enrollments_collection.find_one(
+        {
+            **_account_filter(account_id),
+            "prospect_id": {"$in": candidates},
+            "status": {"$in": ["active", "enrolled", "replied"]},
+        },
+        {"_id": 1},
+    )
+    return str(enrollment["_id"]) if enrollment else None
 
 
 @router.get("/preview/{conversation_id}")
@@ -67,12 +89,15 @@ async def manually_classify(
     if not inbound:
         raise HTTPException(status_code=400, detail="No inbound message found to classify")
 
+    enrollment_id = await _find_active_enrollment_id(account_id, conv.get("prospect_id"))
+
     from services.reply_classifier_service import classify_reply
     classification = await classify_reply(
         conversation_id=body.conversation_id,
         message_text=inbound.get("content_text", ""),
         channel=conv.get("channel", "email"),
         account_id=account_id,
+        enrollment_id=enrollment_id,
         prospect_id=conv.get("prospect_id"),
     )
     return {"classification": classification}
@@ -105,6 +130,7 @@ async def override_classification(
         messages = conv.get("messages") or []
         inbound = next((m for m in reversed(messages) if m.get("direction") == "inbound"), None)
         message_text = inbound.get("content_text", "") if inbound else ""
+        enrollment_id = await _find_active_enrollment_id(account_id, conv.get("prospect_id"))
 
         from services.reply_classifier_service import classify_reply
         from services.reply_handler_service import handle_classified_reply
@@ -113,6 +139,7 @@ async def override_classification(
             message_text=message_text,
             channel=conv.get("channel", "email"),
             account_id=account_id,
+            enrollment_id=enrollment_id,
             prospect_id=conv.get("prospect_id"),
         )
         classification["category"] = body.category
@@ -144,7 +171,7 @@ async def escalate_conversation(
         raise HTTPException(status_code=404, detail="Conversation not found")
 
     from services.reply_handler_service import _escalate_to_human
-    enrollment_id = conv.get("enrollment_id")
+    enrollment_id = await _find_active_enrollment_id(account_id, conv.get("prospect_id"))
     await _escalate_to_human(
         enrollment_id=enrollment_id,
         conversation_id=body.conversation_id,

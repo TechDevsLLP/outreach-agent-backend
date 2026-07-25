@@ -3,61 +3,177 @@ Enrichment pipeline API endpoints.
 Handles triggering enrichment, tracking runs, and managing outreach.
 """
 
-from fastapi import APIRouter, Depends, HTTPException, BackgroundTasks, Query
+from fastapi import APIRouter, Depends, HTTPException, Query
 from typing import Optional
 from datetime import datetime
 from bson import ObjectId
 
 from auth import get_account_context
-from database import prospects_collection, enrichment_runs_collection, industries_collection
+from database import (
+    prospects_collection,
+    enrichment_runs_collection,
+    industries_collection,
+    prospect_state_collection,
+    campaign_enrollments_collection,
+    campaign_prospect_state_collection,
+    campaigns_collection,
+)
 from models.enrichment import EnrichmentTriggerRequest, EnrichByIndustryRequest
-from services.enrichment_pipeline import run_enrichment_pipeline
-from services.openrouter_service import OpenRouterClient
+from services.enrichment_job_service import enqueue_enrichment_run
 
 router = APIRouter(prefix="/api/enrichment", tags=["Enrichment"])
+
+
+def _account_variants(account_id: str) -> list:
+    return [str(account_id), ObjectId(str(account_id))]
+
+
+async def _require_campaign(account_id: str, campaign_id: str | None) -> None:
+    if not campaign_id:
+        return
+    if not ObjectId.is_valid(campaign_id):
+        raise HTTPException(status_code=400, detail="Invalid campaign ID")
+    campaign = await campaigns_collection.find_one(
+        {"_id": ObjectId(campaign_id), "account_id": {"$in": _account_variants(account_id)}},
+        {"_id": 1},
+    )
+    if campaign is None:
+        raise HTTPException(status_code=404, detail="Campaign not found")
+
+
+async def _authorized_prospect_ids(
+    *, account_id: str, prospect_ids: list[str], campaign_id: str | None = None
+) -> list[str]:
+    """Return only IDs owned through the tenant overlay/campaign boundary."""
+    normalized = []
+    for value in prospect_ids:
+        if not ObjectId.is_valid(value):
+            raise HTTPException(status_code=400, detail=f"Invalid prospect ID: {value}")
+        normalized.append(str(ObjectId(value)))
+    if not normalized:
+        return []
+
+    await _require_campaign(account_id, campaign_id)
+    state_query: dict = {
+        "account_id": {"$in": _account_variants(account_id)},
+        "prospect_id": {"$in": normalized + [ObjectId(value) for value in normalized]},
+    }
+    if campaign_id:
+        state_query["campaign_id"] = str(campaign_id)
+        state_cursor = campaign_prospect_state_collection.find(state_query, {"prospect_id": 1})
+    else:
+        state_cursor = prospect_state_collection.find(state_query, {"prospect_id": 1})
+    authorized = {str(doc["prospect_id"]) async for doc in state_cursor}
+
+    enrollment_query: dict = {
+        "account_id": {"$in": _account_variants(account_id)},
+        "prospect_id": {"$in": normalized + [ObjectId(value) for value in normalized]},
+    }
+    if campaign_id:
+        enrollment_query["campaign_id"] = {"$in": [str(campaign_id), ObjectId(campaign_id)]}
+    enrollment_cursor = campaign_enrollments_collection.find(enrollment_query, {"prospect_id": 1})
+    async for doc in enrollment_cursor:
+        authorized.add(str(doc["prospect_id"]))
+
+    existing_cursor = prospects_collection.find(
+        {"_id": {"$in": [ObjectId(value) for value in normalized]}}, {"_id": 1}
+    )
+    existing = {str(doc["_id"]) async for doc in existing_cursor}
+    missing = [value for value in normalized if value not in authorized or value not in existing]
+    if missing:
+        # Do not reveal whether a shared prospect exists outside this tenant.
+        raise HTTPException(status_code=404, detail="One or more prospects were not found")
+    return normalized
+
+
+async def _tenant_prospect_ids(
+    *, account_id: str, campaign_id: str | None, max_prospects: int,
+    statuses: list[str] | None = None, min_score: float | None = None,
+    tenant_status: str | None = None,
+) -> list[str]:
+    await _require_campaign(account_id, campaign_id)
+    if campaign_id:
+        query: dict = {
+            "account_id": str(account_id),
+            "campaign_id": str(campaign_id),
+        }
+        if statuses:
+            query["enrichment.state"] = {"$in": statuses}
+        if min_score is not None:
+            query["score.value"] = {"$gte": min_score}
+        cursor = campaign_prospect_state_collection.find(query, {"prospect_id": 1}).sort("score.value", -1).limit(max_prospects)
+    else:
+        query = {"account_id": {"$in": _account_variants(account_id)}}
+        if tenant_status:
+            query["status"] = tenant_status
+        if statuses:
+            query["enrichment_status"] = {"$in": statuses}
+        if min_score is not None:
+            query["prospect_score"] = {"$gte": min_score}
+        cursor = prospect_state_collection.find(query, {"prospect_id": 1}).sort("prospect_score", -1).limit(max_prospects)
+    return [str(doc["prospect_id"]) async for doc in cursor]
+
+
+async def _create_and_enqueue_run(
+    *, account_id: str, prospect_ids: list[str], options: dict,
+    triggered_by: str | None, campaign_id: str | None, trigger: str = "manual",
+) -> str:
+    now = datetime.utcnow()
+    run_doc = {
+        "account_id": str(account_id), "campaign_id": campaign_id,
+        "status": "queued", "trigger": trigger,
+        "total_prospects": len(prospect_ids), "prospects_processed": 0,
+        "prospects_skipped": 0, "prospects_failed": 0,
+        "profiles_scraped": 0, "companies_scraped": 0,
+        "companies_deduplicated": 0, "ai_assessments_done": 0,
+        "outreach_generated": 0, "prospect_ids": prospect_ids,
+        "started_at": None, "created_at": now, "completed_at": None,
+        "current_step": "queued", "error": None, "triggered_by": triggered_by,
+    }
+    result = await enrichment_runs_collection.insert_one(run_doc)
+    run_id = str(result.inserted_id)
+    await enqueue_enrichment_run(
+        account_id=account_id, run_id=run_id, prospect_ids=prospect_ids,
+        options=options, triggered_by=triggered_by, campaign_id=campaign_id,
+    )
+    return run_id
 
 
 @router.post("/trigger")
 async def trigger_enrichment(
     request: EnrichmentTriggerRequest,
-    background_tasks: BackgroundTasks,
     account_ctx: dict = Depends(get_account_context),
 ):
     """
     Start the enrichment pipeline as a background task.
     Returns run_id immediately; pipeline runs async.
     """
-    account_id = ObjectId(account_ctx["account"]["_id"])
+    account_id = str(account_ctx["account"]["_id"])
     triggered_by: str = account_ctx["user"]["_id"]
 
     # Resolve prospect IDs
     prospect_ids = []
 
     if request.prospect_ids:
-        # Validate provided prospect IDs exist
-        for lid in request.prospect_ids:
-            try:
-                ObjectId(lid)
-            except Exception:
-                raise HTTPException(status_code=400, detail=f"Invalid prospect ID: {lid}")
-        prospect_ids = request.prospect_ids
+        prospect_ids = await _authorized_prospect_ids(
+            account_id=account_id,
+            prospect_ids=request.prospect_ids,
+            campaign_id=request.campaign_id,
+        )
 
     elif request.enrich_all_unenriched:
-        # Find unenriched leads
-        query: dict = {"account_id": account_id}
-        if request.force_re_enrich:
-            pass  # Get all leads
-        else:
-            query["enrichment_status"] = {"$in": ["not_started", None]}
-
-        if request.filter_min_score is not None:
-            query["prospect_score"] = {"$gte": request.filter_min_score}
-        if request.filter_status:
-            query["status"] = request.filter_status
-
-        cursor = prospects_collection.find(query, {"_id": 1}).limit(request.max_prospects)
-        docs = await cursor.to_list(request.max_prospects)
-        prospect_ids = [str(doc["_id"]) for doc in docs]
+        statuses = None if request.force_re_enrich else (
+            ["queued", "retryable_failure", "not_found"]
+            if request.campaign_id else ["not_started", "failed", None]
+        )
+        prospect_ids = await _tenant_prospect_ids(
+            account_id=account_id,
+            campaign_id=request.campaign_id,
+            max_prospects=request.max_prospects,
+            statuses=statuses,
+            min_score=request.filter_min_score,
+            tenant_status=request.filter_status,
+        )
 
     if not prospect_ids:
         raise HTTPException(status_code=400, detail="No prospects found to enrich")
@@ -65,29 +181,6 @@ async def trigger_enrichment(
     # Cap at max_prospects
     if len(prospect_ids) > request.max_prospects:
         prospect_ids = prospect_ids[:request.max_prospects]
-
-    # Create enrichment run document
-    run_doc = {
-        "account_id": account_id,
-        "status": "running",
-        "total_prospects": len(prospect_ids),
-        "prospects_processed": 0,
-        "prospects_skipped": 0,
-        "prospects_failed": 0,
-        "profiles_scraped": 0,
-        "companies_scraped": 0,
-        "companies_deduplicated": 0,
-        "ai_assessments_done": 0,
-        "outreach_generated": 0,
-        "prospect_ids": prospect_ids,
-        "started_at": datetime.utcnow(),
-        "completed_at": None,
-        "current_step": "initializing",
-        "error": None,
-        "triggered_by": triggered_by,
-    }
-    result = await enrichment_runs_collection.insert_one(run_doc)
-    run_id = str(result.inserted_id)
 
     # Build options
     options = {
@@ -99,20 +192,21 @@ async def trigger_enrichment(
         "skip_pre_enrichment_triage": True,
     }
 
-    # Launch pipeline as background task
-    background_tasks.add_task(run_enrichment_pipeline, run_id, prospect_ids, options, triggered_by)
+    run_id = await _create_and_enqueue_run(
+        account_id=account_id, prospect_ids=prospect_ids, options=options,
+        triggered_by=triggered_by, campaign_id=request.campaign_id,
+    )
 
     return {
         "enrichment_run_id": run_id,
         "total_prospects": len(prospect_ids),
-        "status": "running",
-        "message": f"Enrichment pipeline started for {len(prospect_ids)} leads",
+        "status": "queued",
+        "message": f"Enrichment queued for {len(prospect_ids)} prospects",
     }
 
 
 @router.post("/assess")
 async def trigger_ai_assessment(
-    background_tasks: BackgroundTasks,
     prospect_ids: Optional[list[str]] = None,
     include_outreach: bool = True,
     max_prospects: int = Query(default=100, ge=1, le=500),
@@ -123,48 +217,21 @@ async def trigger_ai_assessment(
     Skips profile and company scraping phases entirely.
     If no prospect_ids provided, finds all scraped-but-unassessed leads.
     """
-    account_id = ObjectId(account_ctx["account"]["_id"])
+    account_id = str(account_ctx["account"]["_id"])
     if prospect_ids:
-        for lid in prospect_ids:
-            try:
-                ObjectId(lid)
-            except Exception:
-                raise HTTPException(status_code=400, detail=f"Invalid prospect ID: {lid}")
+        prospect_ids = await _authorized_prospect_ids(
+            account_id=account_id, prospect_ids=prospect_ids
+        )
     else:
-        # Find prospects that have been scraped but not yet AI-assessed
-        query = {
-            "account_id": account_id,
-            "enrichment_status": {"$in": ["profile_scraped", "company_scraped"]},
-        }
-        cursor = prospects_collection.find(query, {"_id": 1}).limit(max_prospects)
-        docs = await cursor.to_list(max_prospects)
-        prospect_ids = [str(doc["_id"]) for doc in docs]
+        prospect_ids = await _tenant_prospect_ids(
+            account_id=account_id, campaign_id=None, max_prospects=max_prospects,
+            statuses=["profile_scraped", "company_scraped"],
+        )
 
     if not prospect_ids:
         raise HTTPException(status_code=400, detail="No scraped prospects found to assess")
 
     prospect_ids = prospect_ids[:max_prospects]
-
-    run_doc = {
-        "account_id": account_id,
-        "status": "running",
-        "total_prospects": len(prospect_ids),
-        "prospects_processed": 0,
-        "prospects_skipped": 0,
-        "prospects_failed": 0,
-        "profiles_scraped": 0,
-        "companies_scraped": 0,
-        "companies_deduplicated": 0,
-        "ai_assessments_done": 0,
-        "outreach_generated": 0,
-        "prospect_ids": prospect_ids,
-        "started_at": datetime.utcnow(),
-        "completed_at": None,
-        "current_step": "initializing",
-        "error": None,
-    }
-    result = await enrichment_runs_collection.insert_one(run_doc)
-    run_id = str(result.inserted_id)
 
     options = {
         "skip_profile_scrape": True,
@@ -174,13 +241,17 @@ async def trigger_ai_assessment(
         "skip_pre_enrichment_triage": True,
     }
 
-    background_tasks.add_task(run_enrichment_pipeline, run_id, prospect_ids, options)
+    run_id = await _create_and_enqueue_run(
+        account_id=account_id, prospect_ids=prospect_ids, options=options,
+        triggered_by=str(account_ctx["user"]["_id"]), campaign_id=None,
+        trigger="ai_assessment",
+    )
 
     return {
         "enrichment_run_id": run_id,
         "total_prospects": len(prospect_ids),
-        "status": "running",
-        "message": f"AI assessment started for {len(prospect_ids)} prospects (outreach: {include_outreach})",
+        "status": "queued",
+        "message": f"AI assessment queued for {len(prospect_ids)} prospects (outreach: {include_outreach})",
     }
 
 
@@ -192,8 +263,8 @@ async def list_enrichment_runs(
     account_ctx: dict = Depends(get_account_context),
 ):
     """List enrichment runs with pagination."""
-    account_id = ObjectId(account_ctx["account"]["_id"])
-    query: dict = {"account_id": account_id}
+    account_id = str(account_ctx["account"]["_id"])
+    query: dict = {"account_id": {"$in": _account_variants(account_id)}}
     if status:
         query["status"] = status
 
@@ -218,9 +289,9 @@ async def list_enrichment_runs(
 @router.get("/runs/{run_id}")
 async def get_enrichment_run(run_id: str, account_ctx: dict = Depends(get_account_context)):
     """Get enrichment run details and progress."""
-    account_id = ObjectId(account_ctx["account"]["_id"])
+    account_id = str(account_ctx["account"]["_id"])
     try:
-        run = await enrichment_runs_collection.find_one({"_id": ObjectId(run_id), "account_id": account_id})
+        run = await enrichment_runs_collection.find_one({"_id": ObjectId(run_id), "account_id": {"$in": _account_variants(account_id)}})
     except Exception:
         raise HTTPException(status_code=400, detail="Invalid run ID")
 
@@ -234,12 +305,12 @@ async def get_enrichment_run(run_id: str, account_ctx: dict = Depends(get_accoun
 @router.get("/status")
 async def get_enrichment_status(account_ctx: dict = Depends(get_account_context)):
     """Get summary of enrichment status counts across all leads."""
-    account_id = ObjectId(account_ctx["account"]["_id"])
+    account_id = str(account_ctx["account"]["_id"])
     pipeline = [
-        {"$match": {"account_id": account_id}},
+        {"$match": {"account_id": {"$in": _account_variants(account_id)}}},
         {"$group": {"_id": "$enrichment_status", "count": {"$sum": 1}}},
     ]
-    results = await prospects_collection.aggregate(pipeline).to_list(20)
+    results = await prospect_state_collection.aggregate(pipeline).to_list(20)
 
     status_counts = {}
     for r in results:
@@ -257,15 +328,22 @@ async def get_enrichment_status(account_ctx: dict = Depends(get_account_context)
 @router.get("/leads/{prospect_id}")
 async def get_lead_enrichment(prospect_id: str, account_ctx: dict = Depends(get_account_context)):
     """Get enrichment data for a specific prospect."""
-    account_id = ObjectId(account_ctx["account"]["_id"])
+    account_id = str(account_ctx["account"]["_id"])
     try:
-        prospect = await prospects_collection.find_one({"_id": ObjectId(prospect_id), "account_id": account_id})
+        authorized_ids = await _authorized_prospect_ids(
+            account_id=account_id, prospect_ids=[prospect_id]
+        )
+        prospect = await prospects_collection.find_one({"_id": ObjectId(authorized_ids[0])})
     except Exception:
         raise HTTPException(status_code=400, detail="Invalid prospect ID")
 
     if not prospect:
         raise HTTPException(status_code=404, detail="Prospect not found")
 
+    state = await prospect_state_collection.find_one({
+        "account_id": {"$in": _account_variants(account_id)},
+        "prospect_id": {"$in": [prospect_id, ObjectId(prospect_id)]},
+    }) or {}
     prospect["_id"] = str(prospect["_id"])
 
     return {
@@ -273,23 +351,150 @@ async def get_lead_enrichment(prospect_id: str, account_ctx: dict = Depends(get_
         "full_name": prospect.get("full_name"),
         "email": prospect.get("email"),
         "company_name": prospect.get("company_name"),
-        "enrichment_status": prospect.get("enrichment_status", "not_started"),
-        "enrichment_error": prospect.get("enrichment_error"),
-        "enrichment_started_at": prospect.get("enrichment_started_at"),
-        "enrichment_completed_at": prospect.get("enrichment_completed_at"),
+        "enrichment_status": state.get("enrichment_status", "not_started"),
+        "enrichment_error": state.get("enrichment_error"),
+        "enrichment_started_at": state.get("enrichment_started_at"),
+        "enrichment_completed_at": state.get("enrichment_completed_at"),
         "linkedin_profile_data": prospect.get("linkedin_profile_data"),
         "company_linkedin_data": prospect.get("company_linkedin_data"),
-        "ai_assessment": prospect.get("ai_assessment"),
-        "ai_prospect_score": prospect.get("ai_prospect_score"),
-        "ai_score_breakdown": prospect.get("ai_score_breakdown"),
-        "outreach_messages": prospect.get("outreach_messages"),
+        "ai_assessment": state.get("ai_assessment"),
+        "ai_prospect_score": state.get("ai_score", state.get("prospect_score")),
+        "ai_score_breakdown": state.get("ai_score_breakdown"),
+        "outreach_messages": state.get("outreach_messages"),
+    }
+
+
+# ---------------------------------------------------------------------------
+# On-demand phone unlock (GrowthToolkit LinkedIn enrichment, 1 credit/call).
+# USER-TRIGGERED ONLY: this endpoint must NEVER be called from enrollment or
+# pipeline code — each call can spend a paid credit.
+# ---------------------------------------------------------------------------
+
+def _first_phone(phones: list) -> Optional[str]:
+    """Extract a displayable number from a phone list entry (str or dict)."""
+    for item in phones:
+        if isinstance(item, str) and item.strip():
+            return item.strip()
+        if isinstance(item, dict):
+            for key in ("number", "phone", "phone_number", "value"):
+                val = item.get(key)
+                if isinstance(val, str) and val.strip():
+                    return val.strip()
+    return None
+
+
+@router.post("/prospects/{prospect_id}/unlock-phone")
+async def unlock_prospect_phone(prospect_id: str, account_ctx: dict = Depends(get_account_context)):
+    """Unlock a prospect's phone number via GrowthToolkit LinkedIn enrichment.
+
+    Returns cached phone data without spending a credit if the prospect
+    already has a phone number.
+    """
+    # GrowthToolkit is restricted to email finding only ($0.0075/lookup).
+    # Phone unlock spends $0.50/credit on the same wallet, so it is disabled.
+    raise HTTPException(
+        status_code=403,
+        detail="Phone unlock is disabled — GrowthToolkit is restricted to email finding only",
+    )
+
+    from services.growthtoolkit_service import (
+        enrich_linkedin,
+        CreditsExhausted,
+        InvalidInput,
+        GrowthToolkitError,
+    )
+
+    account_oid = ObjectId(account_ctx["account"]["_id"])
+    account_id_str = str(account_oid)
+
+    try:
+        pid = ObjectId(prospect_id)
+    except Exception:
+        raise HTTPException(status_code=400, detail="Invalid prospect ID")
+
+    prospect = await prospects_collection.find_one({"_id": pid})
+    if not prospect:
+        raise HTTPException(status_code=404, detail="Prospect not found")
+
+    # Authorization: same pattern as routes/prospects.py — this account must
+    # have a prospect_state or an enrollment for this prospect (fallback:
+    # old schema with account_id directly on the prospect doc).
+    authorized = await prospect_state_collection.find_one(
+        {"account_id": {"$in": [account_id_str, account_oid]}, "prospect_id": prospect_id},
+        {"_id": 1},
+    )
+    if not authorized:
+        enr = await campaign_enrollments_collection.find_one(
+            {"prospect_id": pid, "account_id": {"$in": [account_oid, account_id_str]}},
+            {"_id": 1},
+        )
+        if not enr and prospect.get("account_id") not in (account_oid, account_id_str):
+            raise HTTPException(status_code=404, detail="Prospect not found")
+
+    linkedin_url = prospect.get("linkedin") or prospect.get("linkedin_url")
+    if not linkedin_url:
+        raise HTTPException(
+            status_code=400,
+            detail="Prospect has no LinkedIn URL — phone unlock requires a LinkedIn profile",
+        )
+
+    # Cached: don't spend a credit if we already have a phone number.
+    existing_phones = prospect.get("phone_numbers") or []
+    existing_mobile = prospect.get("mobile_number")
+    if existing_mobile or existing_phones:
+        return {
+            "phone_numbers": existing_phones or ([existing_mobile] if existing_mobile else []),
+            "mobile_number": existing_mobile or _first_phone(existing_phones),
+            "cached": True,
+        }
+
+    try:
+        result = await enrich_linkedin(
+            linkedin_url,
+            unlock_phone=True,
+            account_id=account_id_str,
+            prospect_id=prospect_id,
+        )
+    except CreditsExhausted:
+        raise HTTPException(
+            status_code=402,
+            detail="GrowthToolkit credits exhausted — top up credits at appconnector.pro to unlock phone numbers",
+        )
+    except InvalidInput as e:
+        raise HTTPException(status_code=400, detail=f"GrowthToolkit rejected the LinkedIn URL: {e}")
+    except GrowthToolkitError as e:
+        raise HTTPException(status_code=502, detail=f"GrowthToolkit request failed: {e}")
+
+    if not result:
+        raise HTTPException(status_code=404, detail="Phone not available for this prospect")
+
+    unlock_details = result.get("unlock_details") or {}
+    phones = unlock_details.get("phone_numbers") or result.get("phone_numbers") or []
+    mobile = _first_phone(phones)
+    if not mobile:
+        raise HTTPException(status_code=404, detail="Phone not available for this prospect")
+
+    await prospects_collection.update_one(
+        {"_id": pid},
+        {"$set": {
+            "mobile_number": mobile,
+            "phone_numbers": phones,
+            "phone_source": "growthtoolkit",
+            "phone_unlocked_at": datetime.utcnow(),
+            "phone_unlocked_by_account": account_id_str,
+        }},
+    )
+
+    return {
+        "phone_numbers": phones,
+        "mobile_number": mobile,
+        "cached": False,
     }
 
 
 @router.post("/enrich-by-industry")
 async def enrich_top_prospects_by_industry(
     request: EnrichByIndustryRequest,
-    background_tasks: BackgroundTasks,
     account_ctx: dict = Depends(get_account_context),
 ):
     """
@@ -301,7 +506,7 @@ async def enrich_top_prospects_by_industry(
     - Selects up to max_per_industry unenriched prospects per industry,
       sorted by prospect_score descending.
     """
-    account_id = ObjectId(account_ctx["account"]["_id"])
+    account_id = str(account_ctx["account"]["_id"])
     # Resolve industries
     if request.industry_ids:
         for iid in request.industry_ids:
@@ -310,10 +515,10 @@ async def enrich_top_prospects_by_industry(
             except Exception:
                 raise HTTPException(status_code=400, detail=f"Invalid industry ID: {iid}")
         industries = await industries_collection.find(
-            {"account_id": account_id, "_id": {"$in": [ObjectId(iid) for iid in request.industry_ids]}}
+            {"account_id": {"$in": _account_variants(account_id)}, "_id": {"$in": [ObjectId(iid) for iid in request.industry_ids]}}
         ).to_list(100)
     else:
-        industries = await industries_collection.find({"account_id": account_id, "is_active": True}).to_list(100)
+        industries = await industries_collection.find({"account_id": {"$in": _account_variants(account_id)}, "is_active": True}).to_list(100)
 
     if not industries:
         raise HTTPException(status_code=404, detail="No industries found")
@@ -330,21 +535,19 @@ async def enrich_top_prospects_by_industry(
     for industry in industries:
         ind_id = str(industry["_id"])
 
-        # Find top unenriched prospects for this industry
         query = {
-            "account_id": account_id,
-            "industry_id": ind_id,
-            "enrichment_status": {"$in": ["not_started", None]},
-            "linkedin": {"$ne": None},
+            "account_id": {"$in": _account_variants(account_id)},
+            "source_industry_ids": ind_id,
+            "enrichment_status": {"$in": ["not_started", "failed", None]},
         }
         if request.min_score > 0:
             query["prospect_score"] = {"$gte": request.min_score}
-
-        cursor = prospects_collection.find(
-            query, {"_id": 1}
-        ).sort("prospect_score", -1).limit(request.max_per_industry)
-        docs = await cursor.to_list(request.max_per_industry)
-        prospect_ids = [str(doc["_id"]) for doc in docs]
+        cursor = prospect_state_collection.find(query, {"prospect_id": 1}).sort("prospect_score", -1).limit(request.max_per_industry)
+        prospect_ids = [str(doc["prospect_id"]) async for doc in cursor]
+        prospect_ids = await _authorized_prospect_ids(
+            account_id=account_id, prospect_ids=prospect_ids,
+            campaign_id=request.campaign_id,
+        ) if prospect_ids else []
 
         if not prospect_ids:
             runs.append({
@@ -355,41 +558,21 @@ async def enrich_top_prospects_by_industry(
             })
             continue
 
-        # Create enrichment run for this industry
-        run_doc = {
-            "account_id": account_id,
-            "status": "running",
-            "trigger": "enrich_by_industry",
-            "industry_id": ind_id,
-            "total_prospects": len(prospect_ids),
-            "prospects_processed": 0,
-            "prospects_skipped": 0,
-            "prospects_failed": 0,
-            "profiles_scraped": 0,
-            "companies_scraped": 0,
-            "companies_deduplicated": 0,
-            "ai_assessments_done": 0,
-            "outreach_generated": 0,
-            "prospect_ids": prospect_ids,
-            "started_at": datetime.utcnow(),
-            "completed_at": None,
-            "current_step": "initializing",
-            "error": None,
-        }
-        result = await enrichment_runs_collection.insert_one(run_doc)
-        run_id = str(result.inserted_id)
-
-        background_tasks.add_task(run_enrichment_pipeline, run_id, prospect_ids, options)
+        run_id = await _create_and_enqueue_run(
+            account_id=account_id, prospect_ids=prospect_ids, options=options,
+            triggered_by=str(account_ctx["user"]["_id"]),
+            campaign_id=request.campaign_id, trigger="enrich_by_industry",
+        )
 
         runs.append({
             "industry_id": ind_id,
             "industry_name": industry["name"],
             "enrichment_run_id": run_id,
             "prospects_queued": len(prospect_ids),
-            "status": "running",
+            "status": "queued",
         })
 
-    launched = [r for r in runs if r["status"] == "running"]
+    launched = [r for r in runs if r["status"] == "queued"]
     skipped = [r for r in runs if r["status"] == "skipped"]
 
     return {
@@ -404,12 +587,13 @@ async def enrich_top_prospects_by_industry(
 @router.get("/status/by-industry")
 async def get_enrichment_status_by_industry(account_ctx: dict = Depends(get_account_context)):
     """Get enrichment status breakdown per industry."""
-    account_id = ObjectId(account_ctx["account"]["_id"])
+    account_id = str(account_ctx["account"]["_id"])
     pipeline = [
-        {"$match": {"account_id": account_id}},
+        {"$match": {"account_id": {"$in": _account_variants(account_id)}}},
+        {"$unwind": {"path": "$source_industry_ids", "preserveNullAndEmptyArrays": True}},
         {"$group": {
             "_id": {
-                "industry_id": "$industry_id",
+                "industry_id": "$source_industry_ids",
                 "enrichment_status": "$enrichment_status",
             },
             "count": {"$sum": 1},
@@ -417,7 +601,7 @@ async def get_enrichment_status_by_industry(account_ctx: dict = Depends(get_acco
             "top_score": {"$max": "$prospect_score"},
         }},
     ]
-    results = await prospects_collection.aggregate(pipeline).to_list(500)
+    results = await prospect_state_collection.aggregate(pipeline).to_list(500)
 
     # Group by industry
     industry_map = {}
@@ -464,7 +648,7 @@ async def get_enrichment_status_by_industry(account_ctx: dict = Depends(get_acco
                 pass
         if valid_oids:
             industries = await industries_collection.find(
-                {"account_id": account_id, "_id": {"$in": valid_oids}}, {"name": 1}
+                {"account_id": {"$in": _account_variants(account_id)}, "_id": {"$in": valid_oids}}, {"name": 1}
             ).to_list(len(valid_oids))
             for ind in industries:
                 industry_names[str(ind["_id"])] = ind["name"]
@@ -496,19 +680,19 @@ async def get_enrichment_status_for_industry(
     industry_id: str, account_ctx: dict = Depends(get_account_context)
 ):
     """Get enrichment status for a specific industry with top prospects."""
-    account_id = ObjectId(account_ctx["account"]["_id"])
+    account_id = str(account_ctx["account"]["_id"])
     try:
         ObjectId(industry_id)
     except Exception:
         raise HTTPException(status_code=400, detail="Invalid industry ID")
 
     # Get industry name
-    industry = await industries_collection.find_one({"_id": ObjectId(industry_id), "account_id": account_id})
+    industry = await industries_collection.find_one({"_id": ObjectId(industry_id), "account_id": {"$in": _account_variants(account_id)}})
     industry_name = industry["name"] if industry else "Unknown"
 
     # Aggregation for this industry
     pipeline = [
-        {"$match": {"account_id": account_id, "industry_id": industry_id}},
+        {"$match": {"account_id": {"$in": _account_variants(account_id)}, "source_industry_ids": industry_id}},
         {"$group": {
             "_id": "$enrichment_status",
             "count": {"$sum": 1},
@@ -516,7 +700,7 @@ async def get_enrichment_status_for_industry(
             "top_score": {"$max": "$prospect_score"},
         }},
     ]
-    results = await prospects_collection.aggregate(pipeline).to_list(20)
+    results = await prospect_state_collection.aggregate(pipeline).to_list(20)
 
     status_counts = {}
     total = 0
@@ -531,13 +715,24 @@ async def get_enrichment_status_for_industry(
 
     enriched = status_counts.get("completed", 0)
 
-    # Top 10 enriched prospects
-    top_prospects_cursor = prospects_collection.find(
-        {"account_id": account_id, "industry_id": industry_id, "enrichment_status": "completed"},
-        {"full_name": 1, "email": 1, "company_name": 1, "prospect_score": 1, "ai_prospect_score": 1},
-    ).sort("prospect_score", -1).limit(10)
-    top_prospects = await top_prospects_cursor.to_list(10)
+    top_states = await prospect_state_collection.find(
+        {
+            "account_id": {"$in": _account_variants(account_id)},
+            "source_industry_ids": industry_id,
+            "enrichment_status": "completed",
+        },
+        {"prospect_id": 1, "prospect_score": 1, "ai_score": 1},
+    ).sort("prospect_score", -1).limit(10).to_list(10)
+    state_by_id = {str(state["prospect_id"]): state for state in top_states}
+    valid_top_ids = [ObjectId(value) for value in state_by_id if ObjectId.is_valid(value)]
+    top_prospects = await prospects_collection.find(
+        {"_id": {"$in": valid_top_ids}},
+        {"full_name": 1, "email": 1, "company_name": 1},
+    ).to_list(10)
     for p in top_prospects:
+        state = state_by_id.get(str(p["_id"]), {})
+        p["prospect_score"] = state.get("prospect_score")
+        p["ai_prospect_score"] = state.get("ai_score")
         p["_id"] = str(p["_id"])
 
     return {

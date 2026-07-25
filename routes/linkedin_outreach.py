@@ -9,6 +9,7 @@ from fastapi import APIRouter, HTTPException, Depends
 from pydantic import BaseModel
 from bson import ObjectId
 
+import database
 from database import prospects_collection
 from auth import get_account_context
 from services.unipile_service import UnipileClient, UnipileAPIError
@@ -53,16 +54,44 @@ class DirectInMailPayload(BaseModel):
 
 # ── Helpers ──
 
-async def _get_prospect(prospect_id: str) -> dict:
+async def _tenant_unipile_client(account_ctx: dict) -> UnipileClient:
+    """Return a client bound to an authenticated tenant-owned LinkedIn account."""
+    account_id = str(account_ctx["account"]["_id"])
+    doc = await database.linkedin_accounts_collection.find_one(
+        {
+            "account_id": account_id,
+            "unipile_account_id": {"$exists": True, "$nin": [None, ""]},
+            "unipile_status": {"$nin": ["DELETED", "STOPPED"]},
+        },
+        sort=[("is_default", -1), ("created_at", -1)],
+    )
+    if not doc:
+        raise HTTPException(
+            status_code=404,
+            detail="No LinkedIn account is connected for this workspace",
+        )
+    return UnipileClient(account_id=str(doc["unipile_account_id"]))
+
+
+async def _get_prospect(prospect_id: str, account_id: str) -> dict:
     """Fetch and validate a prospect by ID."""
     try:
         oid = ObjectId(prospect_id)
     except Exception:
         raise HTTPException(status_code=400, detail="Invalid prospect ID")
 
-    prospect = await prospects_collection.find_one({"_id": oid})
+    from services.prospect_activity_state_service import require_prospect_access, get_prospect_activity
+    try:
+        await require_prospect_access(account_id=account_id, prospect_id=prospect_id)
+    except PermissionError:
+        raise HTTPException(status_code=404, detail="Prospect not found")
+    prospect = await prospects_collection.find_one(
+        {"_id": oid},
+        {"full_name": 1, "first_name": 1, "company_name": 1, "linkedin": 1},
+    )
     if not prospect:
         raise HTTPException(status_code=404, detail="Prospect not found")
+    prospect.update(await get_prospect_activity(account_id=account_id, prospect_id=prospect_id))
     return prospect
 
 
@@ -84,7 +113,10 @@ def _get_generated_connection_message(prospect: dict) -> Optional[str]:
     return conn.get("message") or conn.get("body") or conn.get("text")
 
 
-async def _record_outreach_event(prospect_id: str, event_type: str, channel: str, detail: dict):
+async def _record_outreach_event(
+    account_id: str, prospect_id: str, event_type: str, channel: str,
+    detail: dict, *, fields: dict | None = None,
+):
     """Record an outreach event in the prospect's history."""
     history_entry = {
         "event": event_type,
@@ -93,12 +125,10 @@ async def _record_outreach_event(prospect_id: str, event_type: str, channel: str
         **detail,
     }
 
-    await prospects_collection.update_one(
-        {"_id": ObjectId(prospect_id)},
-        {
-            "$push": {"outreach_history": history_entry},
-            "$set": {"last_updated_at": datetime.utcnow()},
-        },
+    from services.prospect_activity_state_service import record_prospect_activity
+    await record_prospect_activity(
+        account_id=account_id, prospect_id=prospect_id,
+        fields=fields, event=history_entry,
     )
 
 
@@ -110,14 +140,8 @@ async def get_linkedin_account(
 ):
     """Get the connected LinkedIn account info."""
     try:
-        client = UnipileClient()
-        accounts = await client.get_accounts()
-        linkedin_account = next(
-            (a for a in accounts if (a.get("type") or a.get("provider") or "").upper() == "LINKEDIN"),
-            None,
-        )
-        if not linkedin_account:
-            raise HTTPException(status_code=404, detail="No LinkedIn account connected")
+        client = await _tenant_unipile_client(account_ctx)
+        linkedin_account = await client.get_account()
         return {"status": "success", "account": linkedin_account}
     except UnipileAPIError as e:
         raise HTTPException(status_code=e.status_code, detail=e.detail)
@@ -130,7 +154,7 @@ async def list_chats(
 ):
     """List LinkedIn chats."""
     try:
-        client = UnipileClient()
+        client = await _tenant_unipile_client(account_ctx)
         data = await client.list_chats(limit=limit)
         chats = data.get("items", [])
         return {"status": "success", "count": len(chats), "chats": chats}
@@ -146,7 +170,7 @@ async def get_chat_messages(
 ):
     """Get messages for a specific LinkedIn chat."""
     try:
-        client = UnipileClient()
+        client = await _tenant_unipile_client(account_ctx)
         data = await client.get_chat_messages(chat_id, limit=limit)
         messages = data.get("items", [])
         return {"status": "success", "count": len(messages), "messages": messages}
@@ -167,7 +191,8 @@ async def send_connection_request(
     Uses the AI-generated connection request message by default,
     or a custom message if provided.
     """
-    prospect = await _get_prospect(payload.prospect_id)
+    account_id = str(account_ctx["account"]["_id"])
+    prospect = await _get_prospect(payload.prospect_id, account_id)
     linkedin_url = _get_linkedin_url(prospect)
 
     message = payload.message
@@ -175,31 +200,24 @@ async def send_connection_request(
         message = _get_generated_connection_message(prospect)
 
     try:
-        client = UnipileClient()
+        client = await _tenant_unipile_client(account_ctx)
         result = await client.send_connection_request(linkedin_url, message)
     except UnipileAPIError as e:
         raise HTTPException(status_code=e.status_code, detail=e.detail)
 
     await _record_outreach_event(
+        account_id,
         payload.prospect_id,
         "connection_request_sent",
         "linkedin",
         {"profile_url": linkedin_url, "message_preview": (message or "")[:100]},
-    )
-
-    await prospects_collection.update_one(
-        {"_id": ObjectId(payload.prospect_id)},
-        {"$set": {
-            "status": "contacted",
-            "connection_request_sent_at": datetime.utcnow(),
-        }},
+        fields={"status": "contacted", "connection_request_sent_at": datetime.utcnow()},
     )
 
     # Record in conversations
     try:
         from services.conversation_service import record_outbound_linkedin_message
         prospect_name = prospect.get("full_name") or prospect.get("first_name", "")
-        account_id = account_ctx["account"]["_id"]
         await record_outbound_linkedin_message(
             prospect_id=payload.prospect_id,
             prospect_name=prospect_name,
@@ -207,6 +225,7 @@ async def send_connection_request(
             message_text=message or "[Connection request]",
             outreach_type="connection_request",
             account_id=account_id,
+            provider_account_id=client.bound_account_id,
         )
     except Exception as e:
         logger.warning(f"Failed to record connection request in conversations: {e}")
@@ -228,7 +247,8 @@ async def send_linkedin_message(
     account_ctx: dict = Depends(get_account_context),
 ):
     """Send a LinkedIn DM to an existing connection."""
-    prospect = await _get_prospect(payload.prospect_id)
+    account_id = str(account_ctx["account"]["_id"])
+    prospect = await _get_prospect(payload.prospect_id, account_id)
 
     text = payload.text
     if not text and payload.use_generated:
@@ -240,7 +260,7 @@ async def send_linkedin_message(
         raise HTTPException(status_code=400, detail="No message text provided or generated")
 
     chat_id = payload.chat_id
-    client = UnipileClient()
+    client = await _tenant_unipile_client(account_ctx)
 
     try:
         if chat_id:
@@ -252,23 +272,19 @@ async def send_linkedin_message(
     except UnipileAPIError as e:
         raise HTTPException(status_code=e.status_code, detail=e.detail)
 
-    await prospects_collection.update_one(
-        {"_id": ObjectId(payload.prospect_id)},
-        {"$set": {"status": "contacted"}},
-    )
-
     await _record_outreach_event(
+        account_id,
         payload.prospect_id,
         "linkedin_message_sent",
         "linkedin",
         {"message_preview": text[:100], "chat_id": chat_id},
+        fields={"status": "contacted"},
     )
 
     # Record in conversations
     try:
         from services.conversation_service import record_outbound_linkedin_message
         prospect_name = prospect.get("full_name") or prospect.get("first_name", "")
-        account_id = account_ctx["account"]["_id"]
         await record_outbound_linkedin_message(
             prospect_id=payload.prospect_id,
             prospect_name=prospect_name,
@@ -278,6 +294,7 @@ async def send_linkedin_message(
             unipile_message_id=result.get("message_id"),
             outreach_type="linkedin_message",
             account_id=account_id,
+            provider_account_id=client.bound_account_id,
         )
     except Exception as e:
         logger.warning(f"Failed to record LinkedIn message in conversations: {e}")
@@ -297,7 +314,7 @@ async def send_linkedin_message_direct(
 ):
     """Send a LinkedIn message directly using profile URL and text."""
     try:
-        client = UnipileClient()
+        client = await _tenant_unipile_client(account_ctx)
         result = await client.start_new_chat(payload.profile_url, payload.text)
     except UnipileAPIError as e:
         raise HTTPException(status_code=e.status_code, detail=e.detail)
@@ -318,7 +335,7 @@ async def get_inmail_balance(
 ):
     """Check remaining InMail credits on the connected LinkedIn account."""
     try:
-        client = UnipileClient()
+        client = await _tenant_unipile_client(account_ctx)
         balance = await client.get_inmail_balance()
     except UnipileAPIError as e:
         raise HTTPException(status_code=e.status_code, detail=e.detail)
@@ -337,7 +354,8 @@ async def send_inmail(
     Requires LinkedIn Premium on the connected account.
     Uses AI-generated cold email subject/body by default.
     """
-    prospect = await _get_prospect(payload.prospect_id)
+    account_id = str(account_ctx["account"]["_id"])
+    prospect = await _get_prospect(payload.prospect_id, account_id)
     linkedin_url = _get_linkedin_url(prospect)
 
     subject = payload.subject
@@ -367,28 +385,24 @@ async def send_inmail(
         )
 
     try:
-        client = UnipileClient()
+        client = await _tenant_unipile_client(account_ctx)
         result = await client.send_inmail(linkedin_url, message, subject)
     except UnipileAPIError as e:
         raise HTTPException(status_code=e.status_code, detail=e.detail)
 
     await _record_outreach_event(
+        account_id,
         payload.prospect_id,
         "inmail_sent",
         "linkedin",
         {"subject": subject, "message_preview": message[:100], "profile_url": linkedin_url},
-    )
-
-    await prospects_collection.update_one(
-        {"_id": ObjectId(payload.prospect_id)},
-        {"$set": {"status": "contacted"}},
+        fields={"status": "contacted"},
     )
 
     # Record in conversations
     try:
         from services.conversation_service import record_outbound_linkedin_message
         prospect_name = prospect.get("full_name") or prospect.get("first_name", "")
-        account_id = account_ctx["account"]["_id"]
         await record_outbound_linkedin_message(
             prospect_id=payload.prospect_id,
             prospect_name=prospect_name,
@@ -396,6 +410,7 @@ async def send_inmail(
             message_text=f"[InMail] {subject}\n\n{message}",
             outreach_type="inmail",
             account_id=account_id,
+            provider_account_id=client.bound_account_id,
         )
     except Exception as e:
         logger.warning(f"Failed to record InMail in conversations: {e}")
@@ -416,7 +431,7 @@ async def send_inmail_direct(
 ):
     """Send an InMail directly using a profile URL, subject, and message."""
     try:
-        client = UnipileClient()
+        client = await _tenant_unipile_client(account_ctx)
         result = await client.send_inmail(payload.profile_url, payload.message, payload.subject)
     except UnipileAPIError as e:
         raise HTTPException(status_code=e.status_code, detail=e.detail)

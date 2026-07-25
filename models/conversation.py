@@ -21,7 +21,8 @@ class Message(BaseModel):
     status: str = "sent"  # sent/delivered/opened/clicked/bounced/failed/received
 
     # Channel-specific IDs
-    sendgrid_message_id: Optional[str] = None
+    provider: Optional[str] = None  # google/zoho/smtp (email) or unipile (linkedin)
+    provider_message_id: Optional[str] = None
     unipile_message_id: Optional[str] = None
 
     # RFC email headers for threading
@@ -49,6 +50,10 @@ class ConversationDocument(BaseModel):
     # Channel-specific identifiers
     unipile_chat_id: Optional[str] = None  # LinkedIn
     email_thread_subject: Optional[str] = None  # Email
+    # Canonical provider identity.  A provider thread identifier is only unique
+    # inside the provider account that owns it, never globally.
+    provider_account_id: Optional[str] = None
+    provider_thread_id: Optional[str] = None
 
     # Messages (embedded array)
     messages: list[dict] = Field(default_factory=list)
@@ -60,8 +65,10 @@ class ConversationDocument(BaseModel):
     last_message_direction: Optional[str] = None
     message_count: int = 0
 
-    # Account ownership
-    account_id: Optional[str] = None
+    # Account ownership is mandatory for every newly-created conversation.
+    # Legacy rows without it are intentionally not adopted implicitly because a
+    # shared prospect is not evidence of tenant ownership.
+    account_id: str
 
     created_at: datetime = Field(default_factory=datetime.utcnow)
     updated_at: datetime = Field(default_factory=datetime.utcnow)

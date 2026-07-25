@@ -1,7 +1,8 @@
 # version2/services/activity_feed_service.py
 from datetime import datetime, timedelta
 from typing import Optional
-from database import prospects_collection, conversations_collection
+from bson import ObjectId
+from database import conversations_collection, prospect_state_collection
 
 ACTIVITY_TYPES = [
     "email_sent", "email_delivered", "email_opened", "email_clicked", "email_bounced",
@@ -14,6 +15,17 @@ ACTIVITY_TYPES = [
 ]
 
 
+def _account_filter(account_id: str) -> dict:
+    if not account_id or not str(account_id).strip():
+        raise ValueError("account_id is required for activity access")
+    values: list[object] = [str(account_id)]
+    try:
+        values.append(ObjectId(str(account_id)))
+    except Exception:
+        pass
+    return {"account_id": {"$in": values}}
+
+
 async def get_activity_feed(
     page: int = 1,
     page_size: int = 50,
@@ -21,13 +33,10 @@ async def get_activity_feed(
     channel: Optional[str] = None,
     since: Optional[datetime] = None,
     prospect_id: Optional[str] = None,
-    account_id: Optional[str] = None,
+    account_id: str = "",
 ) -> dict:
     """
-    Build a unified activity feed from:
-    1. Conversation messages (sent/received across email+linkedin)
-    2. Prospect outreach_history events
-    3. Schedule execution events
+    Build a tenant-owned activity feed from canonical conversation messages.
 
     Returns {items: [...], total: int, page: int, page_size: int}
     """
@@ -37,12 +46,12 @@ async def get_activity_feed(
     pipeline = []
 
     # Stage 1: Match conversations with messages after `since`
-    match_filter = {"last_message_at": {"$gte": since}}
+    match_filter = {
+        **_account_filter(account_id),
+        "last_message_at": {"$gte": since},
+    }
     if channel:
         match_filter["channel"] = channel
-    if account_id:
-        from bson import ObjectId as _ObjectId
-        match_filter["account_id"] = _ObjectId(account_id)
     if prospect_id:
         match_filter["prospect_id"] = prospect_id
     pipeline.append({"$match": match_filter})
@@ -103,68 +112,23 @@ async def get_activity_feed(
 
     items = await conversations_collection.aggregate(pipeline).to_list(page_size)
 
-    # Now also pull prospect-level events (connection_accepted, email_opened, etc.)
-    # from prospect.outreach_history for richer feed
-    prospect_match: dict = {"outreach_history": {"$exists": True, "$ne": []}}
-    if account_id:
-        from bson import ObjectId as _ObjectId
-        prospect_match["account_id"] = _ObjectId(account_id)
-    if prospect_id:
-        from bson import ObjectId as _ObjectId
-        prospect_match["_id"] = _ObjectId(prospect_id)
-    prospect_pipeline = [
-        {"$match": prospect_match},
-        {"$unwind": "$outreach_history"},
-        {"$match": {"outreach_history.timestamp": {"$gte": since}}},
-    ]
-
-    prospect_pipeline.append({
-        "$project": {
-            "_id": 0,
-            "activity_id": {"$toString": "$outreach_history.timestamp"},
-            "timestamp": "$outreach_history.timestamp",
-            "activity_type": "$outreach_history.event",
-            "channel": "$outreach_history.channel",
-            "prospect_id": {"$toString": "$_id"},
-            "prospect_name": "$full_name",
-            "prospect_email": "$email",
-            "prospect_company": "$company_name",
-            "conversation_id": "$outreach_history.conversation_id",
-            "message_preview": {"$ifNull": ["$outreach_history.preview", ""]},
-            "message_subject": {"$ifNull": ["$outreach_history.subject", None]},
-            "message_status": None,
-            "direction": "outbound",
-            "variant_id": None,
-        }
-    })
-    if activity_type:
-        prospect_pipeline.append({"$match": {"activity_type": activity_type}})
-
-    prospect_pipeline.append({"$sort": {"timestamp": -1}})
-    prospect_pipeline.append({"$limit": page_size})
-
-    prospect_items = await prospects_collection.aggregate(prospect_pipeline).to_list(page_size)
-
-    # Merge and sort both streams
-    all_items = items + prospect_items
-    all_items.sort(key=lambda x: x["timestamp"], reverse=True)
-    all_items = all_items[:page_size]
-
     return {
-        "items": all_items,
-        "total": total + len(prospect_items),
+        "items": items,
+        "total": total,
         "page": page,
         "page_size": page_size,
     }
 
 
-async def get_activity_summary() -> dict:
+async def get_activity_summary(account_id: str) -> dict:
     """Quick counts for dashboard widgets."""
     now = datetime.utcnow()
     today_start = now.replace(hour=0, minute=0, second=0, microsecond=0)
 
     # Today's activity counts
+    account_filter = _account_filter(account_id)
     today_sent = await conversations_collection.count_documents({
+        **account_filter,
         "messages": {
             "$elemMatch": {
                 "direction": "outbound",
@@ -174,6 +138,7 @@ async def get_activity_summary() -> dict:
     })
 
     today_replies = await conversations_collection.count_documents({
+        **account_filter,
         "messages": {
             "$elemMatch": {
                 "direction": "inbound",
@@ -182,22 +147,29 @@ async def get_activity_summary() -> dict:
         }
     })
 
-    unread_count = await conversations_collection.count_documents({"is_read": False})
+    unread_count = await conversations_collection.count_documents(
+        {**account_filter, "is_read": False}
+    )
 
     # Pending connections (sent but not accepted)
-    pending_connections = await prospects_collection.count_documents({
-        "outreach_history.event": "linkedin_connection_sent",
-        "connection_accepted_at": None,
-        "status": "contacted",
+    pending_connections = await prospect_state_collection.count_documents({
+        **account_filter,
+        "connection_request_sent_at": {"$ne": None},
+        "$or": [
+            {"connection_accepted_at": {"$exists": False}},
+            {"connection_accepted_at": None},
+        ],
     })
 
     # Connections accepted today
-    accepted_today = await prospects_collection.count_documents({
+    accepted_today = await prospect_state_collection.count_documents({
+        **account_filter,
         "connection_accepted_at": {"$gte": today_start}
     })
 
     # AI drafts pending review (stored at conversation level, not message level)
     pending_drafts = await conversations_collection.count_documents({
+        **account_filter,
         "ai_draft_reply": {"$exists": True, "$ne": None},
         "ai_draft_reply.status": "pending",
     })

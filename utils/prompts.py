@@ -3,13 +3,14 @@ Prompt templates for AI assessment and outreach generation.
 Keeps prompts out of service logic for maintainability.
 """
 
+import re
 import json
 import time
 import logging
 
 logger = logging.getLogger(__name__)
 
-_prompt_cache: dict[str, tuple[str, float]] = {}
+_prompt_cache: dict[tuple[str, str], tuple[str, float]] = {}
 _PROMPT_CACHE_TTL = 60  # seconds
 
 
@@ -139,6 +140,8 @@ def build_assessment_user_prompt(
         parts.append("## Campaign Context")
         if campaign.get("name"):
             parts.append(f"Campaign: {campaign['name']}")
+        if campaign.get("description"):
+            parts.append(f"Campaign Description: {str(campaign['description'])[:300]}")
         if campaign.get("value_proposition"):
             parts.append(f"Value Proposition: {campaign['value_proposition']}")
         if campaign.get("pain_point"):
@@ -242,6 +245,8 @@ def build_batch_assessment_user_prompt(
         parts.append("## Campaign Context")
         if campaign.get("name"):
             parts.append(f"Campaign: {campaign['name']}")
+        if campaign.get("description"):
+            parts.append(f"Campaign Description: {str(campaign['description'])[:300]}")
         if campaign.get("value_proposition"):
             parts.append(f"Value Proposition: {campaign['value_proposition']}")
         if campaign.get("pain_point"):
@@ -299,7 +304,7 @@ OUTREACH_SYSTEM_PROMPT_V2 = """You are an expert B2B outreach copywriter. Your j
 - Be direct and conversational, not formal or salesy
 - Short is better: cold email body ≤150 words, LinkedIn connection request ≤280 chars
 - One clear call to action per message — no multiple asks
-- Sign off with first name only
+- Email sign-off must be EXACTLY "Best," on one line, then the SENDER's first name on the next line. Never sign with the prospect's name. If no sender name is given, end after the CTA with no name at all.
 
 ## Banned openers (NEVER use):
 - "I hope this finds you well"
@@ -475,7 +480,7 @@ Return ONLY a JSON object with this exact schema:
   "cold_email": {
     "subject_a": "Primary subject line (direct benefit)",
     "subject_b": "Alternative subject line (curiosity/question angle)",
-    "body": "Email body — no subject, no greeting line salutation at start, sign off with sender name"
+    "body": "Email body — no subject, no greeting line salutation at start; end with EXACTLY 'Best,' on its own line then the SENDER's first name on the next line (never the prospect's name)"
   },
   "linkedin_connection": {
     "note": "Connection request note — HARD LIMIT 280 chars"
@@ -517,11 +522,11 @@ Return ONLY a JSON object with this exact schema:
 
 3. **Banned phrases**: "innovative solutions", "drive growth", "synergy", "leverage", "circle back", "touch base", "value-add", "game-changer", "cutting-edge", "best-in-class", "world-class"
 
-4. **Length**: cold email body 80-130 words, LinkedIn note ≤280 chars (hard limit), InMail body 100-160 words
+4. **Length**: cold email body 80-130 words, LinkedIn note ≤280 chars (hard limit), InMail body 100-160 words. The LinkedIn connection note MUST be a COMPLETE thought that ends on a full sentence — aim for 200-260 chars so it never gets cut off. A short complete note always beats a longer one that runs past 280 and gets truncated mid-sentence.
 
 5. **One ask**: Exactly one CTA. No "or" options, no multiple links. Match CTA to the campaign's cta_type.
 
-6. **Sign-off**: Use sender's first name only (never last name unless explicitly in sender data). No "Best regards", no "Thanks in advance".
+6. **Sign-off**: Email bodies end with EXACTLY two lines: "Best," then the SENDER's first name (never last name, and NEVER the prospect's name). If no sender name is provided, end after the CTA with no name in the sign-off at all. No "Best regards", no "Thanks in advance". LinkedIn notes/InMails: if signed, sender first name only — never the prospect's.
 
 7. **Subject lines**: ≤55 chars, no clickbait, no ALL CAPS, no emojis."""
 
@@ -566,17 +571,57 @@ def _select_top_signal(prospect: dict) -> tuple[str, str]:
 
 
 def _select_best_case_study(case_studies: list, prospect: dict) -> dict | None:
-    """Pick the case study whose industry best matches the prospect's industry."""
-    if not case_studies:
+    """Pick the case study whose industry best matches the prospect's industry.
+
+    Entries may be dicts ({client, outcome, metric, industry} from the
+    onboarding analyzer) or plain strings (manual Settings edits) — strings are
+    normalized to {"outcome": <text>}.
+    """
+    normalized = []
+    for cs in case_studies or []:
+        if isinstance(cs, dict):
+            normalized.append(cs)
+        elif isinstance(cs, str) and cs.strip():
+            normalized.append({"client": "", "outcome": cs.strip(), "metric": None, "industry": None})
+    if not normalized:
         return None
     prospect_industry = (prospect.get("industry") or "").lower()
     if not prospect_industry:
-        return case_studies[0] if case_studies else None
-    for cs in case_studies:
+        return normalized[0]
+    for cs in normalized:
         cs_industry = (cs.get("industry") or cs.get("client") or "").lower()
-        if prospect_industry in cs_industry or cs_industry in prospect_industry:
+        if cs_industry and (prospect_industry in cs_industry or cs_industry in prospect_industry):
             return cs
-    return case_studies[0]
+    return normalized[0]
+
+
+def _format_funding_line(funding: dict | None) -> str:
+    """Compact one-line summary of the research `funding` block.
+    E.g. 'Raised $30M Series B in 2026-03 — investors: Accel, Index'. Empty
+    string when nothing usable is present."""
+    if not isinstance(funding, dict):
+        return ""
+    round_ = str(funding.get("latest_round") or "").strip()
+    amount = str(funding.get("amount") or "").strip()
+    date = str(funding.get("date") or "").strip()
+    summary = str(funding.get("summary") or "").strip()
+    bits = []
+    if amount and round_:
+        bits.append(f"Raised {amount} {round_}")
+    elif amount:
+        bits.append(f"Raised {amount}")
+    elif round_:
+        bits.append(round_)
+    if bits and date:
+        bits.append(f"in {date}")
+    line = " ".join(bits)
+    investors = funding.get("investors") or []
+    if isinstance(investors, list) and investors:
+        inv = ", ".join(str(i) for i in investors[:3])
+        line = (line + " — investors: " + inv) if line else ("Investors: " + inv)
+    if not line and summary:
+        line = summary[:150]
+    return line
 
 
 def build_campaign_outreach_prompt(
@@ -607,6 +652,15 @@ def build_campaign_outreach_prompt(
     parts.append("## Seller Identity")
     if sender_first:
         parts.append(f"Sender First Name: {sender_first}")
+        parts.append(
+            f'Sign off the email body exactly as: "Best,\\n{sender_first}" '
+            f'(that is: "Best," on one line, then "{sender_first}" on the next line).'
+        )
+    else:
+        parts.append(
+            "Sender name unknown — do not include any name in the sign-off, "
+            "and NEVER sign with the prospect's name."
+        )
     if sender_role:
         parts.append(f"Sender Role: {sender_role}")
     if seller_company:
@@ -638,18 +692,50 @@ def build_campaign_outreach_prompt(
             client = best_cs.get("client") or ""
             outcome = best_cs.get("outcome") or ""
             metric = best_cs.get("metric") or ""
-            parts.append(f"Proof Point: {client} — {outcome}" + (f" ({metric})" if metric else ""))
+            label = f"{client} — {outcome}" if client and outcome else (client or outcome)
+            if label:
+                parts.append(f"Proof Point: {label}" + (f" ({metric})" if metric else ""))
+
+    # Sender voice + banned phrases from onboarding
+    if company_profile:
+        _inject_voice_profile(parts, company_profile.get("sender_voice_profile"))
+        banned = [p for p in (company_profile.get("banned_phrases") or []) if p]
+        if banned:
+            parts.append("Never use these phrases: " + "; ".join(banned[:10]))
 
     parts.append("")
 
     # CTA
     cta_type = campaign.get("cta_type") or "reply"
     cta_url = campaign.get("cta_url") or ""
+    # Free-value CTA (from the per-prospect pitch overlay) is the DEFAULT for
+    # cold email + InMail whenever it exists: offering a named, zero-commitment
+    # asset out-converts generic call/link asks. Connection note stays soft.
+    _fv_cta = (intelligence or {}).get("free_value_cta") or {}
+    _fv_asset = (_fv_cta.get("asset_name") or "").strip() if isinstance(_fv_cta, dict) else ""
     parts.append("## Call to Action")
-    if cta_type == "book_call":
+    if _fv_asset:
+        _fv_line = (_fv_cta.get("cta_line") or "Worth sending over?").strip()
+        parts.append(f"CTA MODE: FREE VALUE (use for cold email and InMail)")
+        parts.append(f'Offer this specific free asset by name: "{_fv_asset}"')
+        parts.append(
+            f'Close the email body and InMail body with a single-question yes ask: "{_fv_line}" '
+            "— no meeting ask, no links, nothing required from them to receive it."
+        )
+        parts.append(
+            "The connection note stays soft: no asset pitch, no CTA beyond connecting."
+        )
+        parts.append("Exactly ONE CTA per message — the free-value ask replaces any other ask.")
+    elif cta_type == "book_call":
         parts.append(f"CTA: Ask them to book a call." + (f" Link: {cta_url}" if cta_url else ""))
     elif cta_type == "visit_link":
         parts.append(f"CTA: Direct them to visit: {cta_url}" if cta_url else "CTA: Soft ask to visit a resource.")
+    elif cta_type == "free_value":
+        parts.append(
+            "CTA: Offer ONE specific, named, zero-commitment free asset (teardown/audit/"
+            "playbook/deck/benchmark) relevant to this prospect, and close with a "
+            'single-question yes ask like "Worth sending over?". No meeting ask.'
+        )
     else:
         parts.append("CTA: Ask a single question that invites a reply. No links.")
     parts.append("")
@@ -736,9 +822,43 @@ def build_campaign_outreach_prompt(
         parts.append("")
         parts.append("## Competitive Context")
         for c in competitors[:3]:
-            name = c.get("name") or str(c)
-            diff = c.get("differentiation") or c.get("description") or ""
+            name = c.get("name") if isinstance(c, dict) else str(c)
+            diff = (c.get("differentiation") or c.get("description") or "") if isinstance(c, dict) else ""
             parts.append(f"  - {name}" + (f": {diff[:100]}" if diff else ""))
+
+    # Deep company research (companies_collection.research — best performer,
+    # buying signals, funding, hiring, tech stack, launches)
+    _research = prospect.get("company_research") or {}
+    _best = _research.get("best_performer")
+    _signals = _research.get("buying_signals") or []
+    _funding_line = _format_funding_line(_research.get("funding"))
+    _hiring = _research.get("hiring_signals") or []
+    _research_tech = _research.get("tech_stack") or []
+    _launches = _research.get("recent_launches") or []
+    if (
+        (isinstance(_best, dict) and _best.get("name"))
+        or _signals or _funding_line or _hiring or _research_tech or _launches
+    ):
+        parts.append("")
+        parts.append("## Company Research (reference these facts concretely in the body)")
+        if isinstance(_best, dict) and _best.get("name"):
+            _why = (_best.get("why_winning") or "")[:200]
+            parts.append(f"Best-Performing Competitor: {_best['name']}" + (f" — why winning: {_why}" if _why else ""))
+        for _sig in _signals[:3]:
+            parts.append(f"Buying Signal: {str(_sig)[:150]}")
+        if _funding_line:
+            parts.append(f"Funding: {_funding_line}")
+        if _hiring:
+            parts.append("Hiring Now (buying intent): " + "; ".join(str(h)[:100] for h in _hiring[:3]))
+        if _research_tech:
+            parts.append(f"Tech Stack (researched): {_stringify_list(_research_tech, 6)}")
+        if _launches:
+            parts.append("Recent Launches: " + "; ".join(str(l)[:100] for l in _launches[:2]))
+        _co_posts = _research.get("company_posts") or []
+        if _co_posts:
+            _cp_text = (_co_posts[0].get("text") or "")[:150] if isinstance(_co_posts[0], dict) else ""
+            if _cp_text:
+                parts.append(f"Latest Company-Page Post: {_cp_text}")
 
     # Company news
     news = prospect.get("company_news") or []
@@ -882,17 +1002,20 @@ def build_campaign_batch_outreach_prompt(
     campaign: dict,
     prospects_with_ids: list[tuple[str, dict]],
     channel: str,
+    company_profile: dict | None = None,
 ) -> str:
     """
     Build a batch prompt that asks the model to generate one message per prospect.
     prospects_with_ids: [(enrollment_id_str, prospect_dict), ...]
     channel: "email" | "linkedin_connection" | "linkedin_inmail"
+    company_profile: onboarding company profile (services, differentiators,
+    case studies, sender voice) — included once for the whole batch.
     """
     tone = campaign.get("message_tone") or "professional"
     tone_desc = TONE_DESCRIPTIONS.get(tone, TONE_DESCRIPTIONS["professional"])
     value_prop = campaign.get("value_proposition") or ""
     pain_point = campaign.get("pain_point") or ""
-    sender_name = campaign.get("sender_name") or ""
+    sender_name = campaign.get("sender_name") or (company_profile or {}).get("sender_name") or ""
     sender_first = sender_name.split()[0] if sender_name else ""
     cta_type = campaign.get("cta_type") or "reply"
     cta_url = campaign.get("cta_url") or ""
@@ -909,13 +1032,62 @@ def build_campaign_batch_outreach_prompt(
     if pain_point:
         parts.append(f"Pain Point: {pain_point}")
     if sender_first:
-        parts.append(f"Sign off as: {sender_first}")
+        parts.append(
+            f'Sign off each email body exactly as: "Best,\\n{sender_first}" '
+            f'(that is: "Best," on one line, then "{sender_first}" on the next line). '
+            "Never sign with a prospect's name."
+        )
+    else:
+        parts.append(
+            "Sender name unknown — do not include any name in the sign-off, "
+            "and NEVER sign with a prospect's name."
+        )
+    if company_profile:
+        sender_role = company_profile.get("sender_role") or ""
+        seller_company = company_profile.get("company_name") or ""
+        if sender_role or seller_company:
+            parts.append(
+                "Sender: " + " at ".join([v for v in (sender_role, seller_company) if v])
+            )
+        services = company_profile.get("services") or []
+        if services:
+            parts.append(f"Services: {_stringify_list(services[:4])}")
+        diffs = company_profile.get("differentiators") or []
+        if diffs:
+            parts.append(f"Differentiators: {_stringify_list(diffs[:3])}")
+        target_market = company_profile.get("target_market") or ""
+        if target_market:
+            parts.append(f"Target Market: {target_market}")
+        best_cs = _select_best_case_study(company_profile.get("case_studies") or [], {})
+        if best_cs:
+            client = best_cs.get("client") or ""
+            outcome = best_cs.get("outcome") or ""
+            metric = best_cs.get("metric") or ""
+            label = f"{client} — {outcome}" if client and outcome else (client or outcome)
+            if label:
+                parts.append(f"Proof Point (use where relevant): {label}" + (f" ({metric})" if metric else ""))
+        _inject_voice_profile(parts, company_profile.get("sender_voice_profile"))
+        banned = [p for p in (company_profile.get("banned_phrases") or []) if p]
+        if banned:
+            parts.append("Never use these phrases: " + "; ".join(banned[:10]))
     if cta_type == "book_call":
         parts.append(f"CTA: Ask to book a call." + (f" Link: {cta_url}" if cta_url else ""))
     elif cta_type == "visit_link":
         parts.append(f"CTA: Visit link: {cta_url}" if cta_url else "CTA: Visit a resource.")
+    elif cta_type == "free_value":
+        parts.append(
+            "CTA: Offer ONE specific, named, zero-commitment free asset and close with a "
+            'single-question yes ask like "Worth sending over?". No meeting ask, no links.'
+        )
     else:
         parts.append("CTA: Ask a single reply-inviting question.")
+    if channel in ("email", "linkedin_inmail"):
+        parts.append(
+            "FREE-VALUE OVERRIDE: when a prospect below has a [FREE-VALUE CTA] line, it "
+            "REPLACES the default CTA for that prospect — offer the named asset and close "
+            'with its single-question yes ask (e.g. "Worth sending over?"). Exactly one CTA '
+            "per message. Never add a meeting ask on top."
+        )
     parts.append("")
     parts.append("## Prospects")
     parts.append("")
@@ -938,7 +1110,9 @@ def build_campaign_batch_outreach_prompt(
             parts.append(f"Signal ({signal_kind}): {signal_text[:150]}")
 
         # Enrichment signals (present only for enriched prospects)
-        ai_fit_score = prospect.get("ai_fit_score") or prospect.get("ai_prospect_score")
+        # Campaign fit is passed in via injected intelligence, not the shared
+        # tenant-neutral pool. Do not read the legacy prospect.ai_prospect_score copy.
+        ai_fit_score = prospect.get("ai_fit_score")
         priority_tier = prospect.get("priority_tier", "")
         ai_assessment = prospect.get("ai_assessment") or {}
         competitor_summary = ai_assessment.get("competitor_summary") or ai_assessment.get("competitors_used", "")
@@ -966,6 +1140,37 @@ def build_campaign_batch_outreach_prompt(
         if recent_news_str:
             parts.append(f"  Recent news: {recent_news_str}")
 
+        # Deep company research facts (best performer + buying signals) — reference concretely
+        _research = prospect.get("company_research") or {}
+        _best = _research.get("best_performer")
+        if isinstance(_best, dict) and _best.get("name"):
+            _why = (_best.get("why_winning") or "")[:150]
+            parts.append(
+                f"  Best-performing competitor: {_best['name']}"
+                + (f" — why winning: {_why}" if _why else "")
+            )
+        _signals = _research.get("buying_signals") or []
+        if _signals:
+            parts.append(
+                "  Buying signals: " + "; ".join(str(s)[:100] for s in _signals[:2])
+            )
+        _funding_line = _format_funding_line(_research.get("funding"))
+        if _funding_line:
+            parts.append(f"  Funding: {_funding_line[:150]}")
+        _hiring = _research.get("hiring_signals") or []
+        if _hiring:
+            parts.append(
+                "  Hiring now (buying intent): " + "; ".join(str(h)[:80] for h in _hiring[:2])
+            )
+        _research_tech = _research.get("tech_stack") or []
+        if _research_tech:
+            parts.append(f"  Tech stack: {_stringify_list(_research_tech, 5)}")
+        _launches = _research.get("recent_launches") or []
+        if _launches:
+            parts.append(
+                "  Recent launches: " + "; ".join(str(l)[:80] for l in _launches[:2])
+            )
+
         # Prospect intelligence (deep enrichment) — highest-priority personalization
         intel = prospect.get("prospect_intelligence") or {}
         if intel:
@@ -985,6 +1190,17 @@ def build_campaign_batch_outreach_prompt(
                 parts.append(f"  [INTEL] Writing voice (mirror in connection note): {intel['writing_voice']}")
             if intel.get("dont_pitch") and isinstance(intel["dont_pitch"], list) and intel["dont_pitch"]:
                 parts.append(f"  [INTEL] AVOID: {', '.join(str(a) for a in intel['dont_pitch'][:2])}")
+            _fv = intel.get("free_value_cta") or {}
+            if (
+                channel in ("email", "linkedin_inmail")
+                and isinstance(_fv, dict)
+                and (_fv.get("asset_name") or "").strip()
+            ):
+                _fv_line = (_fv.get("cta_line") or "Worth sending over?").strip()
+                parts.append(
+                    f'  [FREE-VALUE CTA] Offer by name: "{_fv["asset_name"].strip()}" '
+                    f'— close with: "{_fv_line}" (this is the ONLY CTA for this prospect)'
+                )
 
         parts.append("")
 
@@ -1026,12 +1242,40 @@ def build_campaign_followup_prompt(
     sender_role = (company_profile or {}).get("sender_role") or ""
     if sender_first:
         parts.append(f"Sender: {sender_first}" + (f", {sender_role}" if sender_role else ""))
+        parts.append(
+            f'For email: sign off exactly as "Best,\\n{sender_first}" '
+            f'("Best," on one line, then "{sender_first}" on the next).'
+        )
+    else:
+        parts.append(
+            "Sender name unknown — do not include any name in the sign-off, "
+            "and NEVER sign with the prospect's name."
+        )
 
     # Value context
     if campaign.get("value_proposition"):
         parts.append(f"Value Proposition: {campaign['value_proposition']}")
     if campaign.get("pain_point"):
         parts.append(f"Pain Point: {campaign['pain_point']}")
+
+    # Onboarding company context: differentiators, real case-study data,
+    # sender voice, banned phrases (previously follow-ups had none of these)
+    if company_profile:
+        diffs = company_profile.get("differentiators") or []
+        if diffs:
+            parts.append(f"Differentiators: {_stringify_list(diffs[:3])}")
+        best_cs = _select_best_case_study(company_profile.get("case_studies") or [], prospect)
+        if best_cs:
+            client = best_cs.get("client") or ""
+            outcome = best_cs.get("outcome") or ""
+            metric = best_cs.get("metric") or ""
+            label = f"{client} — {outcome}" if client and outcome else (client or outcome)
+            if label:
+                parts.append(f"Case Study Available: {label}" + (f" ({metric})" if metric else ""))
+        _inject_voice_profile(parts, company_profile.get("sender_voice_profile"))
+        banned = [p for p in (company_profile.get("banned_phrases") or []) if p]
+        if banned:
+            parts.append("Never use these phrases: " + "; ".join(banned[:10]))
     parts.append("")
 
     # Step variation rules
@@ -1043,6 +1287,61 @@ def build_campaign_followup_prompt(
     else:
         parts.append("Step 4+: Low-pressure breakup or value drop. 'Last note before I stop — here's one thing worth knowing...'")
     parts.append("")
+
+    # Per-node intent + author guidance from the sequence builder (optional).
+    intent = node.get("message_intent")
+    _intent_hint = {
+        "intro": "Purpose: introduce yourself and open the conversation.",
+        "followup": "Purpose: follow up on the prior touch without repeating it.",
+        "value": "Purpose: lead with a concrete value or insight for this prospect.",
+        "breakup": "Purpose: polite last-touch break-up note.",
+    }.get(intent or "")
+    if _intent_hint:
+        parts.append(_intent_hint)
+    guidance = (node.get("guidance") or "").strip()
+    if guidance:
+        parts.append(f"Author guidance (follow closely): {guidance}")
+    if _intent_hint or guidance:
+        parts.append("")
+
+    # ── Later-touch sharpening ──
+    # Touch number is derived from the prior-message context (each already-sent
+    # step contributes one entry); node.touches_done, when threaded by the
+    # caller, wins as the explicit signal from sequence_state.
+    _prior_count = len(prior_step_messages or [])
+    _touches_done = node.get("touches_done")
+    if isinstance(_touches_done, int) and not isinstance(_touches_done, bool):
+        _prior_count = max(_prior_count, _touches_done)
+    _touch_number = _prior_count + 1
+    if _touch_number >= 3:
+        parts.append("## Later-Touch Sharpening")
+        parts.append(
+            f"The prospect has not responded to {_prior_count} previous touches. "
+            "Change the angle completely from earlier messages. Use one concrete "
+            "research hook if available (funding round, hiring signal, competitor "
+            "move, recent launch). Keep it shorter than the previous touch."
+        )
+        if intent == "value":
+            if _touch_number <= 3:
+                parts.append(
+                    "Angle for this touch: offer the detailed deck about the service "
+                    "— the only CTA is 'reply if you want me to send it over'."
+                )
+            else:
+                parts.append(
+                    "Angle for this touch: proof — lead with a case study or "
+                    "customer outcome with a concrete metric. Do NOT re-offer the deck."
+                )
+        elif intent == "followup":
+            parts.append(
+                "Angle for this touch: ROI framing that ends in one short, direct question."
+            )
+        elif intent == "breakup":
+            parts.append(
+                "Angle for this touch: short break-up note — two sentences max, "
+                "no guilt, leave the door open."
+            )
+        parts.append("")
 
     # Prospect context
     full_name = prospect.get("full_name") or (
@@ -1110,6 +1409,8 @@ def build_campaign_followup_prompt(
         parts.append("Email body: 60-90 words. Subject line ≤55 chars.")
     elif channel == "linkedin_connection":
         parts.append("LinkedIn note: 80-120 words equivalent, but ≤280 chars hard limit.")
+    elif channel == "linkedin_message":
+        parts.append("LinkedIn DM body: 40-70 words. Conversational, no subject line.")
     else:
         parts.append("InMail body: 100-140 words.")
 
@@ -1117,7 +1418,16 @@ def build_campaign_followup_prompt(
     parts.append("## Anti-Repetition Rule")
     parts.append("This message MUST introduce a new specific detail, angle, or signal not used in any prior message above. No 'just following up'. No re-stating what you already said. Sound like a real colleague checking in with something new.")
     parts.append("")
-    parts.append("Generate the follow-up message. Return JSON matching the campaign message schema (cold_email / linkedin_connection / linkedin_inmail).")
+    if channel == "linkedin_message":
+        # linkedin_message has no shape in the campaign message schema, so name
+        # the contract explicitly — otherwise the model answers with one of the
+        # other three shapes and the generated body comes back empty.
+        parts.append(
+            'Generate the follow-up message. Return JSON exactly as: '
+            '{"linkedin_message": {"body": "..."}}'
+        )
+    else:
+        parts.append("Generate the follow-up message. Return JSON matching the campaign message schema (cold_email / linkedin_connection / linkedin_inmail).")
     return "\n".join(parts)
 
 
@@ -1169,7 +1479,7 @@ _PREFILL_VALID_INDUSTRIES = [
 
 CAMPAIGN_PREFILL_FIELD_OPTIONS = {
     "message_tone": ["professional", "challenger", "conversational", "empathetic"],
-    "cta_type": ["book_call", "reply", "visit_link"],
+    "cta_type": ["book_call", "reply", "visit_link", "free_value"],
     "icp_seniority_levels": ["c_suite", "owner", "founder", "partner", "vp", "director", "manager", "senior"],
     "icp_functional_departments": [
         "marketing", "sales", "operations", "engineering", "product",
@@ -1271,7 +1581,7 @@ Return ONLY a JSON object in this format:
     "target": {
       "industry_label": "Human-readable industry name",
       "icp_industries": ["linkedin industry slug"],
-      "icp_job_titles": [],
+      "icp_job_titles": ["CEO", "Founder", "Chief Executive Officer"],
       "icp_seniority_levels": ["c_suite", "owner"],
       "icp_functional_departments": ["marketing"],
       "icp_company_size_min": null,
@@ -1298,10 +1608,57 @@ Return ONLY a JSON object in this format:
 - icp_seniority_levels must only use: c_suite, owner, founder, partner, vp, director, manager, senior.
 - `keywords`, `exclude_keywords`, and `exclude_industries`: leave `[]` EMPTY unless one of the special-case rules below explicitly mandates a list. Do NOT infer keywords from `value_proposition`, `pain_point`, the sender's `company_profile`, or general industry associations. The user can add or refine keywords in the wizard after this AI step.
 - When the user targets D2C, ecommerce, direct-to-consumer, online brands, or consumer brands: set icp_industries to ["retail", "consumer goods", "apparel & fashion", "food & beverages", "cosmetics"] (pick the most relevant 2-3), set keywords to EXACTLY ["d2c", "direct-to-consumer", "ecommerce"] (3 entries, no additions), and set exclude_keywords to EXACTLY ["agency", "consulting", "consultancy", "services", "staffing"] (5 entries, no additions) and exclude_industries to ["marketing & advertising", "staffing & recruiting", "management consulting"].
-- icp_job_titles: leave empty [] since function+seniority filters are used instead.
+- Always populate icp_job_titles with the specific role keywords from the captured targeting (e.g. "marketing managers" -> ["Marketing Manager", "Head of Marketing", "Growth Marketing Manager"]). Function+seniority filters are used for scraping, but icp_job_titles drives the person-fit title gate — an empty list disables it and lets adjacent roles through.
 
 ## Valid LinkedIn industry slugs:
 """ + "\n".join(f"- {ind}" for ind in _PREFILL_VALID_INDUSTRIES)
+
+
+# ── Lead-list column mapping (BYOL / Upload-a-Lead-List) ─────────────────────
+
+LEAD_COLUMN_MAPPING_SYSTEM_PROMPT = """You map spreadsheet columns from an uploaded sales lead list to a fixed set of canonical fields.
+
+You are given the list of column headers and a few sample rows. Decide which canonical field each column represents.
+
+## Canonical fields (map each column to exactly one)
+- first_name — person's given/first name
+- last_name — person's family/last name
+- full_name — person's full name in one column
+- job_title — the person's role/title (e.g. "VP Marketing")
+- linkedin_url — a LinkedIn profile OR company URL (linkedin.com/in/... or linkedin.com/company/...)
+- company_name — the company/organization name
+- company_domain — the company website domain or URL (e.g. acme.com, https://acme.io)
+- company_linkedin_url — explicitly a company LinkedIn page URL
+- email — the person's email address
+- country — country or location
+- seniority — an explicit seniority level column (e.g. "C-Level", "Manager")
+- ignore — column is irrelevant to outreach (notes, ids, timestamps, arbitrary data)
+
+## Rules
+- Map every input column to exactly one canonical field. If unsure and it is clearly irrelevant, use "ignore".
+- Only ONE column should map to each of first_name/last_name/full_name/email/linkedin_url/company_name/company_domain. If two columns look like the same field, map the better one and set the other to "ignore".
+- confidence is 0.0–1.0. Use < 0.6 when the header is ambiguous or the samples are inconsistent.
+- For any column you map with confidence < 0.6, ALSO emit a clarifying question so the user can confirm. Do not ask about high-confidence columns.
+- Questions use widget "single_select" with the candidate canonical fields as options (value = canonical field, label = human text), plus allow_free_text=false. Keep to at most 3 questions.
+
+## Output — return ONLY valid JSON matching this schema exactly:
+```json
+{
+  "mapping": { "<original column header>": "<canonical field>", ... },
+  "confidence": { "<original column header>": 0.0, ... },
+  "questions": [
+    {
+      "id": "col::<original column header>",
+      "question": "Which field is the \\"<header>\\" column?",
+      "widget": "single_select",
+      "options": [ {"value": "company_name", "label": "Company name"}, {"value": "ignore", "label": "Ignore this column"} ],
+      "allow_free_text": false,
+      "column": "<original column header>"
+    }
+  ]
+}
+```
+Return mapping keys EXACTLY as the input column headers (same casing/spacing). Output nothing but the JSON object."""
 
 
 # ── Prompt Registry + DB-backed get_system_prompt ─────────────────────────────
@@ -1337,199 +1694,63 @@ PROMPT_REGISTRY: dict[str, dict] = {
         "description": "Composes the final campaign JSON from pre-captured targeting fields. No clarification questions.",
         "default": CAMPAIGN_PREFILL_COMPOSE_SYSTEM_PROMPT,
     },
+    "lead_column_mapping": {
+        "name": "Lead List Column Mapping (BYOL)",
+        "description": "Maps uploaded spreadsheet columns to canonical lead fields and asks clarifying questions for ambiguous columns.",
+        "default": LEAD_COLUMN_MAPPING_SYSTEM_PROMPT,
+    },
 }
 
 
-async def get_system_prompt(slug: str) -> str:
+async def get_system_prompt(slug: str, account_id: str | None = None) -> str:
     """
-    Fetch system prompt for the given slug.
-    Checks the DB system_prompts collection first (with 60s TTL cache), then falls back to PROMPT_REGISTRY default.
+    Fetch a tenant prompt override, or the registry default.
+
+    Missing tenant context deliberately skips DB overrides. A global slug-only
+    lookup could otherwise apply one customer's prompt to every account.
     """
     import database
 
     now = time.time()
-    cached = _prompt_cache.get(slug)
+    tenant_key = str(account_id) if account_id else "__registry_default__"
+    cache_key = (tenant_key, slug)
+    cached = _prompt_cache.get(cache_key)
     if cached:
         content, ts = cached
         if now - ts < _PROMPT_CACHE_TTL:
             return content
 
     try:
-        doc = await database.system_prompts_collection.find_one({"slug": slug})
+        doc = None
+        if account_id:
+            account_values: list[object] = [str(account_id)]
+            try:
+                from bson import ObjectId
+                account_values.append(ObjectId(str(account_id)))
+            except Exception:
+                pass
+            doc = await database.system_prompts_collection.find_one(
+                {"slug": slug, "account_id": {"$in": account_values}}
+            )
         if doc and doc.get("content"):
             content = doc["content"]
-            _prompt_cache[slug] = (content, now)
+            _prompt_cache[cache_key] = (content, now)
             return content
     except Exception as e:
         logger.warning(f"Failed to fetch system prompt '{slug}' from DB: {e}")
 
     default = PROMPT_REGISTRY.get(slug, {}).get("default", "")
-    _prompt_cache[slug] = (default, now)
+    _prompt_cache[cache_key] = (default, now)
     return default
 
 
 def clear_prompt_cache(slug: str | None = None) -> None:
     """Clear the prompt cache for a specific slug or all slugs."""
     if slug:
-        _prompt_cache.pop(slug, None)
+        for key in [key for key in _prompt_cache if key[1] == slug]:
+            _prompt_cache.pop(key, None)
     else:
         _prompt_cache.clear()
-
-
-# ── Campaign Prefill (user prompt builder) ────────────────────────────────────
-
-PREFILTER_SYSTEM_PROMPT = """You are a B2B lead qualification expert. Assess whether each prospect fits the Ideal Customer Profile (ICP).
-
-Analyze job title, headline, company, industry, and geography against the ICP criteria.
-Be strict on clear mismatches; pass uncertain cases with lower confidence.
-
-Return ONLY a valid JSON array — no markdown, no explanation, no extra text.
-
-Format (one object per prospect, preserve input order):
-[
-  {
-    "idx": <integer>,
-    "passes": <true|false>,
-    "confidence": <float 0.0-1.0>,
-    "fit_summary": "<max 120 chars>",
-    "reject_reason": <null | "title_mismatch" | "function_mismatch" | "company_stage_mismatch" | "seniority_too_junior" | "out_of_market" | "other">
-  }
-]
-
-Rules:
-- passes=true when role and company clearly match the ICP
-- passes=false only on clear mismatch
-- reject_reason must be null when passes=true
-- When uncertain, set passes=true with confidence < 0.5
-"""
-
-
-def build_prefilter_user_prompt(icp: dict, candidates: list[dict]) -> str:
-    import json as _json
-    icp_block = {k: v for k, v in {
-        "industries": icp.get("icp_industries") or [],
-        "job_titles": icp.get("icp_job_titles") or [],
-        "seniority": icp.get("icp_seniority_levels") or [],
-        "countries": icp.get("icp_countries") or [],
-        "company_size_min": icp.get("icp_company_size_min"),
-        "company_size_max": icp.get("icp_company_size_max"),
-        "value_proposition": icp.get("value_proposition") or "",
-        "pain_point": icp.get("pain_point") or "",
-        "functional_departments": icp.get("icp_functional_departments") or [],
-    }.items() if v not in (None, [], "")}
-
-    return (
-        f"ICP:\n{_json.dumps(icp_block, indent=2)}\n\n"
-        f"Prospects:\n{_json.dumps(candidates, indent=2)}\n\n"
-        f"Return JSON array for idx 0..{len(candidates)-1}."
-    )
-
-
-def build_campaign_prefill_prompt(conversation: list[dict], company_profile: dict | None = None, captured: dict | None = None) -> str:
-    """Build the user-turn prompt for campaign prefill from NL."""
-    parts = []
-
-    if company_profile:
-        parts.append(f"""Company context:
-- Company: {company_profile.get('company_name', 'Unknown')}
-- Industry: {company_profile.get('industry', '')}
-- Value proposition: {company_profile.get('value_proposition', '')}
-- Target customer: {company_profile.get('target_customer_description', '')}
-""")
-
-    if captured:
-        captured_lines = [f"- {k}: {v}" for k, v in captured.items() if v]
-        if captured_lines:
-            parts.append("Already captured (do NOT ask about these again):")
-            parts.extend(captured_lines)
-            parts.append("")
-
-    parts.append("Conversation so far:")
-    for msg in conversation:
-        role = msg.get("role", "user")
-        content = msg.get("content", "")
-        parts.append(f"{role.capitalize()}: {content}")
-
-    parts.append("\nExtract the campaign configuration from this conversation.")
-
-
-# ── Curated discovery batch scoring ──────────────────────────────────────────
-
-COMPANY_BATCH_SCORE_SYSTEM_PROMPT = """You are a B2B market research analyst scoring companies for ICP (Ideal Customer Profile) fit.
-
-Given a list of companies and an ICP description, score each company 0–100 for how well it matches.
-
-Scoring criteria:
-- Industry alignment with ICP (40 pts)
-- Geographic match if ICP specifies countries (20 pts)
-- Company size within ICP range (20 pts)
-- Keyword/descriptor match in description (20 pts)
-
-Return ONLY valid JSON: {"scores": [<int>, <int>, ...]} — one integer per company in INPUT ORDER.
-No explanation. No markdown. Only the JSON object."""
-
-
-def build_company_batch_score_prompt(companies: list[dict], icp_prompt: str) -> str:
-    """Build scoring prompt for a batch of sourced companies."""
-    lines = [
-        f"ICP Description: {icp_prompt}",
-        "",
-        "Score each company 0-100 for ICP fit. Return JSON: {\"scores\": [...]} in the same order.",
-        "",
-        "Companies:",
-    ]
-    for i, c in enumerate(companies, 1):
-        lines.append(
-            f"{i}. {c.get('company_name', 'Unknown')} | "
-            f"Industry: {c.get('industry', 'Unknown')} | "
-            f"Country: {c.get('country', 'Unknown')} | "
-            f"Size: {c.get('employee_size_estimate', 'Unknown')} | "
-            f"Description: {(c.get('description') or '')[:150]}"
-        )
-    return "\n".join(lines)
-
-
-EMPLOYEE_BATCH_SCORE_SYSTEM_PROMPT = """You are a B2B sales analyst scoring LinkedIn prospects for outreach fit.
-
-Given a list of employees and campaign context, score each person 0–100 as a cold outreach target.
-
-Scoring criteria:
-- Seniority match with target levels (35 pts)
-- Role/function alignment with target departments (30 pts)
-- ICP industry and company fit (20 pts)
-- Location in target countries (15 pts)
-
-Return ONLY valid JSON: {"scores": [<int>, <int>, ...]} — one integer per employee in INPUT ORDER.
-No explanation. No markdown. Only the JSON object."""
-
-
-def build_employee_batch_score_prompt(
-    employees: list[dict],
-    icp_prompt: str,
-    sender_context: str = "",
-) -> str:
-    """Build scoring prompt for a batch of scraped employees."""
-    lines = [
-        f"ICP Description: {icp_prompt}",
-    ]
-    if sender_context:
-        lines.append(f"Sender context: {sender_context[:200]}")
-    lines.extend([
-        "",
-        "Score each employee 0-100 for cold outreach fit. Return JSON: {\"scores\": [...]} in order.",
-        "",
-        "Employees:",
-    ])
-    for i, e in enumerate(employees, 1):
-        lines.append(
-            f"{i}. {e.get('full_name', 'Unknown')} | "
-            f"Title: {e.get('job_title') or e.get('headline', 'Unknown')} | "
-            f"Seniority: {e.get('seniority_level', 'Unknown')} | "
-            f"Company: {e.get('company_name', 'Unknown')} | "
-            f"Industry: {e.get('industry', 'Unknown')} | "
-            f"Country: {e.get('country', 'Unknown')}"
-        )
-    return "\n".join(lines)
 
 
 # ── Reply Classifier ─────────────────────────────────────────────────────────
@@ -1622,7 +1843,6 @@ def build_reply_positive_prompt(
     discovery_agenda: str = "",
 ) -> str:
     slots_str = "\n".join(f"- {s}" for s in proposed_slots)
-    voice_tone = (voice_profile or {}).get("tone_markers", "professional and direct")
     return f"""Prospect: {prospect_name} @ {company_name}
 
 Their message:
@@ -1636,7 +1856,8 @@ Proposed time slots (use these exact times):
 
 Booking link: {booking_link}
 Meeting agenda hint: {discovery_agenda or "Learn about their current workflow and explore fit"}
-Voice tone: {voice_tone}
+
+{build_voice_block(voice_profile)}
 
 Write the reply. Reply only with the message text."""
 
@@ -1673,6 +1894,8 @@ Relevant proof points: {case_study_str or 'None available'}
 
 Recent conversation context:
 {conversation_context[:400]}
+
+{build_voice_block(voice_profile)}
 
 Write a reply that answers their question and pivots to a call. Reply only with the message text."""
 
@@ -1717,6 +1940,8 @@ Our primary CTA: {company_profile.get('primary_cta', 'Schedule a discovery call'
 Recent conversation:
 {conversation_context[:400]}
 
+{build_voice_block(voice_profile)}
+
 Write a reply that acknowledges their objection and keeps the door open. Reply only with the message text."""
 
 
@@ -1741,6 +1966,8 @@ def build_reply_hard_objection_prompt(
 ) -> str:
     return f"""Prospect: {prospect_name} @ {company_name}
 Their message: {message_text[:600]}
+
+{build_voice_block(voice_profile)}
 
 Write a graceful closing reply. Reply only with the message text."""
 
@@ -1805,6 +2032,69 @@ LinkedIn Posts:
 Analyze the posts above and return the voice profile JSON."""
 
 
+# ── Onboarding preview message ────────────────────────────────────────────────
+
+ONBOARDING_PREVIEW_MESSAGE_PROMPT = """You are an expert B2B cold-outreach ghostwriter. Write ONE short LinkedIn connection-style outreach message from the sender to the prospect.
+
+Rules:
+- 40-80 words, plain text only. No subject line, no signature block, no placeholders like [Name].
+- Personalize with the prospect's role, company, and industry.
+- Lead with relevance to the prospect's likely pain points; end with a soft, low-friction call to action.
+- If a sender voice profile is provided, match its tone, sentence patterns, and formality exactly — the message must sound like the sender wrote it.
+- Never invent facts, metrics, or claims not present in the context.
+
+Output ONLY the message text — no preamble, no quotes, no markdown."""
+
+
+def build_onboarding_preview_message_prompt(
+    company_profile: dict,
+    prospect: dict,
+    voice_profile: dict | None = None,
+) -> str:
+    """User prompt for the onboarding sample outreach message (stage 4/5 preview)."""
+    services = ", ".join((company_profile.get("services") or [])[:5])
+    pain_points = ", ".join((company_profile.get("pain_points") or [])[:5])
+
+    parts = [
+        f"Sender: {company_profile.get('sender_name') or 'the sender'}"
+        + (f" ({company_profile.get('sender_role')})" if company_profile.get("sender_role") else ""),
+        f"Sender's company: {company_profile.get('company_name') or 'their company'}",
+    ]
+    if services:
+        parts.append(f"What they offer: {services}")
+    if pain_points:
+        parts.append(f"Pain points they solve: {pain_points}")
+    diffs = ", ".join((company_profile.get("differentiators") or [])[:3])
+    if diffs:
+        parts.append(f"Differentiators: {diffs}")
+    best_cs = _select_best_case_study(company_profile.get("case_studies") or [], prospect)
+    if best_cs:
+        client = best_cs.get("client") or ""
+        outcome = best_cs.get("outcome") or ""
+        metric = best_cs.get("metric") or ""
+        label = f"{client} — {outcome}" if client and outcome else (client or outcome)
+        if label:
+            parts.append(f"Proof point: {label}" + (f" ({metric})" if metric else ""))
+    if company_profile.get("primary_cta"):
+        parts.append(f"Primary call to action: {company_profile['primary_cta']}")
+
+    parts.append("")
+    parts.append(f"Prospect: {prospect.get('full_name') or 'the prospect'}")
+    if prospect.get("job_title"):
+        parts.append(f"Prospect title: {prospect['job_title']}")
+    if prospect.get("company_name"):
+        parts.append(f"Prospect company: {prospect['company_name']}")
+    if prospect.get("industry"):
+        parts.append(f"Prospect industry: {prospect['industry']}")
+    if prospect.get("country"):
+        parts.append(f"Prospect country: {prospect['country']}")
+
+    parts = _inject_voice_profile(parts, voice_profile)
+    parts.append("")
+    parts.append("Write the outreach message now.")
+    return "\n".join(parts)
+
+
 # ── Onboarding refinement ─────────────────────────────────────────────────────
 
 ONBOARDING_REFINEMENT_SYSTEM_PROMPT = """You are an expert B2B sales coach helping a user build their AI outreach system.
@@ -1830,14 +2120,122 @@ Keep responses conversational, warm, and brief (2-4 sentences). This is a 10-min
 
 # ── Shared helpers ────────────────────────────────────────────────────────────
 
+EM_DASH_RULE = (
+    "Never use em dashes (—) or en dashes (–). Use a comma, a full stop, or "
+    "rewrite the sentence instead."
+)
+
+MARKDOWN_RULE = (
+    "Write plain text only. Never use markdown formatting: no **bold**, no "
+    "*italics*, no _underscores_, no backticks, no ## headings. Email and "
+    "LinkedIn do not render markdown, so the characters show up literally."
+)
+
+STYLE_RULES = f"{EM_DASH_RULE}\n{MARKDOWN_RULE}"
+
+# Emphasis wrappers only. Each requires non-space immediately inside the
+# markers so a bullet ("* item") or a stray asterisk is left alone, and the
+# single-character forms refuse a neighbouring word character so snake_case
+# identifiers and mid-word asterisks survive untouched.
+_MARKDOWN_EMPHASIS_PATTERNS = [
+    (re.compile(r"\*\*\*(?=\S)(.+?)(?<=\S)\*\*\*", re.S), r"\1"),
+    (re.compile(r"___(?=\S)(.+?)(?<=\S)___", re.S), r"\1"),
+    (re.compile(r"\*\*(?=\S)(.+?)(?<=\S)\*\*", re.S), r"\1"),
+    (re.compile(r"__(?=\S)(.+?)(?<=\S)__", re.S), r"\1"),
+    (re.compile(r"(?<![\w*])\*(?=\S)([^*\n]+?)(?<=\S)\*(?![\w*])"), r"\1"),
+    (re.compile(r"(?<![\w_])_(?=\S)([^_\n]+?)(?<=\S)_(?![\w_])"), r"\1"),
+    (re.compile(r"(?<!`)`(?=\S)([^`\n]+?)(?<=\S)`(?!`)"), r"\1"),
+]
+
+
+def strip_em_dashes(text: str) -> str:
+    """Replace em/en dashes with a comma so no generated copy ever ships one.
+
+    Canonical implementation. The prompt asks the model to avoid them, this
+    enforces it on the way out for every message and reply.
+    """
+    if not text:
+        return text
+    text = re.sub(r"\s*[—–]\s*", ", ", text)
+    return re.sub(r"[—–]", ", ", text)
+
+
+def strip_markdown_emphasis(text: str) -> str:
+    """Remove markdown emphasis markers, keeping the words they wrapped.
+
+    Neither email nor LinkedIn renders markdown, so `**Tuesday**` reaches the
+    prospect with the asterisks visible. Leading list markers are deliberately
+    preserved: a "- " bullet reads fine as plain text.
+    """
+    if not text:
+        return text
+    for pattern, replacement in _MARKDOWN_EMPHASIS_PATTERNS:
+        text = pattern.sub(replacement, text)
+    return text
+
+
+def sanitize_generated_text(text: str) -> str:
+    """Apply every outgoing-copy rule the prompts also state. Order-independent."""
+    return strip_markdown_emphasis(strip_em_dashes(text))
+
+
+def _stringify_voice_list(value) -> str:
+    if isinstance(value, list):
+        return ", ".join(str(v) for v in value if v)
+    return str(value or "")
+
+
+def build_voice_block(voice_profile: dict | None) -> str:
+    """Render the sender's full voice profile as prompt context.
+
+    Everything the synthesis step captured is passed through, not just the tone
+    markers — the summary, sentence patterns, vocabulary, formality and CTA
+    style are what actually make generated copy sound like the sender.
+    Returns "" when no profile exists.
+    """
+    if not voice_profile:
+        # No profile yet, but the style rules still apply to every message.
+        return f"## Style Rules\n{STYLE_RULES}"
+
+    lines = ["## Voice profile - write every word as this person would"]
+    fields = [
+        ("Tone", voice_profile.get("tone_markers")),
+        ("Sentence patterns", voice_profile.get("sentence_patterns")),
+        ("Favoured vocabulary", voice_profile.get("vocab_signature")),
+        ("Formality", voice_profile.get("formality_level")),
+        ("Typical length", voice_profile.get("average_post_length")),
+        ("CTA style", voice_profile.get("call_to_action_style")),
+        ("Recurring topics", voice_profile.get("post_topics")),
+    ]
+    for label, value in fields:
+        rendered = _stringify_voice_list(value)
+        if rendered:
+            lines.append(f"{label}: {rendered}")
+
+    uses_emojis = voice_profile.get("uses_emojis")
+    if uses_emojis is not None:
+        lines.append(
+            "Emojis: uses them naturally" if uses_emojis else "Emojis: never uses them"
+        )
+
+    summary = (voice_profile.get("synthesized_summary") or "").strip()
+    if summary:
+        lines.append(f"Voice summary: {summary}")
+
+    if len(lines) == 1:
+        return f"## Style Rules\n{STYLE_RULES}"
+    lines.append(
+        "Match this voice closely, but never fabricate claims to fit it. "
+        + STYLE_RULES
+    )
+    return "\n".join(lines)
+
+
 def _inject_voice_profile(prompt_parts: list[str], voice_profile: dict | None) -> list[str]:
     """Append voice profile context to a prompt parts list."""
-    if not voice_profile:
-        return prompt_parts
-    summary = voice_profile.get("synthesized_summary", "")
-    tone = ", ".join(voice_profile.get("tone_markers", []))
-    if summary or tone:
-        prompt_parts.append(f"\nVoice profile — write in this style:\nTone: {tone}\n{summary}")
+    block = build_voice_block(voice_profile)
+    if block:
+        prompt_parts.append("\n" + block)
     return prompt_parts
 
 
@@ -1851,112 +2249,3 @@ def _redact_banned_phrases(text: str, banned_phrases: list[str]) -> str:
             text = text[:idx] + text[idx + len(phrase):]
     return text.strip()
 
-
-# ── Meeting Proposal ──────────────────────────────────────────────────────────
-
-MEETING_PROPOSAL_PROMPT = """You are writing the final reply to a prospect who has shown genuine interest.
-Your goal: express enthusiasm, propose 3 specific meeting times, and include a booking link.
-
-Rules:
-- Warm but professional tone
-- Reference something specific from their message if possible
-- Propose exactly 3 time slots (they will be filled in by the system)
-- Include the booking link naturally
-- 80 words max
-- Never use: "I hope this email finds you well", "circle back", "reach out", "synergy"
-"""
-
-
-def build_meeting_proposal_prompt(
-    prospect_name: str,
-    company_name: str,
-    message_text: str,
-    slots: list[dict],
-    booking_url: str,
-    voice_profile: dict = None,
-) -> str:
-    slot_lines = "\n".join(f"  • {s['label']}" for s in slots)
-    parts = [
-        f"Prospect: {prospect_name} at {company_name}",
-        f"Their message: {message_text[:400]}",
-        f"",
-        f"Proposed slots:\n{slot_lines}",
-        f"Booking link: {booking_url}",
-        f"",
-        f"Write the reply using these exact slots and link.",
-    ]
-    if voice_profile:
-        _inject_voice_profile(parts, voice_profile)
-    return "\n".join(parts)
-
-
-# ── Voice Note Script ─────────────────────────────────────────────────────────
-
-VOICE_NOTE_SCRIPT_PROMPT = """You are writing a 30-45 second voice note script for a B2B sales rep.
-
-Rules:
-- Conversational, warm — sounds like talking to a colleague not reading a script
-- Reference the prospect's company or role specifically
-- One clear ask at the end (reply, book a call, etc.)
-- Max 90 words (~45s spoken at natural pace)
-- Format: plain text, no stage directions, no "Hi, my name is" openers
-- Never use: "I hope this finds you well", "circle back", "reach out", "touch base"
-"""
-
-
-def build_voice_note_script_prompt(
-    prospect_name: str,
-    company_name: str,
-    prospect_title: str,
-    sender_name: str,
-    sender_role: str,
-    company_profile: dict,
-    previous_touches: int = 0,
-    voice_profile: dict = None,
-) -> str:
-    parts = [
-        f"Prospect: {prospect_name}, {prospect_title} at {company_name}",
-        f"Sender: {sender_name}, {sender_role}",
-        f"Previous touches: {previous_touches}",
-        f"",
-        f"Write a 30-45 second voice note script. Be specific to this prospect.",
-    ]
-    if voice_profile:
-        _inject_voice_profile(parts, voice_profile)
-    return "\n".join(parts)
-
-
-# ── Video DM Script ───────────────────────────────────────────────────────────
-
-VIDEO_DM_SCRIPT_PROMPT = """You are writing a 30-45 second video DM script for a B2B sales rep.
-
-Rules:
-- Opens with something visible/specific about the prospect (their LinkedIn post, company news, role change)
-- Demonstrates research — not a generic pitch
-- One specific ask at the end
-- Max 90 words
-- Format: plain text, as if the person is speaking naturally to camera
-- Never use: "I hope this finds you well", "circle back", "synergy"
-"""
-
-
-def build_video_dm_script_prompt(
-    prospect_name: str,
-    company_name: str,
-    prospect_title: str,
-    sender_name: str,
-    sender_role: str,
-    company_profile: dict,
-    prospect_recent_activity: str = "",
-    voice_profile: dict = None,
-) -> str:
-    parts = [
-        f"Prospect: {prospect_name}, {prospect_title} at {company_name}",
-        f"Sender: {sender_name}, {sender_role}",
-    ]
-    if prospect_recent_activity:
-        parts.append(f"Recent prospect activity to reference: {prospect_recent_activity[:200]}")
-    parts.extend(["", "Write a 30-45 second video DM script. Open with something specific."])
-    if voice_profile:
-        _inject_voice_profile(parts, voice_profile)
-    return "\n".join(parts)

@@ -15,7 +15,7 @@ Optimizations applied:
 
 import asyncio
 import logging
-from datetime import datetime
+from datetime import datetime, timedelta
 from bson import ObjectId
 
 from pymongo import UpdateOne
@@ -25,12 +25,14 @@ from database import (
     prospects_collection,
     enrichment_runs_collection,
     companies_collection,
+    campaigns_collection,
     prospect_state_collection,
+    campaign_prospect_state_collection,
+    campaign_enrollments_collection,
     geo_places_collection,
     industries_taxonomy_collection,
 )
 from services.openrouter_service import OpenRouterClient
-from services.linkedin_scraper_service import scrape_linkedin_profiles, match_profiles_to_urls
 from services.company_scraper_service import (
     extract_unique_company_urls,
     scrape_company_pages,
@@ -44,12 +46,20 @@ logger = logging.getLogger(__name__)
 
 settings = get_settings()
 
+# How long a company-level research claim (competitors_fetching_at /
+# news_fetching_at) is honored before it's treated as abandoned (e.g. the
+# worker holding it crashed) and re-claimable.
+_CLAIM_STALE_AFTER = timedelta(minutes=5)
+
 
 async def run_enrichment_pipeline(
     enrichment_run_id: str,
     prospect_ids: list[str],
     options: dict,
     triggered_by: str | None = None,
+    *,
+    account_id: str,
+    campaign_id: str | None = None,
 ) -> dict:
     """
     Run the full enrichment pipeline for the given leads.
@@ -64,6 +74,8 @@ async def run_enrichment_pipeline(
     5. Finalize
     """
     run_oid = ObjectId(enrichment_run_id)
+    account_id = str(account_id)
+    campaign_id = str(campaign_id) if campaign_id else None
     pipeline_start = datetime.utcnow()
     skip_profile = options.get("skip_profile_scrape", False)
     skip_company = options.get("skip_company_scrape", False)
@@ -92,17 +104,7 @@ async def run_enrichment_pipeline(
 
     # ── Fetch company profile for personalised AI assessment ──
     company_profile: dict | None = None
-    _account_id_for_profile = None
-    if triggered_by:
-        try:
-            from database import users_collection
-            user_doc = await users_collection.find_one({"_id": ObjectId(triggered_by)})
-            if user_doc and user_doc.get("current_account_id"):
-                _account_id_for_profile = user_doc["current_account_id"]
-        except Exception as e:
-            logger.warning(f"Could not resolve account from triggered_by={triggered_by}: {e}")
-    elif options.get("account_id"):
-        _account_id_for_profile = options["account_id"]
+    _account_id_for_profile = account_id
 
     if _account_id_for_profile:
         try:
@@ -116,46 +118,106 @@ async def run_enrichment_pipeline(
 
     try:
         # ── Phase 0: Setup ──
-        await _update_run(run_oid, {"current_step": "setup"})
+        owned_run = await enrichment_runs_collection.find_one(
+            {"_id": run_oid, "account_id": {"$in": [account_id, ObjectId(account_id)]}},
+            {"_id": 1},
+        )
+        if owned_run is None:
+            raise PermissionError("enrichment run does not belong to account")
+        await _update_run(run_oid, account_id, {
+            "status": "running", "current_step": "setup",
+            "started_at": datetime.utcnow(),
+        })
 
         lead_oids = [ObjectId(lid) for lid in prospect_ids]
+        state_ids: set[str] = set()
+        if campaign_id:
+            state_cursor = campaign_prospect_state_collection.find(
+                {
+                    "account_id": account_id,
+                    "campaign_id": campaign_id,
+                    "prospect_id": {"$in": [str(value) for value in lead_oids]},
+                },
+                {"prospect_id": 1},
+            )
+        else:
+            state_cursor = prospect_state_collection.find(
+                {
+                    "account_id": {"$in": [account_id, ObjectId(account_id)]},
+                    "prospect_id": {"$in": [str(value) for value in lead_oids] + lead_oids},
+                },
+                {"prospect_id": 1},
+            )
+        state_ids.update([str(doc["prospect_id"]) async for doc in state_cursor])
+        enrollment_query = {
+            "account_id": {"$in": [account_id, ObjectId(account_id)]},
+            "prospect_id": {"$in": [str(value) for value in lead_oids] + lead_oids},
+        }
+        if campaign_id:
+            enrollment_query["campaign_id"] = {"$in": [campaign_id, ObjectId(campaign_id)]}
+        enrollment_cursor = campaign_enrollments_collection.find(enrollment_query, {"prospect_id": 1})
+        async for doc in enrollment_cursor:
+            state_ids.add(str(doc["prospect_id"]))
+        unauthorized = [str(value) for value in lead_oids if str(value) not in state_ids]
+        if unauthorized:
+            raise PermissionError("one or more prospects are outside the enrichment tenant scope")
+        scoring_version = None
+        if campaign_id:
+            from services.campaign_prospect_state_service import DEFAULT_SCORING_VERSION
+            _campaign_for_scoring = await campaigns_collection.find_one(
+                {"_id": ObjectId(str(campaign_id))}, {"scoring_version": 1}
+            )
+            scoring_version = (_campaign_for_scoring or {}).get("scoring_version") or DEFAULT_SCORING_VERSION
+            for prospect_oid in lead_oids:
+                await campaign_prospect_state_collection.update_one(
+                    {
+                        "account_id": account_id,
+                        "campaign_id": campaign_id,
+                        "prospect_id": str(prospect_oid),
+                        "scoring_version": scoring_version,
+                    },
+                    {
+                        "$setOnInsert": {
+                            "account_id": account_id,
+                            "campaign_id": campaign_id,
+                            "prospect_id": str(prospect_oid),
+                            "scoring_version": scoring_version,
+                            "score": {"value": None, "version": scoring_version},
+                            "enrichment": {"state": "queued", "attempt": 0, "queued_at": datetime.utcnow()},
+                            "created_at": datetime.utcnow(),
+                            "updated_at": datetime.utcnow(),
+                        }
+                    },
+                    upsert=True,
+                )
         prospects = await prospects_collection.find({"_id": {"$in": lead_oids}}).to_list(len(lead_oids))
+        if len(prospects) != len(set(lead_oids)):
+            raise LookupError("one or more prospects no longer exist")
 
-        # Filter out prospects without LinkedIn URL → mark "skipped" via bulk write
+        # Filter out prospects without LinkedIn URL. Runtime/progress belongs
+        # to the tenant/campaign overlay, never the shared person document.
         valid_leads = []
-        bulk_ops = []
         for prospect in prospects:
             if not prospect.get("linkedin"):
-                bulk_ops.append(UpdateOne(
-                    {"_id": prospect["_id"]},
-                    {"$set": {
-                        "enrichment_status": "skipped",
-                        "enrichment_error": "No LinkedIn URL",
-                    }}
-                ))
+                await _update_prospect_status(
+                    account_id, campaign_id, prospect["_id"], "skipped",
+                    error="No LinkedIn URL", scoring_version=scoring_version,
+                )
                 stats["prospects_skipped"] += 1
             else:
                 valid_leads.append(prospect)
-                bulk_ops.append(UpdateOne(
-                    {"_id": prospect["_id"]},
-                    {"$set": {
-                        "enrichment_status": "in_progress",
-                        "enrichment_started_at": datetime.utcnow(),
-                        "enrichment_run_id": enrichment_run_id,
-                        "enrichment_error": None,
-                    }}
-                ))
+                await _update_prospect_status(
+                    account_id, campaign_id, prospect["_id"], "in_progress",
+                    run_id=enrichment_run_id, scoring_version=scoring_version,
+                )
 
-        if bulk_ops:
-            await prospects_collection.bulk_write(bulk_ops, ordered=False)
-
-        await _update_run(run_oid, {
+        await _update_run(run_oid, account_id, {
             "total_prospects": len(prospects),
             "prospects_skipped": stats["prospects_skipped"],
         })
 
         if not valid_leads:
-            await _update_run(run_oid, {
+            await _update_run(run_oid, account_id, {
                 "status": "completed",
                 "current_step": "completed",
                 "completed_at": datetime.utcnow(),
@@ -167,7 +229,8 @@ async def run_enrichment_pipeline(
         # if not skip_triage and settings.pre_enrichment_triage_enabled:
         #     await _update_run(run_oid, {"current_step": "pre_enrichment_triage"})
         #     valid_leads, stats = await _phase_pre_enrichment_triage(
-        #         valid_leads, stats, enrichment_run_id
+        #         valid_leads, stats, enrichment_run_id,
+        #         account_id=account_id, campaign_id=campaign_id,
         #     )
         #     await _update_run(run_oid, {
         #         "triage_decision_makers": stats["triage_decision_makers"],
@@ -175,32 +238,17 @@ async def run_enrichment_pipeline(
         #         "triage_contacts_discovered": stats.get("triage_contacts_discovered", 0),
         #     })
 
-        # ── Phase 1: LinkedIn Profile Scrape ──
-        elapsed = (datetime.utcnow() - pipeline_start).total_seconds()
-        if elapsed > 1200:
-            logger.error(f"Enrichment pipeline exceeded 20-minute wall-clock limit after {elapsed:.0f}s, aborting before Phase 1")
-            await _update_run(run_oid, {
-                "status": "failed",
-                "current_step": "failed",
-                "error": f"Pipeline exceeded 20-minute time limit after {int(elapsed)}s",
-                "completed_at": datetime.utcnow(),
-                **stats,
-            })
-            return stats
-
+        # ── Phase 1: LinkedIn Profile Scrape (RETIRED) ──
+        # The Apify PROFILE_SCRAPER actor was removed. Prospects proceed to
+        # company scraping + AI assessment without per-person profile data.
         if not skip_profile:
-            await _update_run(run_oid, {"current_step": "scraping_profiles"})
-            valid_leads, stats = await _phase_profile_scrape(valid_leads, stats)
-            await _update_run(run_oid, {
-                "profiles_scraped": stats["profiles_scraped"],
-                "prospects_failed": stats["prospects_failed"],
-            })
+            logger.info("Phase 1 profile scrape skipped — profile scraper actor retired")
 
         # ── Phase 2: Company Scrape with Dedup ──
         elapsed = (datetime.utcnow() - pipeline_start).total_seconds()
         if elapsed > 1200:
             logger.error(f"Enrichment pipeline exceeded 20-minute wall-clock limit after {elapsed:.0f}s, aborting before Phase 2")
-            await _update_run(run_oid, {
+            await _update_run(run_oid, account_id, {
                 "status": "failed",
                 "current_step": "failed",
                 "error": f"Pipeline exceeded 20-minute time limit after {int(elapsed)}s",
@@ -210,9 +258,14 @@ async def run_enrichment_pipeline(
             return stats
 
         if not skip_company:
-            await _update_run(run_oid, {"current_step": "scraping_companies"})
+            await _update_run(run_oid, account_id, {"current_step": "scraping_companies"})
             valid_leads, stats = await _phase_company_scrape(valid_leads, stats)
-            await _update_run(run_oid, {
+            for prospect in valid_leads:
+                await _update_prospect_status(
+                    account_id, campaign_id, prospect["_id"], "company_scraped",
+                    scoring_version=scoring_version,
+                )
+            await _update_run(run_oid, account_id, {
                 "companies_scraped": stats["companies_scraped"],
                 "companies_deduplicated": stats["companies_deduplicated"],
             })
@@ -223,7 +276,7 @@ async def run_enrichment_pipeline(
 
         if not skip_competitors and not skip_ai:
             openrouter_client = OpenRouterClient()
-            await _update_run(run_oid, {"current_step": "ai_assessment_and_competitors"})
+            await _update_run(run_oid, account_id, {"current_step": "ai_assessment_and_competitors"})
 
             # Run all three in parallel
             competitors_task = asyncio.create_task(
@@ -233,7 +286,7 @@ async def run_enrichment_pipeline(
                 _phase_news(valid_leads, stats)
             )
             assessment_task = asyncio.create_task(
-                _phase_ai_assessment(valid_leads, stats, openrouter_client, company_profile=company_profile, account_id=_account_id_for_profile)
+                _phase_ai_assessment(valid_leads, stats, openrouter_client, company_profile=company_profile, account_id=account_id, campaign_id=campaign_id)
             )
 
             # Wait for all to complete
@@ -244,7 +297,7 @@ async def run_enrichment_pipeline(
             # Merge competitor/news data into AI-assessed prospects (both update in-place and in DB)
             valid_leads = valid_leads_from_ai
 
-            await _update_run(run_oid, {
+            await _update_run(run_oid, account_id, {
                 "competitors_researched": stats.get("competitors_researched", 0),
                 "news_researched": stats.get("news_researched", 0),
                 "ai_assessments_done": stats["ai_assessments_done"],
@@ -253,20 +306,20 @@ async def run_enrichment_pipeline(
             })
 
         elif not skip_competitors:
-            await _update_run(run_oid, {"current_step": "researching_competitors"})
+            await _update_run(run_oid, account_id, {"current_step": "researching_competitors"})
             competitors_task = asyncio.create_task(_phase_competitors(valid_leads, stats))
             news_task = asyncio.create_task(_phase_news(valid_leads, stats))
             (valid_leads, stats), (_, stats) = await asyncio.gather(competitors_task, news_task)
-            await _update_run(run_oid, {
+            await _update_run(run_oid, account_id, {
                 "competitors_researched": stats.get("competitors_researched", 0),
                 "news_researched": stats.get("news_researched", 0),
             })
 
         elif not skip_ai:
             openrouter_client = OpenRouterClient()
-            await _update_run(run_oid, {"current_step": "ai_assessment"})
-            valid_leads, wrong_person_prospects, stats = await _phase_ai_assessment(valid_leads, stats, openrouter_client, company_profile=company_profile, account_id=_account_id_for_profile)
-            await _update_run(run_oid, {
+            await _update_run(run_oid, account_id, {"current_step": "ai_assessment"})
+            valid_leads, wrong_person_prospects, stats = await _phase_ai_assessment(valid_leads, stats, openrouter_client, company_profile=company_profile, account_id=account_id, campaign_id=campaign_id)
+            await _update_run(run_oid, account_id, {
                 "ai_assessments_done": stats["ai_assessments_done"],
                 "prospects_failed": stats["prospects_failed"],
                 "wrong_person_prospects": len(wrong_person_prospects),
@@ -276,12 +329,13 @@ async def run_enrichment_pipeline(
         if wrong_person_prospects:
             if not openrouter_client:
                 openrouter_client = OpenRouterClient()
-            await _update_run(run_oid, {"current_step": "contact_discovery"})
+            await _update_run(run_oid, account_id, {"current_step": "contact_discovery"})
             discovered_prospects, stats = await _phase_contact_discovery(
-                wrong_person_prospects, stats, openrouter_client
+                wrong_person_prospects, stats, openrouter_client,
+                account_id=account_id, campaign_id=campaign_id,
             )
             valid_leads.extend(discovered_prospects)
-            await _update_run(run_oid, {
+            await _update_run(run_oid, account_id, {
                 "contacts_discovered": stats.get("contacts_discovered", 0),
                 "employees_scraped_for_discovery": stats.get("employees_scraped_for_discovery", 0),
                 "emails_found": stats.get("emails_found", 0),
@@ -298,40 +352,14 @@ async def run_enrichment_pipeline(
         #         "prospects_failed": stats["prospects_failed"],
         #     })
 
-        # Mark ai_assessed prospects as completed
-        if valid_leads:
-            valid_oids = [p["_id"] for p in valid_leads]
-            bulk_ops = [
-                UpdateOne(
-                    {"_id": oid, "enrichment_status": "ai_assessed"},
-                    {"$set": {
-                        "enrichment_status": "completed",
-                        "enrichment_completed_at": datetime.utcnow(),
-                    }}
-                )
-                for oid in valid_oids
-            ]
-            await prospects_collection.bulk_write(bulk_ops, ordered=False)
+        for prospect in valid_leads:
+            await _update_prospect_status(
+                account_id, campaign_id, prospect["_id"], "completed",
+                scoring_version=scoring_version,
+            )
 
         # ── Phase 5: Finalize ──
         stats["prospects_processed"] = len(valid_leads)
-
-        # Phase 5.0: Auto-trigger employee discovery (DISABLED — invoke explicitly via API)
-        # if settings.auto_discover_contacts_enabled:
-        #     stats["employee_discoveries_queued"] = 0
-        #     from services.employee_discovery_service import discover_best_contacts
-        #     for prospect in valid_leads:
-        #         score = prospect.get("ai_prospect_score") or 0
-        #         if score >= settings.auto_discover_contacts_threshold:
-        #             try:
-        #                 asyncio.create_task(discover_best_contacts(
-        #                     prospect_id=str(prospect["_id"]),
-        #                     max_contacts=3,
-        #                     auto_enrich=False,
-        #                 ))
-        #                 stats["employee_discoveries_queued"] += 1
-        #             except Exception as e:
-        #                 logger.warning(f"Employee discovery queue failed for {prospect.get('email')}: {e}")
 
         # Phase 5.1: Auto-initialize outreach sequences (DISABLED — campaign-specific)
         # stats["outreach_sequences_initialized"] = 0
@@ -354,15 +382,7 @@ async def run_enrichment_pipeline(
         # if stats["outreach_sequences_initialized"] > 0:
         #     logger.info(f"Auto-initialized {stats['outreach_sequences_initialized']} outreach sequences")
 
-        # Set enriched_by on all prospects that completed successfully in this run
-        if triggered_by and valid_leads:
-            valid_oids = [p["_id"] for p in valid_leads]
-            await prospects_collection.update_many(
-                {"_id": {"$in": valid_oids}, "enrichment_status": "completed"},
-                {"$set": {"enriched_by": triggered_by}},
-            )
-
-        await _update_run(run_oid, {
+        await _update_run(run_oid, account_id, {
             "status": "completed",
             "current_step": "completed",
             "completed_at": datetime.utcnow(),
@@ -375,14 +395,14 @@ async def run_enrichment_pipeline(
 
     except Exception as e:
         logger.error(f"Enrichment pipeline failed: {e}", exc_info=True)
-        await _update_run(run_oid, {
+        await _update_run(run_oid, account_id, {
             "status": "failed",
             "current_step": "failed",
             "error": str(e),
             "completed_at": datetime.utcnow(),
             **stats,
         })
-        return stats
+        raise
 
     finally:
         if openrouter_client:
@@ -390,66 +410,6 @@ async def run_enrichment_pipeline(
 
 
 # ── Phase Implementations ──
-
-
-async def _phase_profile_scrape(prospects: list[dict], stats: dict) -> tuple[list[dict], dict]:
-    """Phase 1: Scrape LinkedIn profiles with concurrent batches."""
-    batch_size = settings.enrichment_batch_size
-    urls = [prospect["linkedin"] for prospect in prospects]
-
-    if not urls:
-        return prospects, stats
-
-    # Split into batches and run concurrently (up to concurrency limit)
-    batches = [urls[i:i + batch_size] for i in range(0, len(urls), batch_size)]
-    scrape_semaphore = asyncio.Semaphore(settings.apify_actor_concurrency_limit)
-
-    async def _scrape_batch(batch_urls: list[str]) -> dict:
-        async with scrape_semaphore:
-            try:
-                _run_id, results = await scrape_linkedin_profiles(batch_urls)
-                return match_profiles_to_urls(batch_urls, results)
-            except Exception as e:
-                logger.error(f"Profile scrape batch failed: {e}", exc_info=True)
-                return {}
-
-    batch_results = await asyncio.gather(*[_scrape_batch(b) for b in batches])
-
-    # Merge all batch results
-    all_matched = {}
-    for result in batch_results:
-        all_matched.update(result)
-
-    # Map results back to prospects and bulk-update DB
-    bulk_ops = []
-    for prospect in prospects:
-        linkedin_url = prospect["linkedin"]
-        profile_data = all_matched.get(linkedin_url)
-        if profile_data:
-            prospect["linkedin_profile_data"] = profile_data
-            db_set: dict = {
-                "linkedin_profile_data": profile_data,
-                "enrichment_status": "profile_scraped",
-            }
-            # Backfill email from profile if prospect doesn't have one yet
-            extracted_email = profile_data.get("extracted_email")
-            if extracted_email and not prospect.get("email"):
-                prospect["email"] = extracted_email
-                db_set["email"] = extracted_email
-                db_set["email_source"] = "linkedin_profile"
-            bulk_ops.append(UpdateOne({"_id": prospect["_id"]}, {"$set": db_set}))
-            stats["profiles_scraped"] += 1
-        else:
-            logger.warning(f"No profile data for {linkedin_url}, continuing without profile")
-            bulk_ops.append(UpdateOne(
-                {"_id": prospect["_id"]},
-                {"$set": {"enrichment_status": "profile_scraped"}}
-            ))
-
-    if bulk_ops:
-        await prospects_collection.bulk_write(bulk_ops, ordered=False)
-
-    return prospects, stats
 
 
 async def _phase_company_scrape(prospects: list[dict], stats: dict) -> tuple[list[dict], dict]:
@@ -472,7 +432,7 @@ async def _phase_company_scrape(prospects: list[dict], stats: dict) -> tuple[lis
     async def _scrape_batch(batch_urls: list[str]) -> dict:
         async with scrape_semaphore:
             try:
-                _run_id, results = await asyncio.to_thread(scrape_company_pages, batch_urls)
+                _run_id, results = await scrape_company_pages(batch_urls)
                 return match_companies_to_urls(batch_urls, results)
             except Exception as e:
                 logger.error(f"Company scrape batch failed: {e}", exc_info=True)
@@ -543,7 +503,7 @@ async def _phase_company_scrape(prospects: list[dict], stats: dict) -> tuple[lis
         try:
             res = await companies_collection.update_one(
                 {"linkedin_url": url},
-                {"$set": set_doc, "$setOnInsert": {"created_at": now, "prospect_count": 0}},
+                {"$set": set_doc, "$setOnInsert": {"created_at": now}},
                 upsert=True,
             )
             cid = str(res.upserted_id) if res.upserted_id else None
@@ -573,7 +533,7 @@ async def _phase_company_scrape(prospects: list[dict], stats: dict) -> tuple[lis
         if company_data:
             prospect["company_linkedin_data"] = company_data  # keep in-memory for AI phase
 
-        update_set: dict = {"enrichment_status": "company_scraped", "stage": "company_enriched"}
+        update_set: dict = {}
         if company_tuple:
             company_id, company_doc = company_tuple
             ind = company_doc.get("industry") or {}
@@ -605,6 +565,7 @@ async def _phase_ai_assessment(
     client: OpenRouterClient,
     company_profile: dict | None = None,
     account_id: str | None = None,
+    campaign_id: str | None = None,
 ) -> tuple[list[dict], list[dict], dict]:
     """Phase 3: Batch AI assessment — 3 prospects per call using Haiku 4.5.
     Returns (good_prospects, wrong_person_prospects, stats).
@@ -620,6 +581,33 @@ async def _phase_ai_assessment(
     batch_semaphore = asyncio.Semaphore(settings.ai_assessment_concurrency_limit)
     assessment_model = settings.mini_enrichment_model  # claude-haiku-4-5 — fast, reliable JSON output
 
+    # Load the campaign doc once so the assessment prompt gets Campaign Context
+    # (name/description/value_prop/pain_point/ICP targeting). Fail-soft: any
+    # load failure just means assessment proceeds without campaign context.
+    campaign_doc: dict | None = None
+    if campaign_id:
+        try:
+            campaign_doc = await campaigns_collection.find_one(
+                {"_id": ObjectId(str(campaign_id))},
+                {
+                    "name": 1,
+                    "description": 1,
+                    "value_proposition": 1,
+                    "pain_point": 1,
+                    "icp_job_titles": 1,
+                    "icp_seniority_levels": 1,
+                    "icp_functional_departments": 1,
+                    "account_id": 1,
+                    "scoring_version": 1,
+                },
+            )
+        except Exception as e:
+            logger.warning(f"AI assessment: failed to load campaign {campaign_id} for prompt context: {e}")
+            campaign_doc = None
+
+    from services.campaign_prospect_state_service import DEFAULT_SCORING_VERSION
+    pipeline_scoring_version = (campaign_doc or {}).get("scoring_version") or DEFAULT_SCORING_VERSION
+
     async def _run_batch(batch: list[dict], batch_index: int) -> list[bool]:
         async with batch_semaphore:
             model = assessment_model
@@ -629,19 +617,19 @@ async def _phase_ai_assessment(
             ]
             try:
                 assessments = await asyncio.wait_for(
-                    batch_assess_leads(tuples, client, model),
+                    batch_assess_leads(tuples, client, model, campaign=campaign_doc),
                     timeout=150.0,
                 )
             except asyncio.TimeoutError:
                 logger.error(f"batch_assess_leads timed out for batch {batch_index} (model={model})")
                 for prospect in batch:
-                    await _update_prospect_status(prospect["_id"], "failed", error="AI assessment: batch timed out")
+                    await _update_prospect_status(account_id, campaign_id, prospect["_id"], "failed", error="AI assessment: batch timed out", scoring_version=pipeline_scoring_version)
                     stats["prospects_failed"] += 1
                 return [False] * len(batch)
             except Exception as e:
                 logger.error(f"batch_assess_leads failed for batch {batch_index} (model={model}): {e}")
                 for prospect in batch:
-                    await _update_prospect_status(prospect["_id"], "failed", error=f"AI assessment: {e}")
+                    await _update_prospect_status(account_id, campaign_id, prospect["_id"], "failed", error=f"AI assessment: {e}", scoring_version=pipeline_scoring_version)
                     stats["prospects_failed"] += 1
                 return [False] * len(batch)
 
@@ -664,11 +652,11 @@ async def _phase_ai_assessment(
                         for we in write_errors:
                             pid = we.get("keyValue", {}).get("_id")
                             if pid:
-                                await _update_prospect_status(pid, "failed", error=f"bulk_write error: {we.get('errmsg', '')}")
+                                await _update_prospect_status(account_id, campaign_id, pid, "failed", error=f"bulk_write error: {we.get('errmsg', '')}", scoring_version=pipeline_scoring_version)
 
             for prospect, assessment in zip(batch, assessments):
                 if assessment is None:
-                    await _update_prospect_status(prospect["_id"], "failed", error="AI assessment: batch returned None")
+                    await _update_prospect_status(account_id, campaign_id, prospect["_id"], "failed", error="AI assessment: batch returned None", scoring_version=pipeline_scoring_version)
                     stats["prospects_failed"] += 1
                     successes.append(False)
                     continue
@@ -697,40 +685,61 @@ async def _phase_ai_assessment(
                     bulk_ops.append(MongoUpdateOne(
                         {"_id": prospect["_id"]},
                         {"$set": {
-                            "ai_assessment": assessment,
-                            "ai_prospect_score": score,
-                            "prospect_score": score,
-                            "ai_score_breakdown": breakdown,
-                            "company_fit_score": prospect["company_fit_score"],
-                            "prospect_fit_score": prospect["prospect_fit_score"],
+                            # Inferred timezone is a neutral person fact. Fit,
+                            # optimal timing, assessment and workflow state are
+                            # persisted only on tenant/campaign state below.
                             "timezone": timezone_str,
-                            "optimal_send_time": optimal_time,
-                            "priority_tier": priority_tier,
-                            "enrichment_status": "ai_assessed",
-                            "stage": "assessed",
                         }},
                     ))
 
-                    # Write scores to prospect_state overlay (account-scoped)
+                    # Write all tenant-relative assessment to the proper
+                    # campaign or account overlay.
                     if account_id:
                         try:
-                            from services.prospect_search_service import ensure_prospect_state
-                            from bson import ObjectId as _OID
                             _aid = account_id if isinstance(account_id, str) else str(account_id)
                             _pid = str(prospect["_id"])
-                            await ensure_prospect_state(None, account_id=_aid, prospect_id=_pid)
-                            await prospect_state_collection.update_one(
-                                {"account_id": _aid, "prospect_id": _pid},
-                                {"$set": {
-                                    "ai_score": score,
-                                    "ai_score_breakdown": breakdown,
-                                    "prospect_score": score,
-                                    "priority_tier": priority_tier,
-                                    "last_updated_at": datetime.utcnow(),
-                                }},
-                            )
+                            if campaign_id:
+                                from services.campaign_prospect_state_service import persist_campaign_score
+                                await persist_campaign_score(
+                                    account_id=_aid, campaign_id=campaign_id,
+                                    prospect_id=_pid,
+                                    scoring_version=pipeline_scoring_version,
+                                    result={
+                                        "fit_score": score,
+                                        "company_fit_score": prospect["company_fit_score"],
+                                        "prospect_fit_score": prospect["prospect_fit_score"],
+                                        "priority_tier": priority_tier,
+                                        "reasoning": assessment.get("reasoning"),
+                                        "breakdown": breakdown,
+                                    },
+                                )
+                                await campaign_prospect_state_collection.update_one(
+                                    {
+                                        "account_id": _aid, "campaign_id": campaign_id, "prospect_id": _pid,
+                                        "scoring_version": pipeline_scoring_version,
+                                    },
+                                    {"$set": {
+                                        "ai_assessment": assessment,
+                                        "optimal_send_time": optimal_time,
+                                        "updated_at": datetime.utcnow(),
+                                    }},
+                                )
+                            else:
+                                await prospect_state_collection.update_one(
+                                    {"account_id": _aid, "prospect_id": _pid},
+                                    {"$set": {
+                                        "ai_score": score, "prospect_score": score,
+                                        "ai_score_breakdown": breakdown,
+                                        "ai_assessment": assessment,
+                                        "priority_tier": priority_tier,
+                                        "optimal_send_time": optimal_time,
+                                        "last_updated_at": datetime.utcnow(),
+                                    }},
+                                    upsert=False,
+                                )
                         except Exception as _pse:
-                            logger.debug(f"prospect_state overlay write failed: {_pse}")
+                            logger.error("tenant assessment write failed for %s: %s", _pid, _pse)
+                            raise
 
                     stats["ai_assessments_done"] += 1
                     successes.append(True)
@@ -742,7 +751,7 @@ async def _phase_ai_assessment(
 
                 except Exception as e:
                     logger.error(f"AI assessment post-processing failed for {prospect.get('email', 'unknown')}: {e}", exc_info=True)
-                    await _update_prospect_status(prospect["_id"], "failed", error=f"AI assessment: {e}")
+                    await _update_prospect_status(account_id, campaign_id, prospect["_id"], "failed", error=f"AI assessment: {e}", scoring_version=pipeline_scoring_version)
                     stats["prospects_failed"] += 1
                     successes.append(False)
 
@@ -782,18 +791,28 @@ async def _phase_contact_discovery(
     wrong_person_prospects: list[dict],
     stats: dict,
     client: OpenRouterClient,
+    *,
+    account_id: str,
+    campaign_id: str | None,
 ) -> tuple[list[dict], dict]:
     """Phase 3.5: Discover better contacts at companies where the prospect was wrong person.
 
     Processes companies CONCURRENTLY for speed.
     """
     from services.employee_scraper_service import _scrape_employees_for_company
-    from services.employee_discovery_service import _fallback_ranking
-    from services.email_finder_service import find_emails_batch
+    from services.email_finder_service import find_emails, EmailLookupEntry, _split_full_name
+    from services.campaign_prospect_state_service import DEFAULT_SCORING_VERSION
 
     stats["contacts_discovered"] = 0
     stats["employees_scraped_for_discovery"] = 0
     stats["emails_found"] = 0
+
+    pipeline_scoring_version = DEFAULT_SCORING_VERSION
+    if campaign_id:
+        _campaign_for_discovery = await campaigns_collection.find_one(
+            {"_id": ObjectId(str(campaign_id))}, {"scoring_version": 1}
+        )
+        pipeline_scoring_version = (_campaign_for_discovery or {}).get("scoring_version") or DEFAULT_SCORING_VERSION
 
     # 1. Deduplicate by company LinkedIn URL
     company_groups: dict[str, list[dict]] = {}
@@ -874,12 +893,6 @@ async def _phase_contact_discovery(
                         "company_size": source_prospect.get("company_size"),
                         "company_annual_revenue": source_prospect.get("company_annual_revenue"),
                         "source": "contact_discovery",
-                        "discovered_from_prospect_id": str(source_prospect["_id"]),
-                        "discovery_reasoning": contact.get("reasoning"),
-                        "tags": ["contact_discovery"],
-                        "status": "new",
-                        "enrichment_status": "in_progress",
-                        "enrichment_started_at": now_ts,
                         "first_seen_at": now_ts,
                         "last_updated_at": now_ts,
                         "company_linkedin_data": source_prospect.get("company_linkedin_data"),
@@ -891,6 +904,35 @@ async def _phase_contact_discovery(
                         insert_result = await prospects_collection.insert_many(docs_to_insert, ordered=False)
                         for doc, inserted_id in zip(docs_to_insert, insert_result.inserted_ids):
                             doc["_id"] = inserted_id
+                            if campaign_id:
+                                await campaign_prospect_state_collection.update_one(
+                                    {
+                                        "account_id": account_id, "campaign_id": campaign_id,
+                                        "prospect_id": str(inserted_id),
+                                        "scoring_version": pipeline_scoring_version,
+                                    },
+                                    {"$setOnInsert": {
+                                        "account_id": account_id, "campaign_id": campaign_id,
+                                        "prospect_id": str(inserted_id),
+                                        "scoring_version": pipeline_scoring_version,
+                                        "score": {"value": None, "version": pipeline_scoring_version},
+                                        "enrichment": {"state": "running", "attempt": 1, "started_at": now_ts},
+                                        "created_at": now_ts, "updated_at": now_ts,
+                                    }},
+                                    upsert=True,
+                                )
+                            else:
+                                await prospect_state_collection.update_one(
+                                    {"account_id": account_id, "prospect_id": str(inserted_id)},
+                                    {"$setOnInsert": {
+                                        "account_id": account_id, "prospect_id": str(inserted_id),
+                                        "status": "new", "tags": ["contact_discovery"],
+                                        "enrichment_status": "in_progress",
+                                        "enrichment_started_at": now_ts,
+                                        "created_at": now_ts, "last_updated_at": now_ts,
+                                    }},
+                                    upsert=True,
+                                )
                             new_prospects_for_company.append(doc)
                         stats["contacts_discovered"] += len(new_prospects_for_company)
                     except Exception as e:
@@ -899,49 +941,42 @@ async def _phase_contact_discovery(
                 if not new_prospects_for_company:
                     return []
 
-                # Scrape LinkedIn profiles for new prospects
-                new_urls = [p["linkedin"] for p in new_prospects_for_company]
-                try:
-                    _run_id, profile_results = await scrape_linkedin_profiles(new_urls)
-                    matched = match_profiles_to_urls(new_urls, profile_results)
-
-                    bulk_ops = []
-                    for prospect in new_prospects_for_company:
-                        profile_data = matched.get(prospect["linkedin"])
-                        if profile_data:
-                            prospect["linkedin_profile_data"] = profile_data
-                            bulk_ops.append(UpdateOne(
-                                {"_id": prospect["_id"]},
-                                {"$set": {"linkedin_profile_data": profile_data}}
-                            ))
-                    if bulk_ops:
-                        await prospects_collection.bulk_write(bulk_ops, ordered=False)
-                except Exception as e:
-                    logger.error(f"Profile scrape failed for discovered contacts at {company_name}: {e}")
+                # NOTE: per-person profile scraping for discovered contacts was retired
+                # with the Apify PROFILE_SCRAPER actor — contacts are assessed from
+                # employee-scrape + company data only.
 
                 # Find emails for new prospects
                 try:
-                    email_results = await find_emails_batch(new_urls)
-                    bulk_ops = []
+                    email_entries = []
                     for prospect in new_prospects_for_company:
-                        email_data = email_results.get(prospect["linkedin"])
-                        if email_data:
-                            email = email_data.get("email") or email_data.get("emailAddress")
+                        first, last = _split_full_name(prospect.get("full_name") or "")
+                        domain = prospect.get("company_domain") or source_prospect.get("company_domain")
+                        if first and last and domain and prospect.get("linkedin"):
+                            email_entries.append(EmailLookupEntry(
+                                first_name=first, last_name=last, domain=domain,
+                                key=prospect["linkedin"],
+                            ))
+                    if email_entries:
+                        email_results = await find_emails(email_entries, account_id=account_id)
+                        bulk_ops = []
+                        for prospect in new_prospects_for_company:
+                            email = email_results.get(prospect["linkedin"])
                             if email:
                                 prospect["email"] = email
                                 bulk_ops.append(UpdateOne(
                                     {"_id": prospect["_id"]},
-                                    {"$set": {"email": email, "email_source": "apify_email_finder"}}
+                                    {"$set": {"email": email, "email_source": "growthtoolkit"}}
                                 ))
                                 stats["emails_found"] += 1
-                    if bulk_ops:
-                        await prospects_collection.bulk_write(bulk_ops, ordered=False)
+                        if bulk_ops:
+                            await prospects_collection.bulk_write(bulk_ops, ordered=False)
                 except Exception as e:
                     logger.error(f"Email finder failed for discovered contacts at {company_name}: {e}")
 
                 # Run AI assessment on new prospects
                 assessed_prospects, _, stats_update = await _phase_ai_assessment(
-                    new_prospects_for_company, stats, client
+                    new_prospects_for_company, stats, client,
+                    account_id=account_id, campaign_id=campaign_id,
                 )
 
                 return assessed_prospects
@@ -960,23 +995,11 @@ async def _phase_contact_discovery(
     for result in company_results:
         all_new_prospects.extend(result)
 
-    # Mark original wrong-person prospects as "replaced" via bulk write
-    bulk_ops = [
-        UpdateOne(
-            {"_id": prospect["_id"]},
-            {"$set": {
-                "enrichment_status": "replaced",
-                "replaced_reason": "good_company_wrong_person",
-                "replaced_at": datetime.utcnow(),
-            }}
+    for prospect in wrong_person_prospects:
+        await _update_prospect_status(
+            account_id, campaign_id, prospect["_id"], "replaced",
+            scoring_version=pipeline_scoring_version,
         )
-        for prospect in wrong_person_prospects
-    ]
-    if bulk_ops:
-        try:
-            await prospects_collection.bulk_write(bulk_ops, ordered=False)
-        except Exception as e:
-            logger.warning(f"Failed to mark prospects as replaced: {e}")
 
     logger.info(
         f"Phase 3.5 complete: {stats['contacts_discovered']} contacts discovered, "
@@ -991,6 +1014,9 @@ async def _phase_pre_enrichment_triage(
     prospects: list[dict],
     stats: dict,
     enrichment_run_id: str,
+    *,
+    account_id: str,
+    campaign_id: str | None = None,
 ) -> tuple[list[dict], dict]:
     """Phase 0.5: Pre-enrichment triage using rule-based checks (no API calls).
 
@@ -1001,14 +1027,39 @@ async def _phase_pre_enrichment_triage(
     - Poor company + NOT decision maker → skip entirely
     """
     from services.employee_scraper_service import _scrape_employees_for_company
-    from services.employee_discovery_service import _fallback_ranking
+    from services.campaign_prospect_state_service import DEFAULT_SCORING_VERSION
 
     threshold = settings.pre_enrichment_company_fit_threshold
     proceed_list = []
     discovery_candidates: dict[str, list[dict]] = {}  # company_url -> [prospects]
 
-    # Triage all prospects and collect bulk DB updates
-    bulk_ops = []
+    pipeline_scoring_version = DEFAULT_SCORING_VERSION
+    if campaign_id:
+        _campaign_for_triage = await campaigns_collection.find_one(
+            {"_id": ObjectId(str(campaign_id))}, {"scoring_version": 1}
+        )
+        pipeline_scoring_version = (_campaign_for_triage or {}).get("scoring_version") or DEFAULT_SCORING_VERSION
+
+    async def _persist_triage(prospect_id, triage: dict) -> None:
+        now = datetime.utcnow()
+        if campaign_id:
+            result = await campaign_prospect_state_collection.update_one(
+                {
+                    "account_id": str(account_id), "campaign_id": str(campaign_id),
+                    "prospect_id": str(prospect_id),
+                    "scoring_version": pipeline_scoring_version,
+                },
+                {"$set": {"pre_enrichment_triage": triage, "updated_at": now}},
+            )
+        else:
+            result = await prospect_state_collection.update_one(
+                {"account_id": str(account_id), "prospect_id": str(prospect_id)},
+                {"$set": {"pre_enrichment_triage": triage, "last_updated_at": now}},
+            )
+        if result.matched_count != 1:
+            raise PermissionError("triage prospect is outside tenant scope")
+
+    # Triage all prospects and persist decisions only to tenant state.
     for prospect in prospects:
         company_score, company_breakdown = score_company_fit_rule_based(prospect)
         is_dm, dm_reasoning = is_decision_maker_rule_based(prospect)
@@ -1028,19 +1079,15 @@ async def _phase_pre_enrichment_triage(
 
         if good_company and is_dm:
             triage_data["pre_enrichment_triage"]["action"] = "proceed"
-            bulk_ops.append(UpdateOne(
-                {"_id": prospect["_id"]}, {"$set": triage_data}
-            ))
+            await _persist_triage(prospect["_id"], triage_data["pre_enrichment_triage"])
             proceed_list.append(prospect)
             stats["triage_decision_makers"] += 1
 
         elif good_company and not is_dm:
             triage_data["pre_enrichment_triage"]["action"] = "discover"
-            triage_data["enrichment_status"] = "triage_skipped"
-            triage_data["triage_skip_reason"] = "good_company_not_decision_maker"
-            bulk_ops.append(UpdateOne(
-                {"_id": prospect["_id"]}, {"$set": triage_data}
-            ))
+            triage_data["pre_enrichment_triage"]["skip_reason"] = "good_company_not_decision_maker"
+            await _persist_triage(prospect["_id"], triage_data["pre_enrichment_triage"])
+            await _update_prospect_status(account_id, campaign_id, prospect["_id"], "skipped", scoring_version=pipeline_scoring_version)
             stats["triage_wrong_person"] += 1
 
             company_url = prospect.get("company_linkedin") or prospect.get("company_linkedin_uid")
@@ -1050,25 +1097,17 @@ async def _phase_pre_enrichment_triage(
 
         elif not good_company and is_dm:
             triage_data["pre_enrichment_triage"]["action"] = "proceed_low_company"
-            bulk_ops.append(UpdateOne(
-                {"_id": prospect["_id"]}, {"$set": triage_data}
-            ))
+            await _persist_triage(prospect["_id"], triage_data["pre_enrichment_triage"])
             proceed_list.append(prospect)
             stats["triage_decision_makers"] += 1
 
         else:
             triage_data["pre_enrichment_triage"]["action"] = "skip"
-            triage_data["enrichment_status"] = "triage_skipped"
-            triage_data["triage_skip_reason"] = "poor_company_not_decision_maker"
-            bulk_ops.append(UpdateOne(
-                {"_id": prospect["_id"]}, {"$set": triage_data}
-            ))
+            triage_data["pre_enrichment_triage"]["skip_reason"] = "poor_company_not_decision_maker"
+            await _persist_triage(prospect["_id"], triage_data["pre_enrichment_triage"])
+            await _update_prospect_status(account_id, campaign_id, prospect["_id"], "skipped", scoring_version=pipeline_scoring_version)
             stats["triage_wrong_person"] += 1
             stats["prospects_skipped"] += 1
-
-    # Single bulk write for all triage updates
-    if bulk_ops:
-        await prospects_collection.bulk_write(bulk_ops, ordered=False)
 
     if not discovery_candidates:
         logger.info(
@@ -1131,20 +1170,12 @@ async def _phase_pre_enrichment_triage(
                             "company_linkedin": company_url,
                             "company_domain": source_prospect.get("company_domain"),
                             "industry": source_prospect.get("industry"),
-                            "industry_id": source_prospect.get("industry_id"),
                             "company_size": source_prospect.get("company_size"),
                             "company_annual_revenue": source_prospect.get("company_annual_revenue"),
                             "company_annual_revenue_clean": source_prospect.get("company_annual_revenue_clean"),
                             "city": source_prospect.get("city"),
                             "country": source_prospect.get("country"),
                             "source": "pre_enrichment_discovery",
-                            "discovered_from_prospect_id": str(source_prospect["_id"]),
-                            "discovery_reasoning": contact.get("reasoning"),
-                            "tags": ["pre_enrichment_discovery"],
-                            "status": "new",
-                            "enrichment_status": "in_progress",
-                            "enrichment_started_at": datetime.utcnow(),
-                            "enrichment_run_id": enrichment_run_id,
                             "first_seen_at": datetime.utcnow(),
                             "last_updated_at": datetime.utcnow(),
                         }
@@ -1152,6 +1183,35 @@ async def _phase_pre_enrichment_triage(
                         try:
                             result = await prospects_collection.insert_one(prospect_data)
                             prospect_data["_id"] = result.inserted_id
+                            if campaign_id:
+                                await campaign_prospect_state_collection.update_one(
+                                    {
+                                        "account_id": str(account_id), "campaign_id": str(campaign_id),
+                                        "prospect_id": str(result.inserted_id),
+                                        "scoring_version": pipeline_scoring_version,
+                                    },
+                                    {"$setOnInsert": {
+                                        "account_id": str(account_id), "campaign_id": str(campaign_id),
+                                        "prospect_id": str(result.inserted_id),
+                                        "scoring_version": pipeline_scoring_version,
+                                        "score": {"value": None, "version": pipeline_scoring_version},
+                                        "enrichment": {"state": "running", "attempt": 1, "run_id": enrichment_run_id},
+                                        "pre_enrichment_triage": {"action": "discovered_replacement"},
+                                        "created_at": datetime.utcnow(), "updated_at": datetime.utcnow(),
+                                    }},
+                                    upsert=True,
+                                )
+                            else:
+                                await prospect_state_collection.update_one(
+                                    {"account_id": str(account_id), "prospect_id": str(result.inserted_id)},
+                                    {"$setOnInsert": {
+                                        "account_id": str(account_id), "prospect_id": str(result.inserted_id),
+                                        "status": "new", "tags": ["pre_enrichment_discovery"],
+                                        "enrichment_status": "in_progress", "enrichment_run_id": enrichment_run_id,
+                                        "created_at": datetime.utcnow(), "last_updated_at": datetime.utcnow(),
+                                    }},
+                                    upsert=True,
+                                )
                             new_prospects.append(prospect_data)
                             stats["triage_contacts_discovered"] += 1
                         except Exception as e:
@@ -1199,7 +1259,6 @@ async def _ai_rank_employees(
     Used by both Phase 0.5 (pre-enrichment triage) and Phase 3.5 (contact discovery).
     Returns list of ranked contacts with full_name, title, linkedin_url, reasoning.
     """
-    from services.employee_discovery_service import _fallback_ranking
     from utils.prompts import get_system_prompt
 
     # Format employee list for AI
@@ -1243,20 +1302,77 @@ async def _ai_rank_employees(
         )
 
 
-async def _update_run(run_oid: ObjectId, update_data: dict):
+async def _update_run(run_oid: ObjectId, account_id: str, update_data: dict):
     """Update enrichment run document."""
     await enrichment_runs_collection.update_one(
-        {"_id": run_oid},
+        {"_id": run_oid, "account_id": {"$in": [str(account_id), ObjectId(str(account_id))]}},
         {"$set": update_data}
     )
 
 
-async def _update_prospect_status(prospect_oid: ObjectId, status: str, error: str | None = None):
-    """Update a prospect's enrichment status."""
-    update = {"enrichment_status": status}
-    if error:
-        update["enrichment_error"] = error
-    await prospects_collection.update_one({"_id": prospect_oid}, {"$set": update})
+async def _update_prospect_status(
+    account_id: str,
+    campaign_id: str | None,
+    prospect_oid: ObjectId | str,
+    status: str,
+    error: str | None = None,
+    run_id: str | None = None,
+    scoring_version: str | None = None,
+):
+    """Persist workflow status only inside the authorized tenant overlay."""
+    now = datetime.utcnow()
+    prospect_id = str(prospect_oid)
+    if campaign_id:
+        from services.campaign_prospect_state_service import DEFAULT_SCORING_VERSION
+        scoring_version = scoring_version or DEFAULT_SCORING_VERSION
+        state = "running"
+        if status == "completed":
+            state = "succeeded"
+        elif status in {"failed"}:
+            state = "retryable_failure"
+        elif status in {"skipped"}:
+            state = "not_found"
+        fields = {
+            "enrichment.state": state,
+            "enrichment.outcome": status,
+            "enrichment.error_message": error,
+            "enrichment.run_id": run_id,
+            "updated_at": now,
+        }
+        if status == "in_progress":
+            fields["enrichment.started_at"] = now
+        if state in {"succeeded", "retryable_failure", "not_found"}:
+            fields["enrichment.completed_at"] = now
+        result = await campaign_prospect_state_collection.update_one(
+            {
+                "account_id": str(account_id), "campaign_id": str(campaign_id),
+                "prospect_id": prospect_id, "scoring_version": scoring_version,
+            },
+            {"$set": fields},
+        )
+    else:
+        fields = {
+            "enrichment_status": status,
+            "enrichment_error": error,
+            "enrichment_run_id": run_id,
+            "last_updated_at": now,
+        }
+        if status == "in_progress":
+            fields["enrichment_started_at"] = now
+        if status in {"completed", "failed", "skipped"}:
+            fields["enrichment_completed_at"] = now
+        result = await prospect_state_collection.update_one(
+            {"account_id": str(account_id), "prospect_id": prospect_id},
+            {"$set": fields},
+        )
+    if result.matched_count != 1:
+        # Bookkeeping only — a missing/mismatched state doc must never abort
+        # the run and mask the real error (e.g. an AI timeout) that called us.
+        logger.warning(
+            f"prospect enrichment state bookkeeping miss for prospect={prospect_id} "
+            f"account={account_id} campaign={campaign_id} status={status} "
+            f"(matched_count={result.matched_count})"
+        )
 
 
 async def _phase_competitors(prospects: list[dict], stats: dict) -> tuple[list[dict], dict]:
@@ -1274,6 +1390,8 @@ async def _phase_competitors(prospects: list[dict], stats: dict) -> tuple[list[d
     try:
         async def _research_one(prospect: dict):
             async with semaphore:
+                comp_doc = None
+                claimed_id = None
                 try:
                     company_name = prospect.get("company_name")
                     industry = prospect.get("industry")
@@ -1283,7 +1401,6 @@ async def _phase_competitors(prospects: list[dict], stats: dict) -> tuple[list[d
 
                     # Resolve the company doc for dedup check + storage
                     company_linkedin = prospect.get("company_linkedin")
-                    comp_doc = None
                     if company_linkedin:
                         comp_doc = await companies_collection.find_one({"linkedin_url": company_linkedin})
 
@@ -1294,6 +1411,31 @@ async def _phase_competitors(prospects: list[dict], stats: dict) -> tuple[list[d
                             prospect["competitors"] = comp_doc["competitors"]
                             logger.info(f"Reusing cached competitors for {company_name} from company doc")
                             return
+
+                    # Atomic claim: multiple prospects at the same company would
+                    # otherwise all pass the freshness check above concurrently
+                    # and each pay for a Perplexity call. Only the claim winner
+                    # calls out; everyone else waits for its result.
+                    if comp_doc:
+                        claim_now = datetime.utcnow()
+                        claim = await companies_collection.find_one_and_update(
+                            {
+                                "_id": comp_doc["_id"],
+                                "$or": [
+                                    {"competitors_fetching_at": {"$exists": False}},
+                                    {"competitors_fetching_at": {"$lt": claim_now - _CLAIM_STALE_AFTER}},
+                                ],
+                            },
+                            {"$set": {"competitors_fetching_at": claim_now}},
+                        )
+                        if claim is None:
+                            latest = await companies_collection.find_one(
+                                {"_id": comp_doc["_id"]}, {"competitors": 1}
+                            )
+                            if latest and latest.get("competitors"):
+                                prospect["competitors"] = latest["competitors"]
+                            return
+                        claimed_id = comp_doc["_id"]
 
                     # Website fallback chain: prospect.company_website → company_domain → company doc
                     website = (
@@ -1326,6 +1468,14 @@ async def _phase_competitors(prospects: list[dict], stats: dict) -> tuple[list[d
 
                 except Exception as e:
                     logger.error(f"Competitor research failed for prospect {prospect.get('email')}: {e}", exc_info=True)
+                finally:
+                    if claimed_id is not None:
+                        try:
+                            await companies_collection.update_one(
+                                {"_id": claimed_id}, {"$unset": {"competitors_fetching_at": ""}}
+                            )
+                        except Exception:
+                            pass
 
         await asyncio.gather(*[_research_one(p) for p in prospects])
     finally:
@@ -1338,8 +1488,11 @@ async def _phase_news(prospects: list[dict], stats: dict) -> tuple[list[dict], d
     """Phase 2.6: Research recent company news using Perplexity Sonar Pro.
 
     Runs in parallel with _phase_competitors — both depend only on company_name.
-    Skips prospects whose news was fetched within 14 days.
-    Persists to prospects.company_news + news_last_fetched.
+    Cached on the COMPANY doc (one Perplexity call per company, not per
+    prospect) with an atomic claim so concurrent prospects at the same company
+    don't each pay for their own call. Persists to companies.news +
+    news_last_fetched, and mirrors the result onto prospects.company_news for
+    prospect-detail display / message personalization.
     """
     from services.news_research_service import research_company_news
 
@@ -1350,41 +1503,127 @@ async def _phase_news(prospects: list[dict], stats: dict) -> tuple[list[dict], d
     try:
         async def _research_one(prospect: dict):
             async with semaphore:
+                comp_doc = None
+                claimed_id = None
                 try:
                     company_name = prospect.get("company_name")
                     if not company_name:
                         return
 
-                    # Skip if news fetched within 14 days
-                    news_last = prospect.get("news_last_fetched")
-                    if news_last:
-                        if isinstance(news_last, str):
-                            from dateutil import parser as _dp
-                            news_last = _dp.parse(news_last)
-                        age_days = (datetime.utcnow() - news_last).days
-                        if age_days < 14:
-                            logger.info(f"Reusing cached news for {company_name} (fetched {age_days}d ago)")
+                    company_linkedin = prospect.get("company_linkedin")
+                    if company_linkedin:
+                        comp_doc = await companies_collection.find_one({"linkedin_url": company_linkedin})
+
+                    now = datetime.utcnow()
+
+                    # Reuse fresh news from the company doc if available (< 14 days old)
+                    if comp_doc and comp_doc.get("news"):
+                        fetched_at = comp_doc.get("news_last_fetched")
+                        if fetched_at and (now - fetched_at).days < 14:
+                            prospect["company_news"] = comp_doc["news"]
+                            await prospects_collection.update_one(
+                                {"_id": prospect["_id"]},
+                                {"$set": {"company_news": comp_doc["news"], "news_last_fetched": fetched_at}},
+                            )
+                            logger.info(f"Reusing cached news for {company_name} from company doc")
                             return
+
+                    # Atomic claim: multiple prospects at the same company would
+                    # otherwise all pass the freshness check above concurrently
+                    # and each pay for a Perplexity call.
+                    if comp_doc:
+                        claim = await companies_collection.find_one_and_update(
+                            {
+                                "_id": comp_doc["_id"],
+                                "$or": [
+                                    {"news_fetching_at": {"$exists": False}},
+                                    {"news_fetching_at": {"$lt": now - _CLAIM_STALE_AFTER}},
+                                ],
+                            },
+                            {"$set": {"news_fetching_at": now}},
+                        )
+                        if claim is None:
+                            latest = await companies_collection.find_one(
+                                {"_id": comp_doc["_id"]}, {"news": 1}
+                            )
+                            if latest and latest.get("news"):
+                                prospect["company_news"] = latest["news"]
+                                await prospects_collection.update_one(
+                                    {"_id": prospect["_id"]},
+                                    {"$set": {"company_news": latest["news"], "news_last_fetched": now}},
+                                )
+                            return
+                        claimed_id = comp_doc["_id"]
 
                     news = await research_company_news(company_name, limit=5, days_back=90, client=shared_client)
 
                     if news:
+                        fetched_now = datetime.utcnow()
                         prospect["company_news"] = news
                         await prospects_collection.update_one(
                             {"_id": prospect["_id"]},
                             {"$set": {
                                 "company_news": news,
-                                "news_last_fetched": datetime.utcnow(),
+                                "news_last_fetched": fetched_now,
                             }}
                         )
+                        if comp_doc:
+                            await companies_collection.update_one(
+                                {"_id": comp_doc["_id"]},
+                                {"$set": {
+                                    "news": news,
+                                    "news_last_fetched": fetched_now,
+                                }}
+                            )
                         stats["news_researched"] += 1
                         logger.info(f"News research: {len(news)} items for {company_name}")
 
                 except Exception as e:
                     logger.error(f"News research failed for {prospect.get('email')}: {e}", exc_info=True)
+                finally:
+                    if claimed_id is not None:
+                        try:
+                            await companies_collection.update_one(
+                                {"_id": claimed_id}, {"$unset": {"news_fetching_at": ""}}
+                            )
+                        except Exception:
+                            pass
 
         await asyncio.gather(*[_research_one(p) for p in prospects])
     finally:
         await shared_client.close()
 
     return prospects, stats
+
+
+def _fallback_ranking(employees: list[dict], max_contacts: int) -> list[dict]:
+    """Simple fallback ranking by title seniority when AI fails."""
+    priority_keywords = [
+        "chief", "ceo", "cmo", "cto", "cfo", "coo", "president",
+        "vp", "vice president", "director", "head of",
+        "marketing", "business development", "sales",
+    ]
+
+    scored = []
+    for emp in employees:
+        position = emp.get("current_position", {})
+        title = (position.get("title", "") if isinstance(position, dict) else "").lower()
+        name = emp.get("full_name") or f"{emp.get('first_name', '')} {emp.get('last_name', '')}".strip()
+        score = sum(10 for kw in priority_keywords if kw in title)
+        scored.append({
+            "rank": 0,
+            "linkedin_url": emp.get("linkedin_url"),
+            "full_name": name,
+            "title": position.get("title", "Unknown") if isinstance(position, dict) else "Unknown",
+            "reasoning": "Ranked by title seniority (AI unavailable)",
+            "approach_angle": "Generic outreach based on seniority level",
+            "confidence_score": min(80, score * 5 + 30),
+            "_score": score,
+        })
+
+    scored.sort(key=lambda x: x["_score"], reverse=True)
+    result = scored[:max_contacts]
+    for i, contact in enumerate(result, 1):
+        contact["rank"] = i
+        del contact["_score"]
+    return result

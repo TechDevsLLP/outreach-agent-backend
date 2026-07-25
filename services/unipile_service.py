@@ -17,11 +17,17 @@ from urllib.parse import urlparse
 import httpx
 
 from config import get_settings
+from utils.rate_limiter import backoff_with_jitter, parse_retry_after
 
 logger = logging.getLogger(__name__)
 settings = get_settings()
 
 TIMEOUT = 30.0
+# Retry budget for transient Unipile failures (429 rate-limited, 5xx upstream
+# errors). Sending pacing/throttling itself is handled elsewhere (daily caps,
+# scheduler cadence) — this is purely about not hard-failing a single call on
+# a momentary blip.
+MAX_RETRIES = 3
 
 
 def _extract_linkedin_username(profile_url: str) -> str:
@@ -48,38 +54,72 @@ def _extract_linkedin_username(profile_url: str) -> str:
 
 
 class UnipileClient:
-    """Async Unipile API client for LinkedIn."""
+    """Async Unipile API client for LinkedIn.
 
-    def __init__(self):
+    Tenant-facing callers must pass the tenant-owned Unipile account id. The
+    optional unbound mode remains only for account discovery/connection flows
+    which intentionally enumerate the platform workspace.
+    """
+
+    def __init__(self, account_id: Optional[str] = None):
         self.base_url = settings.unipile_base_url.rstrip("/")
         self.headers = {
             "X-API-KEY": settings.unipile_token,
             "Authorization": f"Bearer {settings.unipile_token}",
             "Content-Type": "application/json",
         }
-        self._account_id: Optional[str] = None
+        self._account_id: Optional[str] = str(account_id) if account_id else None
+
+    @property
+    def bound_account_id(self) -> Optional[str]:
+        """Return the provider account explicitly bound by the tenant caller."""
+        return self._account_id
 
     async def _request(self, method: str, endpoint: str, **kwargs) -> dict:
-        """Make an async HTTP request to Unipile API. Raises on failure."""
+        """Make an async HTTP request to Unipile API.
+
+        Retries 429 (rate-limited) and 5xx (upstream error) responses up to
+        MAX_RETRIES times with jittered exponential backoff, honoring a
+        Retry-After header when Unipile sends one. Any other status raises
+        immediately. Raises UnipileAPIError once retries are exhausted.
+        """
         url = f"{self.base_url}/{endpoint}"
 
-        async with httpx.AsyncClient(timeout=TIMEOUT) as client:
-            response = await client.request(
-                method=method.upper(),
-                url=url,
-                headers=self.headers,
-                **kwargs,
-            )
+        for attempt in range(MAX_RETRIES + 1):
+            async with httpx.AsyncClient(timeout=TIMEOUT) as client:
+                response = await client.request(
+                    method=method.upper(),
+                    url=url,
+                    headers=self.headers,
+                    **kwargs,
+                )
 
-        if response.status_code in (200, 201):
-            return response.json()
+            if response.status_code in (200, 201):
+                return response.json()
 
-        error_text = response.text
-        logger.error(f"Unipile API {method} {endpoint} failed: {response.status_code} - {error_text}")
-        raise UnipileAPIError(response.status_code, error_text)
+            if response.status_code == 429 or response.status_code >= 500:
+                if attempt < MAX_RETRIES:
+                    retry_after = parse_retry_after(response.headers.get("Retry-After"))
+                    wait = retry_after if retry_after is not None else backoff_with_jitter(attempt)
+                    logger.warning(
+                        f"Unipile API {method} {endpoint} returned {response.status_code} "
+                        f"(attempt {attempt + 1}/{MAX_RETRIES + 1}), retry in {wait:.1f}s"
+                    )
+                    await asyncio.sleep(wait)
+                    continue
+
+            error_text = response.text
+            logger.error(f"Unipile API {method} {endpoint} failed: {response.status_code} - {error_text}")
+            raise UnipileAPIError(response.status_code, error_text)
+
+        # Unreachable — the loop above always returns or raises.
+        raise UnipileAPIError(0, "Unipile API request failed with no response")
 
     async def _request_form(self, method: str, endpoint: str, data: dict) -> dict:
-        """Make a multipart/form-data request to Unipile API (required for InMail)."""
+        """Make a multipart/form-data request to Unipile API (required for InMail).
+
+        Same 429/5xx retry behavior as `_request` (see there for details).
+        """
         url = f"{self.base_url}/{endpoint}"
         headers = {
             "X-API-KEY": settings.unipile_token,
@@ -87,20 +127,35 @@ class UnipileClient:
             "accept": "application/json",
         }
 
-        async with httpx.AsyncClient(timeout=TIMEOUT) as client:
-            response = await client.request(
-                method=method.upper(),
-                url=url,
-                headers=headers,
-                data=data,
-            )
+        for attempt in range(MAX_RETRIES + 1):
+            async with httpx.AsyncClient(timeout=TIMEOUT) as client:
+                response = await client.request(
+                    method=method.upper(),
+                    url=url,
+                    headers=headers,
+                    data=data,
+                )
 
-        if response.status_code in (200, 201):
-            return response.json()
+            if response.status_code in (200, 201):
+                return response.json()
 
-        error_text = response.text
-        logger.error(f"Unipile API {method} {endpoint} failed: {response.status_code} - {error_text}")
-        raise UnipileAPIError(response.status_code, error_text)
+            if response.status_code == 429 or response.status_code >= 500:
+                if attempt < MAX_RETRIES:
+                    retry_after = parse_retry_after(response.headers.get("Retry-After"))
+                    wait = retry_after if retry_after is not None else backoff_with_jitter(attempt)
+                    logger.warning(
+                        f"Unipile API {method} {endpoint} returned {response.status_code} "
+                        f"(attempt {attempt + 1}/{MAX_RETRIES + 1}), retry in {wait:.1f}s"
+                    )
+                    await asyncio.sleep(wait)
+                    continue
+
+            error_text = response.text
+            logger.error(f"Unipile API {method} {endpoint} failed: {response.status_code} - {error_text}")
+            raise UnipileAPIError(response.status_code, error_text)
+
+        # Unreachable — the loop above always returns or raises.
+        raise UnipileAPIError(0, "Unipile API request failed with no response")
 
     async def get_accounts(self) -> list[dict]:
         """Get all connected Unipile accounts."""
@@ -110,6 +165,11 @@ class UnipileClient:
         for acc in items:
             logger.debug(f"  Account: id={acc.get('id')} provider={acc.get('provider')} type={acc.get('type')}")
         return items
+
+    async def get_account(self) -> dict:
+        """Retrieve only the explicitly bound provider account."""
+        account_id = await self.get_linkedin_account_id()
+        return await self._request("GET", f"accounts/{account_id}")
 
     async def get_linkedin_account_id(self) -> str:
         """Get the LinkedIn account ID, caching after first call."""
@@ -139,13 +199,27 @@ class UnipileClient:
         return data
 
     async def get_chat_messages(self, chat_id: str, limit: int = 50) -> dict:
-        """Get messages for a specific chat."""
+        """Get messages for a chat, returning only bound-account messages."""
+        account_id = await self.get_linkedin_account_id()
         data = await self._request(
             "GET", f"chats/{chat_id}/messages",
             params={"limit": limit},
         )
-        logger.info(f"Retrieved {len(data.get('items', []))} messages for chat {chat_id}")
-        return data
+        items = data.get("items", [])
+        owned_items = [
+            message
+            for message in items
+            if str(message.get("account_id") or "") == account_id
+        ]
+        if len(owned_items) != len(items):
+            logger.warning(
+                "Discarded %s chat messages outside bound Unipile account",
+                len(items) - len(owned_items),
+            )
+        scoped = dict(data)
+        scoped["items"] = owned_items
+        logger.info(f"Retrieved {len(owned_items)} messages for chat {chat_id}")
+        return scoped
 
     async def get_profile(self, identifier: str) -> dict:
         """
@@ -162,16 +236,38 @@ class UnipileClient:
         logger.info(f"Retrieved profile for {identifier}: provider_id={data.get('provider_id')}")
         return data
 
-    async def get_user_posts(self, identifier: str, limit: int = 20) -> list[dict]:
+    async def get_user_posts(self, identifier: str, limit: int = 20, account_id: Optional[str] = None) -> list[dict]:
         """
         Fetch the connected user's own LinkedIn posts via Unipile.
         Fully defensive — returns [] on any failure (endpoint shape varies by Unipile version).
+
+        Pass `account_id` (the tenant-scoped Unipile account id, e.g. linkedin_accounts.unipile_account_id)
+        when the caller already knows which LinkedIn account to use — otherwise this falls back to
+        get_linkedin_account_id(), which returns the FIRST LinkedIn account found across the whole
+        Unipile workspace and can leak a different tenant's account in a multi-tenant deployment.
         """
         try:
-            account_id = await self.get_linkedin_account_id()
+            if not account_id:
+                account_id = await self.get_linkedin_account_id()
+
+            # Unipile's /users/{id}/posts endpoint requires the internal
+            # provider_id, not the public slug. Resolve it first (public slugs
+            # like "john-doe-123" 404 or return empty on the posts endpoint).
+            provider_id = identifier
+            if not identifier.startswith("ACo"):  # LinkedIn provider ids start with "ACo"
+                profile = await self._request(
+                    "GET",
+                    f"users/{identifier}",
+                    params={"account_id": account_id},
+                )
+                provider_id = profile.get("provider_id") or identifier
+                logger.info(
+                    f"[voice-sync] resolved public_id={identifier} -> provider_id={provider_id}"
+                )
+
             data = await self._request(
                 "GET",
-                f"users/{identifier}/posts",
+                f"users/{provider_id}/posts",
                 params={"account_id": account_id, "limit": limit},
             )
             items = data.get("items") or data.get("posts") or []
@@ -189,7 +285,11 @@ class UnipileClient:
                     })
             return out
         except Exception as e:
-            logger.warning(f"Unipile posts fetch failed for {identifier}: {e}")
+            logger.error(
+                f"[voice-sync] Unipile posts fetch failed for identifier={identifier} "
+                f"account_id={account_id}: {e}",
+                exc_info=True,
+            )
             return []
 
     async def get_profile_data_for_enrichment(self, linkedin_url: str) -> dict | None:
@@ -294,7 +394,10 @@ class UnipileClient:
         Returns:
             API response with message_id
         """
-        payload = {"text": text}
+        account_id = await self.get_linkedin_account_id()
+        # Unipile rejects an account mismatch when account_id is present,
+        # preventing a tenant from sending into another account's chat id.
+        payload = {"text": text, "account_id": account_id}
         result = await self._request("POST", f"chats/{chat_id}/messages", json=payload)
         logger.info(f"Message sent in chat {chat_id}")
         return result
@@ -403,18 +506,12 @@ class UnipileClient:
         Returns:
             Dict with InMail balance info
         """
-        data = await self._request("GET", "linkedin/inmail_balance")
+        account_id = await self.get_linkedin_account_id()
+        data = await self._request(
+            "GET", "linkedin/inmail_balance", params={"account_id": account_id}
+        )
         logger.info(f"InMail balance: {data}")
         return data
-
-    async def send_connection_request_async(self, profile_url: str, message: str = None):
-        return await self.send_connection_request(profile_url, message)
-
-    async def send_inmail_async(self, profile_url: str, subject: str, body: str):
-        return await self.send_inmail(profile_url, body, subject)
-
-    async def send_message_async(self, chat_id: str, message: str):
-        return await self.send_message(chat_id, message)
 
 
 class UnipileAPIError(Exception):

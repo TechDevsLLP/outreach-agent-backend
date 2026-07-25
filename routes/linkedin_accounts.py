@@ -5,18 +5,23 @@ Connects LinkedIn accounts via Unipile's hosted auth flow.
 Router prefix: /api/linkedin-accounts
 """
 
+import json
+import logging
 from datetime import datetime, timezone, timedelta
-from typing import Optional
+from typing import Literal, Optional
 
 import httpx
 from bson import ObjectId
-from fastapi import APIRouter, BackgroundTasks, Depends, HTTPException, Query, status
-from pydantic import BaseModel
+from fastapi import APIRouter, BackgroundTasks, Depends, HTTPException, Query, Request, status
+from pydantic import BaseModel, Field
 
 from auth import get_account_context
 from config import get_settings
 import database
 from models.linkedin_account import LinkedInAccountDocument, LinkedInAccountResponse
+from routes.webhooks import _verify_unipile_signature
+
+logger = logging.getLogger(__name__)
 
 router = APIRouter(prefix="/api/linkedin-accounts", tags=["LinkedIn Accounts"])
 
@@ -178,6 +183,88 @@ def _extract_profile_fields(profile_data: dict, user_profile: Optional[dict] = N
     }
 
 
+async def _upsert_linkedin_account_from_unipile(
+    unipile_account_id: str,
+    account_id: str,
+    user_id: str,
+    fallback_status: str,
+    settings,
+    background_tasks: BackgroundTasks,
+) -> None:
+    """
+    Idempotently create/update a linkedin_accounts record from Unipile data.
+
+    Race-safe against concurrent callers (notify webhook, /connect/webhook, /sync)
+    via upsert keyed on the unique unipile_account_id index (database.py). Fires
+    replan_channels_on_sender_add exactly once, only on first creation.
+    """
+    now = datetime.now(timezone.utc)
+
+    profile_data = await _fetch_unipile_profile(unipile_account_id, settings)
+    partial = _extract_profile_fields(profile_data)
+    user_profile: dict = {}
+    if partial.get("public_id"):
+        user_profile = await _fetch_unipile_user_profile(unipile_account_id, partial["public_id"], settings)
+    profile_fields = _extract_profile_fields(profile_data, user_profile)
+    unipile_status = profile_fields.pop("unipile_status", fallback_status)
+
+    result = await database.linkedin_accounts_collection.update_one(
+        {"unipile_account_id": unipile_account_id},
+        {
+            "$set": {
+                **profile_fields,
+                "unipile_status": unipile_status,
+                "last_profile_sync_at": now,
+                "updated_at": now,
+            },
+            "$setOnInsert": {
+                "account_id": account_id,
+                "user_id": user_id,
+                "unipile_account_id": unipile_account_id,
+                "daily_connection_limit": 25,
+                "daily_inmail_limit": 10,
+                "daily_message_limit": 30,
+                "warmup_enabled": True,
+                "warmup_status": "warming",
+                "warmup_day": 0,
+                "warmup_started_at": now,
+                "created_at": now,
+            },
+        },
+        upsert=True,
+    )
+
+    if result.upserted_id is not None:
+        from services.campaign_launch_service import replan_channels_on_sender_add
+        background_tasks.add_task(replan_channels_on_sender_add, account_id, "linkedin")
+        # First LinkedIn connect for this tenant: sync the sender voice profile
+        # in the background so outreach generation has voice data even when the
+        # user connected LinkedIn outside/after the onboarding wizard stage 2.
+        background_tasks.add_task(_sync_sender_voice_after_connect, account_id)
+
+
+async def _sync_sender_voice_after_connect(account_id: str) -> None:
+    """Background: pull posts + synthesize sender voice after a LinkedIn connect.
+
+    Skips if a good (non-low-confidence) voice profile already exists so a
+    reconnect never clobbers a curated profile. Errors are logged and recorded
+    on company_profiles.sender_voice_sync_error by the service — never raised.
+    """
+    try:
+        profile = await database.company_profiles_collection.find_one(
+            {"account_id": account_id},
+            {"sender_voice_profile": 1},
+        )
+        existing = (profile or {}).get("sender_voice_profile") or {}
+        if existing and not existing.get("low_confidence"):
+            logger.info(f"[voice-sync] account={account_id}: voice profile already present, skipping post-connect sync")
+            return
+        from services.sender_voice_service import update_sender_voice_from_unipile
+        await update_sender_voice_from_unipile(account_id)
+    except Exception as e:
+        logger.error(f"[voice-sync] post-connect voice sync failed for account={account_id}: {e}", exc_info=True)
+
+
 # ---------------------------------------------------------------------------
 # GET /api/linkedin-accounts
 # ---------------------------------------------------------------------------
@@ -204,86 +291,15 @@ async def sync_linkedin_accounts_from_unipile(
     account_ctx: dict = Depends(get_account_context),
 ):
     """
-    Import any Unipile LinkedIn accounts not yet in MongoDB for this organization.
+    Retired: workspace-wide account discovery cannot prove tenant ownership.
 
-    Fetches all accounts from Unipile, filters to LinkedIn type, and creates
-    local records for any that are unclaimed (not yet linked to any organization).
-    Idempotent — safe to call multiple times.
+    The hosted-auth callback is the only supported linking path because it
+    carries the account context established before the provider redirect.
     """
-    from services.unipile_service import UnipileClient, UnipileAPIError as _UnipileAPIError
-
-    settings = get_settings()
-    account_id = account_ctx["account"]["_id"]
-    user_id = account_ctx["user"]["_id"]
-    now = datetime.now(timezone.utc)
-
-    # Fetch all Unipile accounts
-    try:
-        client = UnipileClient()
-        all_accounts = await client.get_accounts()
-    except Exception as exc:
-        raise HTTPException(
-            status_code=status.HTTP_502_BAD_GATEWAY,
-            detail=f"Failed to fetch Unipile accounts: {exc}",
-        )
-
-    # Filter to LinkedIn-type accounts only
-    linkedin_accounts = [
-        acc for acc in all_accounts
-        if (acc.get("type") or acc.get("provider") or "").upper() == "LINKEDIN"
-    ]
-
-    if not linkedin_accounts:
-        return {"message": "No LinkedIn accounts found in Unipile", "synced": 0}
-
-    # Find which unipile_account_ids are already claimed by ANY organization
-    all_unipile_ids = [acc["id"] for acc in linkedin_accounts]
-    cursor = database.linkedin_accounts_collection.find(
-        {"unipile_account_id": {"$in": all_unipile_ids}},
-        {"unipile_account_id": 1},
+    raise HTTPException(
+        status_code=status.HTTP_409_CONFLICT,
+        detail="Workspace account sync is disabled. Connect LinkedIn using hosted auth.",
     )
-    claimed_ids = {doc["unipile_account_id"] async for doc in cursor}
-
-    # Import unclaimed accounts into this organization
-    synced = 0
-    for acc in linkedin_accounts:
-        unipile_id = acc["id"]
-        if unipile_id in claimed_ids:
-            continue
-
-        # Fetch profile details from Unipile (account status + user profile)
-        try:
-            profile_data = await _fetch_unipile_profile(unipile_id, settings)
-            # First pass to extract public_id so we can call the users endpoint
-            partial = _extract_profile_fields(profile_data)
-            user_profile: dict = {}
-            if partial.get("public_id"):
-                user_profile = await _fetch_unipile_user_profile(unipile_id, partial["public_id"], settings)
-            profile_fields = _extract_profile_fields(profile_data, user_profile)
-        except Exception:
-            profile_fields = {"unipile_status": acc.get("status", "OK")}
-
-        doc = LinkedInAccountDocument(
-            account_id=account_id,
-            user_id=user_id,
-            unipile_account_id=unipile_id,
-            unipile_status=profile_fields.pop("unipile_status", acc.get("status", "OK")),
-            profile_id=profile_fields.get("profile_id"),
-            public_id=profile_fields.get("public_id"),
-            name=profile_fields.get("name"),
-            headline=profile_fields.get("headline"),
-            profile_photo_url=profile_fields.get("profile_photo_url"),
-            profile_url=profile_fields.get("profile_url"),
-            connections_count=profile_fields.get("connections_count"),
-            followers_count=profile_fields.get("followers_count"),
-            last_profile_sync_at=now,
-            created_at=now,
-            updated_at=now,
-        )
-        await database.linkedin_accounts_collection.insert_one(doc.model_dump())
-        synced += 1
-
-    return {"message": f"Synced {synced} new LinkedIn account(s)", "synced": synced}
 
 
 # ---------------------------------------------------------------------------
@@ -300,6 +316,7 @@ async def initiate_hosted_auth(
     """
     settings = get_settings()
     account_id = account_ctx["account"]["_id"]
+    user_id = account_ctx["user"]["_id"]
 
     # Build redirect URLs — the frontend can override these via query params if needed
     frontend_url = settings.frontend_url
@@ -313,14 +330,18 @@ async def initiate_hosted_auth(
     )
     api_url = settings.unipile_base_url.removesuffix("/api/v1")
 
+    # "name" is echoed back verbatim on the notify_url callback — it's the only way
+    # to carry our tenant + user identity through Unipile's hosted-auth flow back to
+    # the notify webhook, since Unipile has no concept of our JWT/session.
     payload = {
         "type": "create",
         "providers": ["LINKEDIN"],
         "expiresOn": expires_on,
         "api_url": api_url,
-        "name": str(account_id),
+        "name": f"{account_id}:{user_id}",
         "success_redirect_url": success_redirect_url,
         "failure_redirect_url": failure_redirect_url,
+        "notify_url": f"{settings.api_base_url}/api/linkedin-accounts/connect/notify",
     }
 
     async with httpx.AsyncClient() as client:
@@ -363,59 +384,86 @@ async def linkedin_webhook(
     account_ctx: dict = Depends(get_account_context),
 ):
     """
-    Called by Unipile after a successful LinkedIn OAuth flow.
-    Creates or updates the linkedin_accounts record and fetches the profile.
+    Authenticated fallback: lets a logged-in frontend confirm a LinkedIn connection
+    itself if it somehow already knows the Unipile account id. Unipile itself cannot
+    call this route (it carries no JWT) — the real Unipile callback is the public
+    /connect/notify route below, wired via notify_url in initiate_hosted_auth.
     """
     settings = get_settings()
     account_id = account_ctx["account"]["_id"]
     user_id = account_ctx["user"]["_id"]
-    now = datetime.now(timezone.utc)
 
-    # Fetch profile from Unipile (account status + user profile for photo/stats)
-    profile_data = await _fetch_unipile_profile(body.unipile_account_id, settings)
-    partial = _extract_profile_fields(profile_data)
-    user_profile: dict = {}
-    if partial.get("public_id"):
-        user_profile = await _fetch_unipile_user_profile(body.unipile_account_id, partial["public_id"], settings)
-    profile_fields = _extract_profile_fields(profile_data, user_profile)
-
-    existing = await database.linkedin_accounts_collection.find_one(
-        {"unipile_account_id": body.unipile_account_id}
+    await _upsert_linkedin_account_from_unipile(
+        unipile_account_id=body.unipile_account_id,
+        account_id=account_id,
+        user_id=user_id,
+        fallback_status=body.status,
+        settings=settings,
+        background_tasks=background_tasks,
     )
 
-    if existing:
-        update_fields = {
-            **profile_fields,
-            "last_profile_sync_at": now,
-            "updated_at": now,
-        }
-        await database.linkedin_accounts_collection.update_one(
-            {"_id": existing["_id"]},
-            {"$set": update_fields},
-        )
-    else:
-        doc = LinkedInAccountDocument(
-            account_id=account_id,
-            user_id=user_id,
-            unipile_account_id=body.unipile_account_id,
-            unipile_status=profile_fields.pop("unipile_status", body.status),
-            profile_id=profile_fields.get("profile_id"),
-            public_id=profile_fields.get("public_id"),
-            name=profile_fields.get("name"),
-            headline=profile_fields.get("headline"),
-            profile_photo_url=profile_fields.get("profile_photo_url"),
-            profile_url=profile_fields.get("profile_url"),
-            connections_count=profile_fields.get("connections_count"),
-            followers_count=profile_fields.get("followers_count"),
-            last_profile_sync_at=now,
-            created_at=now,
-            updated_at=now,
-        )
-        await database.linkedin_accounts_collection.insert_one(doc.model_dump())
-        from services.campaign_launch_service import replan_channels_on_sender_add
-        background_tasks.add_task(replan_channels_on_sender_add, account_id, "linkedin")
-
     return {"message": "LinkedIn account connected"}
+
+
+# ---------------------------------------------------------------------------
+# POST /api/linkedin-accounts/connect/notify
+# ---------------------------------------------------------------------------
+
+@router.post("/connect/notify")
+async def linkedin_connect_notify(request: Request, background_tasks: BackgroundTasks):
+    """
+    Public Unipile hosted-auth callback (notify_url set in initiate_hosted_auth).
+
+    Unlike /connect/webhook, this carries no JWT — Unipile calls it directly once
+    the hosted-auth flow completes, so the onboarding UI's connection state is
+    reflected server-side even if the frontend tab is never refocused (e.g. the
+    popup lingers on a success screen through a slow 2FA login).
+
+    Tenant + user identity is recovered from the "name" field we set on the
+    hosted-auth request (f"{account_id}:{user_id}" in initiate_hosted_auth), since
+    Unipile echoes it back verbatim.
+    """
+    settings = get_settings()
+    body = await request.body()
+    x_webhook_secret = request.headers.get("X-Webhook-Secret", "")
+    x_unipile_signature = request.headers.get("X-Unipile-Signature", "")
+    x_unipile_timestamp = request.headers.get("X-Unipile-Timestamp", "")
+    sig = x_unipile_signature or x_webhook_secret
+
+    if not _verify_unipile_signature(settings.unipile_webhook_secret, body, sig, x_unipile_timestamp):
+        logger.warning("Unipile connect/notify verification failed")
+        raise HTTPException(status_code=403, detail="Invalid webhook secret")
+
+    try:
+        payload = json.loads(body)
+    except Exception:
+        raise HTTPException(status_code=400, detail="Invalid JSON")
+
+    unipile_status = str(payload.get("status") or "")
+    unipile_account_id = payload.get("account_id")
+    name = payload.get("name") or ""
+
+    # Only a successful (re)connection creates/updates a record — everything else
+    # (CREATION_FAILED, etc.) is ack'd so Unipile doesn't retry.
+    if unipile_status.upper() not in ("CREATION_SUCCESS", "RECONNECTED") or not unipile_account_id:
+        logger.info(f"Ignoring Unipile connect/notify status={unipile_status!r}")
+        return {"status": "ignored"}
+
+    account_id, _, user_id = name.partition(":")
+    if not account_id:
+        logger.warning(f"Unipile connect/notify missing account_id in name={name!r}")
+        return {"status": "ignored", "reason": "missing account_id in name"}
+
+    await _upsert_linkedin_account_from_unipile(
+        unipile_account_id=unipile_account_id,
+        account_id=account_id,
+        user_id=user_id,  # "" if the name had no ":" (stale/malformed link) — account_id is still correct
+        fallback_status=unipile_status or "OK",
+        settings=settings,
+        background_tasks=background_tasks,
+    )
+
+    return {"status": "ok"}
 
 
 # ---------------------------------------------------------------------------
@@ -431,6 +479,46 @@ async def get_linkedin_account(
     account_id = account_ctx["account"]["_id"]
     doc = await _get_linkedin_account_or_404(linkedin_account_id, account_id)
     return _serialize_linkedin_account(doc)
+
+
+class LinkedInAccountUpdateRequest(BaseModel):
+    daily_connection_limit: Optional[int] = Field(default=None, ge=1, le=80)
+    daily_inmail_limit: Optional[int] = Field(default=None, ge=1, le=20)
+    daily_message_limit: Optional[int] = Field(default=None, ge=1, le=50)
+    warmup_enabled: Optional[bool] = None
+    warmup_status: Optional[Literal["warming", "active", "paused"]] = None
+
+
+@router.patch("/{linkedin_account_id}", response_model=LinkedInAccountResponse)
+async def update_linkedin_account(
+    linkedin_account_id: str,
+    body: LinkedInAccountUpdateRequest,
+    account_ctx: dict = Depends(get_account_context),
+):
+    """Configure channel-specific safety limits and sender warm-up state."""
+    account_id = account_ctx["account"]["_id"]
+    doc = await _get_linkedin_account_or_404(linkedin_account_id, account_id)
+    update_fields = {
+        key: value
+        for key, value in body.model_dump(exclude_none=True).items()
+    }
+    update_fields["updated_at"] = datetime.now(timezone.utc)
+    if body.warmup_enabled is True and not doc.get("warmup_started_at"):
+        update_fields["warmup_started_at"] = datetime.now(timezone.utc)
+        update_fields.setdefault("warmup_status", "warming")
+    elif body.warmup_enabled is False:
+        update_fields["warmup_status"] = "active"
+    if body.warmup_status == "warming" and not doc.get("warmup_started_at"):
+        update_fields["warmup_started_at"] = datetime.now(timezone.utc)
+
+    await database.linkedin_accounts_collection.update_one(
+        {"_id": doc["_id"], "account_id": account_id},
+        {"$set": update_fields},
+    )
+    updated = await database.linkedin_accounts_collection.find_one(
+        {"_id": doc["_id"], "account_id": account_id}
+    )
+    return _serialize_linkedin_account(updated)
 
 
 # ---------------------------------------------------------------------------
@@ -570,3 +658,26 @@ async def list_connection_requests(
         doc["_id"] = str(doc["_id"])
 
     return docs
+
+
+# ---------------------------------------------------------------------------
+# Hosted auth completion signal (polled by frontend after popup closes)
+# ---------------------------------------------------------------------------
+
+@router.get("/pending-auth/{account_name}")
+async def pending_auth_status(
+    account_name: str,
+    account_ctx: dict = Depends(get_account_context),
+):
+    """
+    Lightweight check if a LinkedIn account connected via hosted auth.
+    The frontend polls this after the hosted-auth popup returns.
+
+    Returns {connected: bool, account_id: str | null}.
+    """
+    doc = await database.linkedin_accounts_collection.find_one(
+        {"account_id": account_ctx["account"]["_id"], "unipile_account_id": account_name},
+    )
+    if doc:
+        return {"connected": True, "account_id": str(doc["_id"])}
+    return {"connected": False, "account_id": None}

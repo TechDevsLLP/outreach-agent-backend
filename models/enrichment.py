@@ -1,4 +1,4 @@
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, ConfigDict, Field
 from typing import Optional
 from datetime import datetime
 
@@ -6,6 +6,7 @@ from datetime import datetime
 class EnrichmentTriggerRequest(BaseModel):
     """Request to trigger the enrichment pipeline."""
     prospect_ids: Optional[list[str]] = None
+    campaign_id: Optional[str] = None
     enrich_all_unenriched: bool = False
     filter_min_score: Optional[float] = None
     filter_status: Optional[str] = None
@@ -46,13 +47,13 @@ class EnrichmentRunResponse(EnrichmentRunDocument):
     """Enrichment run response with MongoDB _id as string."""
     id: str = Field(alias="_id")
 
-    class Config:
-        populate_by_name = True
+    model_config = ConfigDict(populate_by_name=True)
 
 
 class EnrichByIndustryRequest(BaseModel):
     """Request to enrich top prospects per industry."""
     industry_ids: Optional[list[str]] = None
+    campaign_id: Optional[str] = None
     max_per_industry: int = Field(default=50, ge=1, le=200)
     min_score: float = Field(default=0, ge=0)
     skip_profile_scrape: bool = False
@@ -60,5 +61,3 @@ class EnrichByIndustryRequest(BaseModel):
     skip_ai_assessment: bool = False
     skip_outreach: bool = True  # outreach generation disabled by default
     skip_pre_enrichment_triage: bool = False
-
-

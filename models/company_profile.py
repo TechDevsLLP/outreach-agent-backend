@@ -45,8 +45,8 @@ class CompanyProfileBase(BaseModel):
     # Voice & tone
     tone_of_voice: str = "professional"  # professional/casual/bold/friendly
 
-    # Social proof — stored as CaseStudy dicts {client, outcome, metric, industry}
-    case_studies: list[dict] = Field(default_factory=list)
+    # Social proof — stored as plain text strings
+    case_studies: list[str] = Field(default_factory=list)
 
     # Sender context
     sender_name: str
@@ -134,7 +134,7 @@ class CompanyProfileUpsertRequest(BaseModel):
     differentiators: Optional[list[str]] = None
     pain_points: Optional[list[str]] = None
     tone_of_voice: Optional[str] = None
-    case_studies: Optional[list[dict]] = None  # list of CaseStudy dicts
+    case_studies: Optional[list[str]] = None
     sender_name: Optional[str] = None
     sender_role: Optional[str] = None
     outreach_strategy: Optional[str] = None

@@ -58,14 +58,14 @@ async def _get_healthy_sender(sender_id: str, channel: str) -> Optional[dict]:
     """Return the sender doc if it exists, is active, and has remaining cap for this channel."""
     try:
         collection = _collection_for_channel(channel)
-        if not collection:
+        if collection is None:
             return None
         sender = await collection.find_one({"_id": ObjectId(sender_id)})
         if not sender:
             return None
         if sender.get("status") in ("paused", "disabled", "error"):
             return None
-        if not _has_remaining_cap(sender, channel):
+        if await _remaining_cap(sender, channel) <= 0:
             return None
         return sender
     except Exception as e:
@@ -76,27 +76,17 @@ async def _get_healthy_sender(sender_id: str, channel: str) -> Optional[dict]:
 async def _pick_from_pool(account_id: str, channel: str) -> Optional[dict]:
     """Pick the sender with most remaining daily cap for this channel."""
     collection = _collection_for_channel(channel)
-    if not collection:
+    if collection is None:
         return None
 
-    query = {"account_id": account_id}
-    if channel in ("email",):
-        query["status"] = {"$nin": ["paused", "disabled", "error"]}
-    else:
-        query["status"] = {"$nin": ["paused", "disabled", "error"]}
+    query = {"account_id": account_id, "status": {"$nin": ["paused", "disabled", "error"]}}
 
     candidates = await collection.find(query).to_list(length=20)
     if not candidates:
         return None
 
-    # Sort by remaining daily cap descending
-    def remaining_cap(sender: dict) -> int:
-        cap_key = _cap_key_for_channel(channel)
-        limit = sender.get("daily_cap", {}).get(cap_key) or _default_cap(channel)
-        used = sender.get("daily_usage", {}).get(cap_key, 0)
-        return max(0, limit - used)
-
-    candidates_with_cap = [(s, remaining_cap(s)) for s in candidates]
+    # Sort by remaining daily cap (real usage from sender_daily_caps) descending
+    candidates_with_cap = [(s, await _remaining_cap(s, channel)) for s in candidates]
     candidates_with_cap.sort(key=lambda x: x[1], reverse=True)
 
     best_sender, best_remaining = candidates_with_cap[0]
@@ -115,30 +105,29 @@ def _collection_for_channel(channel: str):
     return None
 
 
-def _cap_key_for_channel(channel: str) -> str:
-    cap_map = {
-        "email": "email",
-        "linkedin_connection": "connections",
-        "linkedin_inmail": "inmails",
-        "linkedin_message": "messages",
-        "linkedin_dm": "messages",
-    }
-    return cap_map.get(channel, channel)
+async def _remaining_cap(sender: dict, channel: str) -> int:
+    """Real remaining daily capacity for this sender+channel.
 
+    Reads today's usage from the ``sender_daily_caps`` collection — the same
+    collection ``daily_cap_service.reserve_sender_slot`` atomically increments
+    (``daily_send_state.{date}.{channel}``) — rather than the ``daily_cap`` /
+    ``daily_usage`` fields on the sender doc, which nothing in the codebase
+    ever writes. The configured limit comes from
+    ``daily_cap_service.sender_policy`` so warm-up ramps and provider ceilings
+    are honored identically to the reservation path.
+    """
+    from datetime import datetime, timezone
+    from services.daily_cap_service import sender_policy, CHANNEL_TO_CAP_KEY
 
-def _default_cap(channel: str) -> int:
-    defaults = {
-        "email": 50,
-        "linkedin_connection": 25,
-        "linkedin_inmail": 10,
-        "linkedin_message": 30,
-        "linkedin_dm": 30,
-    }
-    return defaults.get(channel, 0)
-
-
-def _has_remaining_cap(sender: dict, channel: str) -> bool:
-    cap_key = _cap_key_for_channel(channel)
-    limit = sender.get("daily_cap", {}).get(cap_key) or _default_cap(channel)
-    used = sender.get("daily_usage", {}).get(cap_key, 0)
-    return (limit - used) > 0
+    cap_key = CHANNEL_TO_CAP_KEY.get(channel)
+    if not cap_key:
+        return 0
+    limit = sender_policy(sender, channel)["limit"]
+    if limit <= 0:
+        return 0
+    date_key = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+    usage_doc = await database.db.sender_daily_caps.find_one(
+        {"_id": str(sender["_id"])}, {f"daily_send_state.{date_key}.{cap_key}": 1}
+    )
+    used = (((usage_doc or {}).get("daily_send_state") or {}).get(date_key) or {}).get(cap_key, 0)
+    return max(0, limit - used)

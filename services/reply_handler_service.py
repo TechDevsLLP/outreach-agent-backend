@@ -2,11 +2,18 @@
 Reply Handler Service.
 Routes classified inbound replies to category-specific handlers.
 
+No handler ever sends to a prospect. Every category that produces copy stages it
+on the conversation as ``ai_draft_reply`` (status "pending"); sending happens only
+when a human approves it via ai_reply_service.approve_draft, optionally with edits.
+
+POSITIVE stages a meeting proposal (slots and booking token are created up front so
+the approved copy is exactly what was reviewed). QUESTION, SOFT_OBJECTION and
+non-hostile HARD_OBJECTION stage a drafted reply. Hostile HARD_OBJECTION and
+UNSUBSCRIBE produce no copy at all and escalate to a human. OOO only pauses the
+enrollment until the parsed return date.
+
 Reply latency contract: by the time this handler is called, the scheduled_reply_at
 delay has already elapsed (enforced by the classifier poller in reply_classifier_service.py).
-Handlers that auto-send do so immediately — no additional delay here.
-
-Escalated categories (HARD_OBJECTION hostile, UNSUBSCRIBE) never auto-send.
 """
 
 import logging
@@ -23,6 +30,7 @@ from database import (
     suppressions_collection,
 )
 from services.openrouter_service import OpenRouterClient
+from services.conversation_service import _account_filter
 from utils.prompts import (
     build_reply_positive_prompt,
     build_reply_question_prompt,
@@ -35,6 +43,7 @@ from utils.prompts import (
     REPLY_HARD_OBJECTION_SYSTEM_PROMPT,
     REPLY_OOO_SYSTEM_PROMPT,
     _redact_banned_phrases,
+    sanitize_generated_text,
 )
 
 logger = logging.getLogger(__name__)
@@ -55,10 +64,15 @@ async def handle_classified_reply(
     account_id = classification.get("account_id", "")
     prospect_id = classification.get("prospect_id")
 
+    if not account_id:
+        raise ValueError("Classified reply is missing tenant account_id")
+
     # Fetch supporting context
     enrollment = None
     if enrollment_id:
-        enrollment = await campaign_enrollments_collection.find_one({"_id": ObjectId(enrollment_id)})
+        enrollment = await campaign_enrollments_collection.find_one(
+            {"_id": ObjectId(enrollment_id), **_account_filter(account_id)}
+        )
 
     company_profile = None
     if account_id:
@@ -82,7 +96,17 @@ async def handle_classified_reply(
         "OOO": _handle_ooo,
         "UNSUBSCRIBE": _handle_unsubscribe,
     }
-    handler = handler_map.get(category, _handle_question)
+    handler = handler_map.get(category)
+    if handler is None:
+        # Unparseable/unrecognized category (e.g. PARSE_FAILED) — never guess
+        # an auto-send category, escalate to a human instead.
+        await _escalate_to_human(
+            enrollment_id=enrollment_id,
+            conversation_id=conversation_id,
+            account_id=account_id,
+            reason=f"Unrecognized classification category: {category}",
+        )
+        return
 
     try:
         await handler(
@@ -110,7 +134,7 @@ async def _handle_positive(
     prospect_name, company_name, message_text, conversation_context,
     account_id, enrollment_id, conversation_id, prospect_id, **_
 ):
-    """POSITIVE: propose 3 meeting slots and send immediately."""
+    """POSITIVE: propose 3 meeting slots as a draft awaiting human approval."""
     from services.meeting_service import propose_meeting
 
     if enrollment_id:
@@ -124,11 +148,11 @@ async def _handle_positive(
             company_name=company_name,
             message_text=message_text,
             conversation_context=conversation_context,
+            draft_only=True,
         )
     else:
         # Fallback: generate a positive reply without full meeting flow
         banned = (company_profile or {}).get("banned_phrases", [])
-        voice_profile = (company_profile or {}).get("sender_voice_profile")
 
         user_prompt = f"""Prospect: {prospect_name} @ {company_name}
 Their message: {message_text[:800]}
@@ -146,9 +170,26 @@ Express enthusiasm and propose booking a discovery call. Keep it under 80 words.
             max_tokens=250,
             temperature=0.7,
         )
-        reply_text = _redact_banned_phrases(result.get("content", "").strip(), banned)
+        reply_text = sanitize_generated_text(_redact_banned_phrases(result.get("content", "").strip(), banned))
         if reply_text:
-            await _send_auto_reply(conversation_id, reply_text, classification)
+            # Draft for approval rather than auto-sending, matching the
+            # enrollment-backed path above.
+            import uuid as _uuid
+            await conversations_collection.update_one(
+                {"_id": ObjectId(conversation_id), **_account_filter(account_id)},
+                {"$set": {
+                    "ai_draft_reply": {
+                        "draft_id": str(_uuid.uuid4()),
+                        "draft_text": reply_text,
+                        "generated_at": datetime.now(timezone.utc),
+                        "status": "pending",
+                        "conversation_id": conversation_id,
+                        "in_response_to": (message_text or "")[:200],
+                        "source": "positive_fallback",
+                    },
+                    "updated_at": datetime.now(timezone.utc),
+                }},
+            )
 
     # Update prospect status
     if prospect_id:
@@ -186,9 +227,9 @@ async def _handle_question(
         max_tokens=250,
         temperature=0.7,
     )
-    reply_text = _redact_banned_phrases(result.get("content", "").strip(), banned)
+    reply_text = sanitize_generated_text(_redact_banned_phrases(result.get("content", "").strip(), banned))
     if reply_text:
-        await _send_auto_reply(conversation_id, reply_text, classification)
+        await _stage_draft_reply(conversation_id, reply_text, classification)
 
     if prospect_id:
         await prospects_collection.update_one(
@@ -227,15 +268,15 @@ async def _handle_soft_objection(
         max_tokens=200,
         temperature=0.7,
     )
-    reply_text = _redact_banned_phrases(result.get("content", "").strip(), banned)
+    reply_text = sanitize_generated_text(_redact_banned_phrases(result.get("content", "").strip(), banned))
     if reply_text:
-        await _send_auto_reply(conversation_id, reply_text, classification)
+        await _stage_draft_reply(conversation_id, reply_text, classification)
 
     # Pause enrollment for 3 days
     if enrollment_id:
         resume_at = datetime.utcnow() + timedelta(days=3)
         await campaign_enrollments_collection.update_one(
-            {"_id": ObjectId(enrollment_id)},
+            {"_id": ObjectId(enrollment_id), **_account_filter(account_id)},
             {"$set": {"status": "paused", "next_action_at": resume_at}},
         )
 
@@ -284,14 +325,14 @@ async def _handle_hard_objection(
         max_tokens=150,
         temperature=0.6,
     )
-    reply_text = _redact_banned_phrases(result.get("content", "").strip(), banned)
+    reply_text = sanitize_generated_text(_redact_banned_phrases(result.get("content", "").strip(), banned))
     if reply_text:
-        await _send_auto_reply(conversation_id, reply_text, classification)
+        await _stage_draft_reply(conversation_id, reply_text, classification)
 
     # Close enrollment
     if enrollment_id:
         await campaign_enrollments_collection.update_one(
-            {"_id": ObjectId(enrollment_id)},
+            {"_id": ObjectId(enrollment_id), **_account_filter(account_id)},
             {"$set": {"status": "completed", "next_action_at": None}},
         )
 
@@ -337,7 +378,7 @@ async def _handle_ooo(
 
     if enrollment_id:
         await campaign_enrollments_collection.update_one(
-            {"_id": ObjectId(enrollment_id)},
+            {"_id": ObjectId(enrollment_id), **_account_filter(account_id)},
             {"$set": {
                 "status": "paused_ooo",
                 "ooo_resume_at": resume_at,
@@ -355,7 +396,9 @@ async def _handle_unsubscribe(
     """UNSUBSCRIBE: insert suppression, opt out enrollment, ALWAYS escalate. Never auto-send."""
     # Insert suppression records for all known identifiers
     suppression_ops = []
-    conv = await conversations_collection.find_one({"_id": ObjectId(conversation_id)}) if conversation_id else None
+    conv = await conversations_collection.find_one(
+        {"_id": ObjectId(conversation_id), **_account_filter(account_id)}
+    ) if conversation_id else None
 
     if conv:
         email = conv.get("prospect_email")
@@ -399,7 +442,7 @@ async def _handle_unsubscribe(
     # Opt out enrollment
     if enrollment_id:
         await campaign_enrollments_collection.update_one(
-            {"_id": ObjectId(enrollment_id)},
+            {"_id": ObjectId(enrollment_id), **_account_filter(account_id)},
             {"$set": {"status": "opted_out", "next_action_at": None}},
         )
 
@@ -421,19 +464,39 @@ async def _handle_unsubscribe(
 
 # ── Helpers ───────────────────────────────────────────────────────────────────
 
-async def _send_auto_reply(conversation_id: str, reply_text: str, classification: dict) -> None:
-    """Send a reply message via the conversation's channel."""
-    from services.conversation_service import send_reply
+async def _stage_draft_reply(conversation_id: str, reply_text: str, classification: dict) -> None:
+    """Stage a reply as a pending draft for human approval.
+
+    Nothing is ever sent to a prospect automatically. The draft lands on the
+    conversation as ``ai_draft_reply`` with status "pending"; approving it via
+    ai_reply_service.approve_draft (optionally with edits) is what sends it.
+    """
+    import uuid as _uuid
 
     try:
-        await send_reply(conversation_id=conversation_id, content_text=reply_text)
+        account_id = classification.get("account_id")
+        now = datetime.now(timezone.utc)
         await conversations_collection.update_one(
-            {"_id": ObjectId(conversation_id)},
-            {"$set": {"auto_reply_sent_at": datetime.now(timezone.utc)}},
+            {"_id": ObjectId(conversation_id), **_account_filter(account_id)},
+            {"$set": {
+                "ai_draft_reply": {
+                    "draft_id": str(_uuid.uuid4()),
+                    "draft_text": reply_text,
+                    "generated_at": now,
+                    "status": "pending",
+                    "conversation_id": conversation_id,
+                    "in_response_to": (classification.get("message_text") or "")[:200],
+                    "source": f"reply_handler:{classification.get('category', 'UNKNOWN')}",
+                },
+                "updated_at": now,
+            }},
         )
-        logger.info(f"Auto-reply sent for conversation {conversation_id}")
+        logger.info(
+            "Reply drafted (awaiting approval) for conversation %s [%s]",
+            conversation_id, classification.get("category"),
+        )
     except Exception as e:
-        logger.error(f"Failed to send auto-reply for conversation {conversation_id}: {e}")
+        logger.error(f"Failed to stage draft reply for conversation {conversation_id}: {e}")
 
 
 async def _escalate_to_human(
@@ -442,10 +505,10 @@ async def _escalate_to_human(
     account_id: str,
     reason: str,
 ) -> None:
-    """Mark enrollment as awaiting human attention and create a notification."""
+    """Mark enrollment and conversation as awaiting human attention and create a notification."""
     if enrollment_id:
         await campaign_enrollments_collection.update_one(
-            {"_id": ObjectId(enrollment_id)},
+            {"_id": ObjectId(enrollment_id), **_account_filter(account_id)},
             {"$set": {
                 "escalated_to_human": True,
                 "escalated_reason": reason,
@@ -454,9 +517,19 @@ async def _escalate_to_human(
             }},
         )
 
+    if conversation_id:
+        try:
+            await conversations_collection.update_one(
+                {"_id": ObjectId(conversation_id), **_account_filter(account_id)},
+                {"$set": {"status": "awaiting_human"}},
+            )
+        except Exception as e:
+            logger.warning(f"Failed to set awaiting_human status on conversation {conversation_id}: {e}")
+
     try:
         from services.notification_service import create_notification
         await create_notification(
+            account_id=account_id,
             type="escalation_required",
             title="Human attention required",
             body=reason,

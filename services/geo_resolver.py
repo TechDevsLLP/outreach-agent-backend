@@ -17,12 +17,55 @@ Usage:
 
 import asyncio
 import logging
+import os
 import re
+import sqlite3
+import threading
 from typing import Optional
 
 from pymongo import UpdateOne
 
 logger = logging.getLogger(__name__)
+
+# ---------------------------------------------------------------------------
+# SQLite gazetteer backend
+#
+# The gazetteer lives in a local read-only SQLite file (built by
+# scripts/build_geo_sqlite.py from GeoNames), NOT in MongoDB. The old Mongo
+# `geo_places` collection used case-insensitive $regex queries that could not
+# use its index — every lookup was a full ~235k-doc collection scan. SQLite
+# gives sub-ms indexed lookups, zero Atlas storage, and no seeding step.
+# ---------------------------------------------------------------------------
+
+GEO_SQLITE_PATH = os.environ.get(
+    "GEO_SQLITE_PATH",
+    os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+                 "data", "geo_places.sqlite"),
+)
+
+_sqlite_local = threading.local()
+_sqlite_missing_warned = False
+
+
+def _sqlite_conn() -> Optional[sqlite3.Connection]:
+    """Per-thread read-only connection to the gazetteer, or None if absent."""
+    global _sqlite_missing_warned
+    conn = getattr(_sqlite_local, "conn", None)
+    if conn is not None:
+        return conn
+    if not os.path.exists(GEO_SQLITE_PATH):
+        if not _sqlite_missing_warned:
+            logger.warning(
+                "geo_resolver: gazetteer not found at %s — only country-level "
+                "resolution available. Build it with scripts/build_geo_sqlite.py",
+                GEO_SQLITE_PATH,
+            )
+            _sqlite_missing_warned = True
+        return None
+    conn = sqlite3.connect(f"file:{GEO_SQLITE_PATH}?mode=ro", uri=True,
+                           check_same_thread=False)
+    _sqlite_local.conn = conn
+    return conn
 
 # ---------------------------------------------------------------------------
 # Static reference data
@@ -321,8 +364,8 @@ def _hint_to_code(country_hint: Optional[str]) -> Optional[str]:
 
 
 def _doc_to_result(doc: dict, raw: str) -> dict:
-    """Map a geo_places document to the public result shape."""
-    return {
+    """Map a gazetteer row to the public result shape."""
+    result = {
         "place_id": doc.get("place_id"),
         "city": doc.get("city"),
         "region": doc.get("region"),
@@ -331,60 +374,69 @@ def _doc_to_result(doc: dict, raw: str) -> dict:
         "continent": doc.get("continent"),
         "raw": raw,
     }
+    if doc.get("geo"):
+        result["geo"] = doc["geo"]
+    return result
 
 
-async def _query_collection(
-    norm: str,
-    hint_code: Optional[str],
-    collection,
-) -> Optional[dict]:
+_PLACE_FIELDS = ["place_id", "city", "region", "country", "country_code", "continent", "lat", "lng"]
+_PLACE_COLS = ", ".join(f"p.{c}" for c in _PLACE_FIELDS)
+
+
+def _query_sqlite(norm: str, hint_code: Optional[str]) -> Optional[dict]:
     """
-    Run a cascade of MongoDB queries against `geo_places` to resolve `norm`.
+    Run the resolution cascade against the SQLite gazetteer.
 
-    Strategy:
-        a. Exact alt_names match (case-insensitive), optionally filtered by
-           country_code from hint.  Sort by population desc.
-        b. Prefix alt_names match with same filter.
+    Strategy (same as the old Mongo version):
+        a. Exact name match, preferring the country hint.  Population desc.
+        b. Prefix name match with same preference.
         c. Strip "greater … area" → retry exact then prefix.
         d. Take first token before comma → retry exact then prefix.
 
-    Returns the best matching geo_places document, or None.
+    Returns a place row as a dict, or None.
     """
+    conn = _sqlite_conn()
+    if conn is None:
+        return None
 
-    async def _find_best(pattern: str, is_prefix: bool) -> Optional[dict]:
-        regex = f"^{re.escape(pattern)}" if is_prefix else f"^{re.escape(pattern)}$"
-        base_filter: dict = {"alt_names": {"$regex": regex, "$options": "i"}}
-
-        docs = None
-
-        if hint_code:
-            hint_filter = dict(base_filter)
-            hint_filter["country_code"] = hint_code
-            try:
-                cursor = collection.find(hint_filter).sort("population", -1).limit(1)
-                docs = await cursor.to_list(length=1)
-            except Exception as exc:
-                logger.warning("geo_places query error (hint): %s", exc)
-                docs = []
-
-        # If hint narrowed to nothing, fall back without country filter
-        if not docs:
-            try:
-                cursor = collection.find(base_filter).sort("population", -1).limit(1)
-                docs = await cursor.to_list(length=1)
-            except Exception as exc:
-                logger.warning("geo_places query error: %s", exc)
-                return None
-
-        return docs[0] if docs else None
+    def _find_best(pattern: str, is_prefix: bool) -> Optional[dict]:
+        if is_prefix:
+            # range comparison instead of LIKE — always index-backed regardless
+            # of collation (LIKE with a bound parameter disables the prefix
+            # optimization on a binary-collated index)
+            where = "n.name_lower >= ? AND n.name_lower < ?"
+            params = [pattern, pattern + "￿"]
+        else:
+            where, params = "n.name_lower = ?", [pattern]
+        sql = (
+            f"SELECT {_PLACE_COLS} FROM names n JOIN places p USING (place_id) "
+            f"WHERE {where} {{hint}} ORDER BY n.population DESC LIMIT 1"
+        )
+        try:
+            row = None
+            if hint_code:
+                row = conn.execute(sql.format(hint="AND n.country_code = ?"),
+                                   params + [hint_code]).fetchone()
+            if row is None:
+                row = conn.execute(sql.format(hint=""), params).fetchone()
+        except sqlite3.Error as exc:
+            logger.warning("geo sqlite query error: %s", exc)
+            return None
+        if row is None:
+            return None
+        doc = dict(zip(_PLACE_FIELDS, row))
+        lat, lng = doc.pop("lat", None), doc.pop("lng", None)
+        if lat is not None and lng is not None:
+            doc["geo"] = to_geojson(lat, lng)
+        return doc
 
     # a. Exact match
-    doc = await _find_best(norm, is_prefix=False)
+    doc = _find_best(norm, is_prefix=False)
     if doc:
         return doc
 
     # b. Prefix match
-    doc = await _find_best(norm, is_prefix=True)
+    doc = _find_best(norm, is_prefix=True)
     if doc:
         return doc
 
@@ -396,10 +448,10 @@ async def _query_collection(
         stripped = stripped[: -len(" area")]
     stripped = stripped.strip()
     if stripped and stripped != norm:
-        doc = await _find_best(stripped, is_prefix=False)
+        doc = _find_best(stripped, is_prefix=False)
         if doc:
             return doc
-        doc = await _find_best(stripped, is_prefix=True)
+        doc = _find_best(stripped, is_prefix=True)
         if doc:
             return doc
 
@@ -407,10 +459,10 @@ async def _query_collection(
     if "," in norm:
         first_part = norm.split(",")[0].strip()
         if first_part and first_part != norm and first_part != stripped:
-            doc = await _find_best(first_part, is_prefix=False)
+            doc = _find_best(first_part, is_prefix=False)
             if doc:
                 return doc
-            doc = await _find_best(first_part, is_prefix=True)
+            doc = _find_best(first_part, is_prefix=True)
             if doc:
                 return doc
 
@@ -454,17 +506,21 @@ async def resolve(
             return {**cached, "raw": original_raw}
         return None
 
-    # --- No collection: country-only fallback --------------------------------
-    if collection is None:
-        result = _resolve_country_only(norm)
-        if result:
-            result["raw"] = original_raw
-        _cache_set(cache_key, result)
-        return result
+    # --- Exact country match first --------------------------------------------
+    # An ISO-2 code or full country name is unambiguous and must win over the
+    # city gazetteer: e.g. "US" is also a tiny French commune, so querying
+    # SQLite first resolved raw location "US" to France.
+    country_result = _resolve_country_only(norm)
+    if country_result:
+        country_result["raw"] = original_raw
+        _cache_set(cache_key, {k: v for k, v in country_result.items() if k != "raw"})
+        return country_result
 
-    # --- MongoDB resolution --------------------------------------------------
+    # --- SQLite resolution ----------------------------------------------------
+    # `collection` is accepted for backwards compatibility but ignored: the
+    # gazetteer lives in a local SQLite file, not MongoDB.
     hint_code = _hint_to_code(country_hint)
-    doc = await _query_collection(norm, hint_code, collection)
+    doc = _query_sqlite(norm, hint_code)
 
     if doc:
         result = _doc_to_result(doc, original_raw)

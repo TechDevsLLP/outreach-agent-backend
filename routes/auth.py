@@ -4,7 +4,7 @@ from datetime import datetime
 from typing import Optional
 
 from bson import ObjectId
-from fastapi import APIRouter, BackgroundTasks, Depends, HTTPException, Request, status
+from fastapi import APIRouter, BackgroundTasks, Depends, HTTPException, Request, Response, status
 from pydantic import BaseModel
 from pymongo.errors import PyMongoError
 from rate_limit import limiter
@@ -12,11 +12,16 @@ from rate_limit import limiter
 import database
 from config import get_settings
 from auth import (
+    clear_session_cookies,
     create_access_token,
     get_current_user,
+    hash_password,
+    is_browser_session_request,
+    rotate_user_access_token,
+    set_session_cookies,
+    validate_cookie_csrf,
     verify_password,
 )
-from models.user import TokenResponse
 from services.user_provisioning import create_user_with_account
 
 settings = get_settings()
@@ -86,12 +91,21 @@ def _account_to_dict(account: dict) -> dict:
     }
 
 
+def _complete_authentication(request: Request, response: Response, token: str) -> dict:
+    """Complete browser auth without exposing its bearer token to JavaScript."""
+    if is_browser_session_request(request):
+        set_session_cookies(response, token)
+        response.headers["Cache-Control"] = "no-store"
+        return {"authenticated": True}
+    return {"access_token": token, "token_type": "bearer"}
+
+
 # ---------------------------------------------------------------------------
 # POST /api/auth/register
 # ---------------------------------------------------------------------------
 
-@router.post("/register", response_model=TokenResponse, status_code=status.HTTP_201_CREATED)
-async def register(body: RegisterRequest):
+@router.post("/register", response_model=None, status_code=status.HTTP_201_CREATED)
+async def register(request: Request, response: Response, body: RegisterRequest):
     """Register a new user and create their first account (owner role)."""
     user_id, account_id = await create_user_with_account(
         email=body.email,
@@ -107,16 +121,16 @@ async def register(body: RegisterRequest):
             "email": body.email.strip().lower(),
         }
     )
-    return {"access_token": access_token, "token_type": "bearer"}
+    return _complete_authentication(request, response, access_token)
 
 
 # ---------------------------------------------------------------------------
 # POST /api/auth/login
 # ---------------------------------------------------------------------------
 
-@router.post("/login", response_model=TokenResponse)
+@router.post("/login", response_model=None)
 @limiter.limit("10/minute")
-async def login(request: Request, body: LoginRequest):
+async def login(request: Request, response: Response, body: LoginRequest):
     """
     Authenticate a user and return a JWT access token.
     Body: {email, password}  — application/json, NOT form data.
@@ -136,7 +150,20 @@ async def login(request: Request, body: LoginRequest):
             detail="Invalid email or password",
         )
 
+    # ── Auto-resolve current_account_id if missing ──────────────────────────
     account_id_str = str(user["current_account_id"]) if user.get("current_account_id") else ""
+    if not account_id_str:
+        user_oid = user["_id"]
+        first_membership = await database.account_members_collection.find_one(
+            {"user_id": user_oid},
+            sort=[("joined_at", 1)],
+        )
+        if first_membership:
+            account_id_str = str(first_membership["account_id"])
+            await database.users_collection.update_one(
+                {"_id": user_oid},
+                {"$set": {"current_account_id": first_membership["account_id"]}},
+            )
 
     access_token = create_access_token(
         data={
@@ -145,7 +172,7 @@ async def login(request: Request, body: LoginRequest):
             "email": email,
         }
     )
-    return {"access_token": access_token, "token_type": "bearer"}
+    return _complete_authentication(request, response, access_token)
 
 
 # ---------------------------------------------------------------------------
@@ -168,6 +195,12 @@ async def me(user: dict = Depends(get_current_user)):
     return {
         "user": _user_to_dict(user),
         "account": account,
+        "session": {
+            "is_impersonating": bool(user.get("_is_impersonating")),
+            "is_super_admin": bool(settings.super_admin_email)
+            and user["email"].lower() == settings.super_admin_email.lower()
+            and not bool(user.get("_is_impersonating")),
+        },
     }
 
 
@@ -175,19 +208,17 @@ async def me(user: dict = Depends(get_current_user)):
 # POST /api/auth/refresh
 # ---------------------------------------------------------------------------
 
-@router.post("/refresh", response_model=TokenResponse)
-async def refresh(user: dict = Depends(get_current_user)):
+@router.post("/refresh", response_model=None)
+async def refresh(
+    request: Request,
+    response: Response,
+    user: dict = Depends(get_current_user),
+):
     """Issue a fresh JWT with the same claims."""
     account_id_str = str(user["current_account_id"]) if user.get("current_account_id") else ""
 
-    access_token = create_access_token(
-        data={
-            "sub": user["_id"],  # already a string from get_current_user
-            "account_id": account_id_str,
-            "email": user["email"],
-        }
-    )
-    return {"access_token": access_token, "token_type": "bearer"}
+    access_token = rotate_user_access_token(user, account_id_str)
+    return _complete_authentication(request, response, access_token)
 
 
 # ---------------------------------------------------------------------------
@@ -222,8 +253,12 @@ async def update_me(body: UpdateMeRequest, user: dict = Depends(get_current_user
 # ---------------------------------------------------------------------------
 
 @router.post("/logout")
-async def logout():
-    """Logout — client is responsible for clearing the stored token."""
+async def logout(request: Request, response: Response):
+    """Clear all browser auth state, including any impersonation session."""
+    if request.cookies.get("auth_token"):
+        validate_cookie_csrf(request)
+    clear_session_cookies(response)
+    response.headers["Cache-Control"] = "no-store"
     return {"message": "Logged out"}
 
 
@@ -267,29 +302,14 @@ async def password_reset_request(request: Request, body: PasswordResetRequestBod
             "used": False,
         })
 
-        reset_url = f"{settings.frontend_url}/reset-password/{token}"
-
-        # Try to send via SendGrid; fall back to log in dev
-        if settings.sendgrid_api_key:
-            try:
-                from sendgrid import SendGridAPIClient
-                from sendgrid.helpers.mail import Mail
-                msg = Mail(
-                    from_email=(settings.sender_email or "noreply@outflo.io"),
-                    to_emails=email,
-                    subject="Reset your Outflo password",
-                    html_content=(
-                        f"<p>Click the link below to reset your password (valid for 1 hour):</p>"
-                        f"<p><a href='{reset_url}'>{reset_url}</a></p>"
-                        f"<p>If you didn't request this, you can safely ignore this email.</p>"
-                    ),
-                )
-                sg = SendGridAPIClient(settings.sendgrid_api_key)
-                sg.send(msg)
-            except Exception as exc:
-                _log.getLogger(__name__).warning(f"Password reset email failed: {exc}. URL: {reset_url}")
-        else:
-            _log.getLogger(__name__).info(f"[DEV] Password reset URL for {email}: {reset_url}")
+        # Platform transactional email (password reset) is independent of the
+        # per-account Gmail/Zoho/SMTP outreach channels — there is no
+        # `email_account` to send this from. SendGrid has been removed. Do not
+        # log the live token; delivery is a launch gate until a transactional
+        # sender is configured.
+        _log.getLogger(__name__).warning(
+            "Password reset requested but transactional delivery is not configured"
+        )
 
     return {"message": "If that email is registered, you'll receive a reset link shortly."}
 
@@ -415,12 +435,13 @@ async def complete_onboarding(body: OnboardingRequest, user: dict = Depends(get_
     from datetime import timezone
     from database import company_profiles_collection, accounts_collection
 
-    account_oid = ObjectId(user["current_account_id"])
+    account_id = str(user["current_account_id"])
+    account_oid = ObjectId(account_id)
     user_oid = user["_id"] if isinstance(user["_id"], ObjectId) else ObjectId(user["_id"])
     now = datetime.now(timezone.utc)
 
     # Upsert company profile
-    existing = await company_profiles_collection.find_one({"account_id": account_oid})
+    existing = await company_profiles_collection.find_one({"account_id": account_id})
     profile_fields: dict = {
         "company_name": body.company_name,
         "description": body.description,
@@ -449,7 +470,7 @@ async def complete_onboarding(body: OnboardingRequest, user: dict = Depends(get_
 
     if existing is None:
         await company_profiles_collection.insert_one({
-            "account_id": account_oid,
+            "account_id": account_id,
             "user_id": user_oid,
             "website_url": body.website_url or "",
             "services": [],
@@ -471,7 +492,7 @@ async def complete_onboarding(body: OnboardingRequest, user: dict = Depends(get_
         })
     else:
         await company_profiles_collection.update_one(
-            {"account_id": account_oid},
+            {"account_id": account_id},
             {"$set": profile_fields},
         )
 

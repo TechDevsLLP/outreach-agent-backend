@@ -29,6 +29,15 @@ from services.employee_scraper_service import (
     bulk_scrape_employees_for_companies,
     transform_employee_to_prospect,
 )
+from services.campaign_prospect_state_service import (
+    DEFAULT_SCORING_VERSION,
+    bulk_transition_enrichment,
+    bulk_write_state_operations,
+    ensure_cohort_membership,
+    persist_campaign_scores,
+    score_update_operation,
+    transition_enrichment_operation,
+)
 
 logger = logging.getLogger(__name__)
 settings = get_settings()
@@ -36,22 +45,221 @@ settings = get_settings()
 _MAX_GEMINI_ITERATIONS = 10  # loop until _QUALITY_COMPANY_TARGET or budget exhausted
 _QUALITY_COMPANY_TARGET = 120   # minimum kept (score ≥50) companies before stopping
 _COMPANY_SCORE_THRESHOLD = 50
-_EMPLOYEE_SCORE_THRESHOLD = 48
+# Score floor for the discovery-time employee gate. score_prospect_for_campaign is a
+# 0-100 additive scale where company-level signals alone (industry 18 + size 12 +
+# linkedin 5 + country 5) reach ~40, so the score is only a SECONDARY ranking signal.
+# Person-level fit is now enforced by the deterministic hard gate
+# (utils.scoring.person_fit_gate applied in _gate_and_select) — the score threshold
+# just removes low-signal rows among gate survivors.
+_EMPLOYEE_SCORE_THRESHOLD = 25
+# Relax ladder: if hard gates leave fewer than this fraction of prospect_target,
+# the function-inference rejection (ONLY) is relaxed and best-scored rejects are
+# re-admitted. Title blocklist + icp_exclude_keywords are never relaxed.
+_GATE_RELAX_FRACTION = 0.5
 _SCORING_DROPOUT_BUFFER = 2.5   # scrape ~2.5x target raw employees to survive score gate + contactability + dedup
 _COMPANY_BUFFER = 1.3           # source ~1.3x the companies strictly needed (company-score dropout)
 _MIN_PER_COMPANY = 2            # floor so a company is worth a scrape
 _MAX_PER_COMPANY_CAP = 10       # ceiling regardless of campaign setting
-_SCRAPE_DEPTH = 8               # employees per company to scrape
-_PER_COMPANY_ENROLLMENT_CAP = 3 # max enrolled per company after scoring
-# Full mode returns proper vanity profile URLs (linkedinUrl = /in/slug) required by
-# the email finder.  Short mode returns only internal ACw... IDs which the actor
-# cannot resolve.  Full costs $8/1k vs Short $4/1k.
+_SCRAPE_DEPTH = 5               # employees per company to scrape (pick 1 primary + 2 backups)
+_PER_COMPANY_ENROLLMENT_CAP = 1 # ONE primary enrolled per company; next-best kept as cascade backups
+_PER_COMPANY_BACKUP_COUNT = 2   # backups stored as cascade_waiting (no email spend, no messages)
+
+# ── Company-first sizing (company count is the ONLY user input) ──────────────
+# prospect_target is derived: _company_target * _PER_COMPANY_TARGET.
+_PER_COMPANY_TARGET = 1          # ONE enrolled prospect per company (rotation covers the rest)
+_DEFAULT_COMPANY_TARGET = 100    # default when the campaign didn't set one
+# Auto top-up: if a discovery generation yields fewer than this fraction of the
+# full prospect target, an append-only follow-up generation is enqueued (up to
+# _MAX_TOPUP_GENERATIONS total generations) sourcing NEW companies only.
+_TOPUP_THRESHOLD = 0.7
+_MAX_TOPUP_GENERATIONS = 3
+_MIN_COMPANY_TARGET = 10
+_MAX_COMPANY_TARGET = 300
+_DEFAULT_SOURCING_CONCURRENCY = 8  # parallel Gemini sourcing calls (rate limiter allows ~150/min)
+_DEFAULT_SCRAPE_CONCURRENCY = 5    # parallel Apify employee-scrape runs (chunks of companies)
+_SCRAPE_CHUNK_SIZE = 10            # ~companies per parallel Apify run
+# Full mode ($8/1k) is the primary mode: Short mode returned urn-style/unreliable
+# prospect profile URLs (breaking LinkedIn sends) and frequently omitted
+# companyLinkedinUrl (breaking per-company attribution + recovery detection).
+# Emails still come from GrowthToolkit's Email Finder, not the actor.
+# Override per campaign via `discovery_profile_scraper_mode`.
 _PROFILE_SCRAPER_MODE = "Full ($8 per 1k)"
 
 
 # ──────────────────────────────────────────────────────────────────────────────
 # Channel planning helpers (public — called by onboarding wizard)
 # ──────────────────────────────────────────────────────────────────────────────
+
+# Human-readable explanation for each channel-planning skip reason, so the UI can
+# say WHY a campaign enrolled 0 prospects instead of showing an empty list.
+_SKIP_REASON_MESSAGES = {
+    "no_sending_account": (
+        "No prospects could be scheduled — connect an email or LinkedIn sending "
+        "account, then re-run discovery."
+    ),
+    "no_contact_info": (
+        "No email or LinkedIn contact could be found for the scraped prospects. "
+        "Try broadening the ICP (seniority/titles) so contactable people are found."
+    ),
+    "channel_mismatch": (
+        "Scraped prospects had no channel compatible with your connected sending "
+        "accounts (e.g. LinkedIn-only prospects but only an email account is connected)."
+    ),
+    "below_min_score": (
+        "All scraped prospects scored below the enrollment threshold for this ICP. "
+        "Try broadening the ICP description."
+    ),
+    "terminal_status": (
+        "All candidate prospects were opted-out, bounced, or disqualified."
+    ),
+}
+
+
+def _skip_reason_message(skip_reasons: dict[str, int] | None) -> str | None:
+    """Pick the dominant skip reason and map it to a user-facing sentence."""
+    if not skip_reasons:
+        return None
+    dominant = max(skip_reasons.items(), key=lambda kv: kv[1])[0]
+    return _SKIP_REASON_MESSAGES.get(
+        dominant, "No prospects could be enrolled from the scraped candidates."
+    )
+
+
+async def _finalize_sequence_plan(
+    campaign_id: str,
+    campaign: dict,
+    enrollments_for_plan: list,
+    prospects_by_id: dict,
+) -> dict:
+    """Finalize channel planning for a branching sequence campaign.
+
+    Resolves the graph's routes (one per start node — a hybrid campaign has a
+    LinkedIn-first, Email-first and InMail route), distributes prospects across
+    them to fill each channel's daily cap (20/20/5), and seeds each enrollment's
+    ``sequence_state`` at *its route's* start node. Mirrors the day_totals /
+    used_by / campaign metadata writes of the classic ``finalize_channel_plan``.
+    """
+    from pymongo import UpdateOne as _PlanUpdateOne
+    from services import sequence_service as seq
+
+    campaign_oid = campaign["_id"]
+    graph = campaign["sequence_graph"]
+    routes = seq.resolve_routes(graph, campaign)
+    if not routes:
+        logger.warning(f"[finalize_plan:{campaign_id}] sequence_graph has no start node")
+        return {"assigned": 0, "skip_reasons": {"no_start_node": len(enrollments_for_plan)}, "day_totals": {}}
+
+    # Seed the planner with days already filled by earlier top-up generations of
+    # this campaign, so this batch continues from the first day that still has
+    # room instead of re-piling onto day 1 (which is what pushed 33 connection
+    # requests — 3 generations × ~11 — onto a single day past the 20 cap).
+    # Scoring/reset enrollments have send_day=None so they're naturally excluded.
+    existing_counts: dict[tuple[int, str], int] = {}
+    async for _e in database.campaign_enrollments_collection.find(
+        {
+            "campaign_id": campaign_oid,
+            "smart_campaign_send_day": {"$ne": None},
+            "smart_campaign_channel": {"$ne": None},
+            "status": {"$nin": ["archived", "skipped_no_channel", "cascade_waiting", "failed", "scoring"]},
+        },
+        {"smart_campaign_send_day": 1, "smart_campaign_channel": 1},
+    ):
+        _d = _e.get("smart_campaign_send_day")
+        _c = _e.get("smart_campaign_channel")
+        if _d is None or _c is None:
+            continue
+        existing_counts[(int(_d), str(_c))] = existing_counts.get((int(_d), str(_c)), 0) + 1
+
+    assignments, skip_reasons = seq.plan_route_first_touch_days(
+        campaign, enrollments_for_plan, prospects_by_id, routes, existing_counts=existing_counts
+    )
+    logger.info(
+        f"[finalize_plan:{campaign_id}] SEQUENCE routes="
+        f"{[(r['channel'], r['cap']) for r in routes]} "
+        f"existing_day_load={ {f'{d}:{c}': n for (d, c), n in existing_counts.items()} } "
+        f"assigned={len(assignments)}, skip={skip_reasons}"
+    )
+
+    plan_ops = []
+    assigned_ids = set()
+    for enr, channel, start_node_id, send_day in assignments:
+        assigned_ids.add(enr["_id"])
+        plan_ops.append(_PlanUpdateOne(
+            {"_id": enr["_id"]},
+            {"$set": {
+                "smart_campaign_channel": channel,
+                "smart_campaign_send_day": send_day,
+                "status": "active",
+                "next_action_at": None,
+                "smart_campaign_scheduled_utc": None,
+                "message_gen_status": "pending" if send_day == 1 else "scheduled_later",
+                "generated_messages": None,
+                "message_gen_error": None,
+                "sequence_state": seq.build_initial_sequence_state(graph, start_node_id=start_node_id),
+            }},
+        ))
+    for enr in enrollments_for_plan:
+        if enr["_id"] not in assigned_ids:
+            plan_ops.append(_PlanUpdateOne(
+                {"_id": enr["_id"]},
+                {"$set": {
+                    "status": "skipped_no_channel",
+                    "smart_campaign_channel": None,
+                    "smart_campaign_send_day": None,
+                    "next_action_at": None,
+                    "smart_campaign_scheduled_utc": None,
+                    "message_gen_status": "skipped",
+                }},
+            ))
+    if plan_ops:
+        await database.campaign_enrollments_collection.bulk_write(plan_ops, ordered=False)
+
+    # Sync used_by → "active" for assigned prospects on prospect_state overlay
+    if assignments:
+        try:
+            from services.prospect_search_service import update_used_by_status as _upd_used_by
+            import asyncio as _asyncio
+            _sync_ops = [
+                _upd_used_by(
+                    database.db,
+                    account_id=str(enr.get("account_id", "")),
+                    prospect_id=str(enr.get("prospect_id", "")),
+                    campaign_id=str(enr.get("campaign_id", "")),
+                    new_status="active",
+                )
+                for enr, _ch, _nid, _sd in assignments
+            ]
+            await _asyncio.gather(*_sync_ops, return_exceptions=True)
+        except Exception as _usync_e:
+            logger.warning(f"[finalize_plan:{campaign_id}] used_by sync failed: {_usync_e}")
+
+    # day_totals keyed by each route's channel
+    day_totals: dict = {}
+    for enr, channel, _nid, d in assignments:
+        day_totals.setdefault(str(d), {}).setdefault(channel, 0)
+        day_totals[str(d)][channel] += 1
+
+    total_assigned = len(assignments)
+    _plan_update: dict = {
+        "discovery_prospects_eligible": total_assigned,
+        "discovery_day_totals": day_totals,
+        "discovery_skip_reasons": skip_reasons or {},
+    }
+    if total_assigned == 0 and enrollments_for_plan:
+        _reason = _skip_reason_message(skip_reasons)
+        _plan_update["discovery_error"] = _reason
+        _plan_update["discovery_failure_reason"] = _reason
+        logger.warning(f"[finalize_plan:{campaign_id}] 0 enrolled (sequence) — reason: {_reason}")
+    elif total_assigned > 0:
+        _plan_update["discovery_error"] = None
+        _plan_update["discovery_failure_reason"] = None
+    await database.campaigns_collection.update_one(
+        {"_id": campaign_oid},
+        {"$set": _plan_update},
+    )
+
+    return {"assigned": total_assigned, "skip_reasons": skip_reasons, "day_totals": day_totals}
+
 
 async def finalize_channel_plan(campaign_id: str, account_id: str) -> dict:
     """
@@ -101,9 +309,50 @@ async def finalize_channel_plan(campaign_id: str, account_id: str) -> dict:
         for p in await database.prospects_collection.find({"_id": {"$in": pids}}).to_list(length=len(pids)):
             prospects_by_id[p["_id"]] = p
 
+    # ── Branching sequence campaigns ──────────────────────────────────────────
+    # When the campaign carries a sequence_graph, every prospect enters on the
+    # sequence's start node. Assign the start node's channel + a send day
+    # (honouring the start channel's daily cap, top-score-first) and seed each
+    # enrollment's sequence_state. The rest of the smart-campaign machinery
+    # (message gen, per-day approval, scheduling) is reused unchanged.
+    if campaign.get("sequence_graph"):
+        return await _finalize_sequence_plan(
+            campaign_id, campaign, enrollments_for_plan, prospects_by_id
+        )
+
     from services.campaign_launch_service import plan_channel_assignments
-    assignments, skip_reasons = plan_channel_assignments(campaign, enrollments_for_plan, prospects_by_id, min_score=0)
-    logger.info(f"[finalize_plan:{campaign_id}] assigned={len(assignments)}, skip={skip_reasons}")
+    # Enrollment score floor: per-campaign override via discovery_min_enroll_score,
+    # default 25 (matches _EMPLOYEE_SCORE_THRESHOLD) — previously hardcoded 0,
+    # which let every scraped row through regardless of fit.
+    try:
+        _min_enroll_score = float(campaign.get("discovery_min_enroll_score") or 25)
+    except (TypeError, ValueError):
+        _min_enroll_score = 25.0
+    # Seed with days already filled by earlier top-up generations so this batch
+    # continues from the first day with room instead of re-piling onto day 1.
+    _existing_counts: dict[tuple[int, str], int] = {}
+    async for _e in database.campaign_enrollments_collection.find(
+        {
+            "campaign_id": campaign_oid,
+            "smart_campaign_send_day": {"$ne": None},
+            "smart_campaign_channel": {"$ne": None},
+            "status": {"$nin": ["archived", "skipped_no_channel", "cascade_waiting", "failed", "scoring"]},
+        },
+        {"smart_campaign_send_day": 1, "smart_campaign_channel": 1},
+    ):
+        _d = _e.get("smart_campaign_send_day")
+        _c = _e.get("smart_campaign_channel")
+        if _d is None or _c is None:
+            continue
+        _existing_counts[(int(_d), str(_c))] = _existing_counts.get((int(_d), str(_c)), 0) + 1
+    assignments, skip_reasons = plan_channel_assignments(
+        campaign, enrollments_for_plan, prospects_by_id,
+        min_score=_min_enroll_score, existing_counts=_existing_counts,
+    )
+    logger.info(
+        f"[finalize_plan:{campaign_id}] assigned={len(assignments)}, "
+        f"min_score={_min_enroll_score}, skip={skip_reasons}"
+    )
 
     from pymongo import UpdateOne as _PlanUpdateOne
     plan_ops = []
@@ -172,12 +421,23 @@ async def finalize_channel_plan(campaign_id: str, account_id: str) -> dict:
     # where the frontend sees "awaiting_approval" instead of "completed".
     # campaign.status="awaiting_approval" (set at the same time as "completed") is
     # the authoritative signal that discovery is done and the review gate is open.
+    _plan_update: dict = {
+        "discovery_prospects_eligible": total_assigned,
+        "discovery_day_totals": day_totals,
+        "discovery_skip_reasons": skip_reasons or {},
+    }
+    # Surface WHY 0 prospects were enrolled (else clear any stale reason on a good plan).
+    if total_assigned == 0 and enrollments_for_plan:
+        _reason = _skip_reason_message(skip_reasons)
+        _plan_update["discovery_error"] = _reason
+        _plan_update["discovery_failure_reason"] = _reason
+        logger.warning(f"[finalize_plan:{campaign_id}] 0 enrolled — reason: {_reason}")
+    elif total_assigned > 0:
+        _plan_update["discovery_error"] = None
+        _plan_update["discovery_failure_reason"] = None
     await database.campaigns_collection.update_one(
         {"_id": campaign_oid},
-        {"$set": {
-            "discovery_prospects_eligible": total_assigned,
-            "discovery_day_totals": day_totals,
-        }},
+        {"$set": _plan_update},
     )
 
     return {"assigned": total_assigned, "skip_reasons": skip_reasons, "day_totals": day_totals}
@@ -229,27 +489,9 @@ async def replan_and_launch(campaign_id: str, account_id: str) -> dict:
     # Run finalize_channel_plan with now-connected sender accounts
     result = await finalize_channel_plan(campaign_id, account_id)
 
-    # Trigger Day-1 deep enrichment + message gen if prospects were assigned
+    # Queue Day-1 enrichment + message generation durably if prospects were assigned.
     if result.get("assigned", 0) > 0:
-        campaign = await database.campaigns_collection.find_one({"_id": campaign_oid})
-        if campaign:
-            # Get day1 and all prospect oids
-            day1_enrs = await database.campaign_enrollments_collection.find(
-                {"campaign_id": campaign_oid, "smart_campaign_send_day": 1, "status": "active"}
-            ).to_list(length=5000)
-            day1_oids = [e["prospect_id"] for e in day1_enrs]
-
-            all_enrs = await database.campaign_enrollments_collection.find(
-                {"campaign_id": campaign_oid, "status": "active"}
-            ).to_list(length=5000)
-            all_oids = [e["prospect_id"] for e in all_enrs]
-
-            asyncio.create_task(_run_deep_enrichment_then_messages(
-                campaign_id=campaign_id,
-                account_id=account_id,
-                day1_prospect_oids=day1_oids,
-                all_prospect_oids=all_oids,
-            ))
+        await _enqueue_day1_enrichment_and_messages(campaign_id, account_id)
 
     logger.info(f"[replan:{campaign_id}] done: assigned={result.get('assigned')}, days={list(result.get('day_totals', {}).keys())}")
     return result
@@ -259,39 +501,248 @@ async def replan_and_launch(campaign_id: str, account_id: str) -> dict:
 # Public entry point
 # ──────────────────────────────────────────────────────────────────────────────
 
-async def run_fast_discovery(campaign_id: str, account_id: str) -> dict:
-    """End-to-end curated discovery. Single BackgroundTask, ~60–120s."""
+async def _enqueue_day1_enrichment_and_messages(
+    campaign_id: str, account_id: str
+) -> None:
+    """Create leased post-discovery work.
+
+    Splits enrichment from message generation:
+      • ENRICHMENT covers ALL enrolled prospects (status scoring/active). Day-1 is
+        enriched inside the Day-1 job below; the remaining enrolled cohort is
+        enriched by a separate leased enrichment run (skip_outreach → no messages).
+        Because this runs on every discovery generation, top-up additions that are
+        still un-enriched get picked up here too.
+      • MESSAGE GENERATION stays Day-1 only (the Day-1 job).
+    """
+    from pymongo import ReturnDocument
+    from services.enrichment_job_service import (
+        enqueue_campaign_day_run,
+        enqueue_enrichment_run,
+    )
+
+    campaign_oid = ObjectId(campaign_id)
+    account_values: list[object] = [str(account_id)]
+    if ObjectId.is_valid(str(account_id)):
+        account_values.append(ObjectId(str(account_id)))
+    campaign = await database.campaigns_collection.find_one_and_update(
+        {"_id": campaign_oid, "account_id": {"$in": account_values}},
+        {
+            "$set": {
+                "message_gen_status": "queued",
+                "message_gen_started_at": datetime.utcnow(),
+                "message_gen_error": None,
+            },
+            "$inc": {"message_gen_generation": 1},
+        },
+        return_document=ReturnDocument.AFTER,
+    )
+    if not campaign:
+        raise PermissionError("campaign is not owned by discovery tenant")
+
+    # Day-1: enrich + generate messages (message generation is scoped to Day-1).
+    await enqueue_campaign_day_run(
+        account_id=str(account_id),
+        campaign_id=campaign_id,
+        day=1,
+        generation=int(campaign.get("message_gen_generation") or 1),
+        request={
+            "instructions": {},
+            "regenerate_channels": {
+                "email": True,
+                "linkedin_connection": True,
+                "linkedin_inmail": True,
+                "linkedin_message": True,
+            },
+            "send_empty_connection_request": bool(
+                campaign.get("send_empty_connection_request", False)
+            ),
+        },
+    )
+
+    # Enrich ALL other enrolled prospects (Day 2+) now, with NO message generation.
+    # Keyed on a fresh run_id so every generation (incl. top-ups) enqueues cleanly
+    # rather than coalescing onto a completed campaign-scoped job.
+    try:
+        enrolled = await database.campaign_enrollments_collection.find(
+            {
+                "campaign_id": campaign_oid,
+                "status": {"$in": ["scoring", "active"]},
+            },
+            {"prospect_id": 1, "smart_campaign_send_day": 1},
+        ).to_list(length=None)
+
+        remaining_pids = [
+            str(e["prospect_id"])
+            for e in enrolled
+            if e.get("prospect_id") and e.get("smart_campaign_send_day") != 1
+        ]
+        # Dedupe while preserving order.
+        remaining_pids = list(dict.fromkeys(remaining_pids))
+
+        if remaining_pids:
+            run_doc = {
+                "account_id": str(account_id),
+                "campaign_id": campaign_id,
+                "status": "queued",
+                "trigger": "post_discovery_enrich_all",
+                "total_prospects": len(remaining_pids),
+                "prospects_processed": 0,
+                "prospects_skipped": 0,
+                "prospects_failed": 0,
+                "profiles_scraped": 0,
+                "companies_scraped": 0,
+                "companies_deduplicated": 0,
+                "ai_assessments_done": 0,
+                "outreach_generated": 0,
+                "prospect_ids": remaining_pids,
+                "started_at": None,
+                "created_at": datetime.utcnow(),
+                "completed_at": None,
+                "current_step": "queued",
+                "error": None,
+            }
+            run_result = await database.enrichment_runs_collection.insert_one(run_doc)
+            run_id = str(run_result.inserted_id)
+            await enqueue_enrichment_run(
+                account_id=str(account_id),
+                run_id=run_id,
+                prospect_ids=remaining_pids,
+                options={
+                    "skip_outreach": True,
+                    "skip_pre_enrichment_triage": True,
+                    "account_id": str(account_id),
+                },
+                triggered_by="post_discovery_enrich_all",
+                campaign_id=campaign_id,
+            )
+            logger.info(
+                f"[fast:{campaign_id}] enqueued enrich-all run {run_id} for "
+                f"{len(remaining_pids)} non-Day-1 enrolled prospects"
+            )
+    except Exception as _ea_e:
+        logger.warning(
+            f"[fast:{campaign_id}] enrich-all enqueue failed (non-fatal): {_ea_e}"
+        )
+
+async def run_fast_discovery(campaign_id: str, account_id: str, generation: int = 1) -> dict:
+    """End-to-end curated discovery owned by a leased durable worker.
+
+    ``generation`` > 1 marks an append-only top-up pass: the destructive reset is
+    skipped, companies already used by this campaign are excluded so new ones are
+    sourced, and the enrolled/planned counters accumulate across generations.
+    """
     campaign_oid = ObjectId(campaign_id)
     now = datetime.utcnow()
 
-    await database.sourced_companies_collection.delete_many({"campaign_id": campaign_id})
-    await database.campaigns_collection.update_one(
-        {"_id": campaign_oid},
-        {"$set": {
-            "discovery_status": "sourcing_companies",
-            "discovery_started_at": now,
-            "discovery_error": None,
-            "curated_companies_sourced": 0,
-            "curated_companies_approved": 0,
-            "curated_companies_scraped": 0,
-        }},
+    account_values: list[object] = [str(account_id)]
+    if ObjectId.is_valid(str(account_id)):
+        account_values.append(ObjectId(str(account_id)))
+    campaign = await database.campaigns_collection.find_one(
+        {"_id": campaign_oid, "account_id": {"$in": account_values}}
     )
+    if not campaign:
+        raise PermissionError("campaign is not owned by discovery tenant")
+
+    if generation == 1:
+        # First generation is destructive: clear prior sourced companies + counters.
+        await database.sourced_companies_collection.delete_many(
+            {"campaign_id": campaign_id, "account_id": {"$in": account_values}}
+        )
+        await database.campaigns_collection.update_one(
+            {"_id": campaign_oid, "account_id": {"$in": account_values}},
+            {"$set": {
+                "discovery_status": "sourcing_companies",
+                "discovery_started_at": now,
+                "discovery_error": None,
+                "curated_companies_sourced": 0,
+                "curated_companies_approved": 0,
+                "curated_companies_scraped": 0,
+            }},
+        )
+    else:
+        # Top-up pass: append only — do NOT delete sourced companies or reset
+        # counters, just flip the status spinner back to "sourcing".
+        await database.campaigns_collection.update_one(
+            {"_id": campaign_oid, "account_id": {"$in": account_values}},
+            {"$set": {
+                "discovery_status": "sourcing_companies",
+                "discovery_error": None,
+            }},
+        )
 
     try:
-        campaign = await database.campaigns_collection.find_one({"_id": campaign_oid})
-        if not campaign:
-            raise ValueError(f"Campaign {campaign_id} not found")
-
         icp_prompt = _build_icp_prompt_from_campaign(campaign)
         import math
-        prospect_target = int(campaign.get("prospect_count_target") or settings.enrolled_target_first_campaign)
-        per_company = int(campaign.get("max_prospects_per_company") or settings.max_prospects_per_company)
-        per_company = max(_MIN_PER_COMPANY, min(per_company, _MAX_PER_COMPANY_CAP))
+        # Company-first sizing: the company count is the single sizing input, and the
+        # prospect target is derived from it (~3 ideal prospects per company).
+        _company_target = int(campaign.get("curated_company_count_target") or _DEFAULT_COMPANY_TARGET)
+        _company_target = max(_MIN_COMPANY_TARGET, min(_company_target, _MAX_COMPANY_TARGET))
+        per_company = _PER_COMPANY_TARGET
+        prospect_target = _company_target * per_company
 
-        # Derive company target from prospect target, buffered for company-score dropout.
-        companies_needed = math.ceil(prospect_target / per_company)
-        target = max(10, math.ceil(companies_needed * _COMPANY_BUFFER))   # companies to source
-        max_companies = max(target, math.ceil(max(target, _QUALITY_COMPANY_TARGET) * 1.5))  # hard sourcing ceiling
+        # Honor an explicit prospect_count_target (the wizard slider AND the
+        # "Scrape more prospects" dialog write it) as the authoritative TOTAL
+        # prospect goal. Company-first sizing otherwise reads only
+        # curated_company_count_target and silently ignores the slider — e.g. a
+        # campaign asking for 150 was sized for 50 (company_target × 1), so
+        # "scrape more" found almost nothing once ~50 were enrolled. Derive the
+        # company need from the prospect goal so we actually source enough.
+        try:
+            _explicit_prospect_target = int(campaign.get("prospect_count_target") or 0)
+        except (TypeError, ValueError):
+            _explicit_prospect_target = 0
+        if _explicit_prospect_target > prospect_target:
+            prospect_target = _explicit_prospect_target
+            _company_target = max(
+                _company_target,
+                min(_MAX_COMPANY_TARGET, math.ceil(prospect_target / max(1, per_company))),
+            )
+
+        # Full intended target is stable across generations; the top-up decision and
+        # generation>1 sizing compare enrolled counts against it (the working
+        # `prospect_target` gets decremented by pool reuse later on).
+        prospect_target_full = prospect_target
+
+        # ── Top-up (generation > 1): size for the shortfall + exclude used companies ──
+        # An append pass sources only NEW companies (not already enrolled in this
+        # campaign) and only enough to cover the remaining gap to the full target.
+        _topup_excluded_co_urls: set[str] = set()
+        _topup_excluded_co_ids: set[str] = set()
+        if generation > 1:
+            _current_enrolled = await database.campaign_enrollments_collection.count_documents({
+                "campaign_id": campaign_oid,
+                "status": {"$nin": ["skipped_no_channel", "archived", "pending_teammate_review", "cascade_waiting"]},
+            })
+            _shortfall = max(0, prospect_target_full - _current_enrolled)
+            # Source extra companies with buffer headroom to survive score/contact dropout.
+            _extra_cos = math.ceil((_shortfall / max(1, per_company)) * _COMPANY_BUFFER)
+            _company_target = max(_MIN_COMPANY_TARGET, min(_extra_cos, _MAX_COMPANY_TARGET))
+            prospect_target = _shortfall
+            # Build the exclusion set from already-enrolled prospects' companies.
+            _used_prospect_oids = [
+                d["prospect_id"]
+                async for d in database.campaign_enrollments_collection.find(
+                    {"campaign_id": campaign_oid}, {"prospect_id": 1}
+                )
+                if d.get("prospect_id")
+            ]
+            if _used_prospect_oids:
+                async for _pdoc in database.prospects_collection.find(
+                    {"_id": {"$in": _used_prospect_oids}},
+                    {"company_id": 1, "company_linkedin": 1},
+                ):
+                    _cid = _pdoc.get("company_id")
+                    if _cid:
+                        _topup_excluded_co_ids.add(str(_cid))
+                    _curl = (_pdoc.get("company_linkedin") or "").rstrip("/").lower()
+                    if _curl:
+                        _topup_excluded_co_urls.add(_curl)
+            logger.info(
+                f"[fast:{campaign_id}] top-up gen {generation}: enrolled={_current_enrolled}, "
+                f"shortfall={_shortfall}, sourcing ~{_company_target} new companies, "
+                f"excluding {len(_topup_excluded_co_ids)} company ids / "
+                f"{len(_topup_excluded_co_urls)} linkedin urls"
+            )
 
         # Fetch sender context for employee scoring
         company_profile = await database.company_profiles_collection.find_one(
@@ -370,7 +821,7 @@ async def run_fast_discovery(campaign_id: str, account_id: str) -> dict:
                 }},
             )
 
-            from services.campaign_prospect_finder_service import _pre_enroll_prospects
+            from services.prospect_enrollment_service import _pre_enroll_prospects
             _mock_prospects_full = await database.prospects_collection.find(
                 {"_id": {"$in": new_prospect_oids}}
             ).to_list(length=None)
@@ -388,24 +839,24 @@ async def run_fast_discovery(campaign_id: str, account_id: str) -> dict:
             )
             _mock_plan = await finalize_channel_plan(campaign_id, account_id)
             _mock_assigned = _mock_plan.get("assigned", 0)
+            # Recompute total_enrolled from the live enrollments (not = assigned) so
+            # it stays correct across top-up generations.
+            _mock_total_enrolled = await database.campaign_enrollments_collection.count_documents({
+                "campaign_id": campaign_oid,
+                "status": {"$nin": ["skipped_no_channel", "archived", "pending_teammate_review", "cascade_waiting"]},
+            })
             await database.campaigns_collection.update_one(
                 {"_id": campaign_oid},
                 {"$set": {
                     "discovery_prospects_planned": _mock_assigned,
                     "discovery_prospects_enrolled": _mock_assigned,
+                    "total_enrolled": _mock_total_enrolled,
                 }},
             )
             if _mock_assigned > 0:
-                _mock_day1 = await database.campaign_enrollments_collection.find(
-                    {"campaign_id": campaign_oid, "smart_campaign_send_day": 1, "status": "active"}
-                ).to_list(length=5000)
-                _mock_day1_oids = [e["prospect_id"] for e in _mock_day1]
-                asyncio.create_task(_run_deep_enrichment_then_messages(
-                    campaign_id=campaign_id,
-                    account_id=str(account_id),
-                    day1_prospect_oids=_mock_day1_oids,
-                    all_prospect_oids=new_prospect_oids,
-                ))
+                await _enqueue_day1_enrichment_and_messages(
+                    campaign_id, str(account_id)
+                )
             logger.info(
                 f"[fast:{campaign_id}] MOCK done — {len(new_prospect_oids)} synthetic prospects, "
                 f"{_mock_assigned} assigned"
@@ -416,13 +867,17 @@ async def run_fast_discovery(campaign_id: str, account_id: str) -> dict:
         # ── Lazy ICP canonicalization ─────────────────────────────────────────────
         from services.prospect_search_service import (
             search_companies_structured as _search_cos,
+            search_companies_vector as _search_cos_vector,
             search_prospects_structured as _search_pool_structured,
             build_exclusion_set as _build_exclusion_set,
         )
         from services.icp_canonicalizer import canonicalize_icp as _canonicalize_icp
 
-        _canon_fields = ("industry_ids", "country_codes", "seniorities", "employee_bands")
-        if not any(campaign.get(f) for f in _canon_fields):
+        # Re-canonicalize whenever EITHER field Stage A (DB company match) needs is
+        # missing — previously this only fired when BOTH were missing, so a campaign
+        # with country_codes set but industry_ids empty never retried and ran Stage A
+        # with no industry filter (over-broad) or skipped it entirely.
+        if not campaign.get("industry_ids") or not campaign.get("country_codes"):
             try:
                 _canonical = await _canonicalize_icp(campaign)
                 if any(_canonical.values()):
@@ -434,8 +889,26 @@ async def run_fast_discovery(campaign_id: str, account_id: str) -> dict:
             except Exception as _ce:
                 logger.warning(f"[fast:{campaign_id}] ICP canonicalization failed: {_ce}")
 
-        # Company + prospect targets (company-first)
-        _company_target = int(campaign.get("curated_company_count_target") or 100)
+        # _company_target already computed above (company-first sizing).
+
+        # Title-gate fallback: if the prefill left icp_job_titles empty, synthesize
+        # target titles from function × seniority so the person-fit title gate and
+        # the AI title judge never run blind — an empty list disabled the title
+        # gate entirely and let adjacent "manager" roles through.
+        if not campaign.get("icp_job_titles"):
+            _synth_titles = _synthesize_icp_titles(
+                campaign.get("icp_functional_departments") or [],
+                campaign.get("icp_seniority_levels") or [],
+            )
+            if _synth_titles:
+                campaign["icp_job_titles"] = _synth_titles
+                try:
+                    await database.campaigns_collection.update_one(
+                        {"_id": campaign_oid}, {"$set": {"icp_job_titles": _synth_titles}}
+                    )
+                except Exception:
+                    pass
+                logger.info(f"[fast:{campaign_id}] synthesized icp_job_titles: {_synth_titles}")
 
         # Build exclusion set (90-day cooldown from completion, per-user)
         _user_id = str(campaign.get("created_by") or account_id)
@@ -468,21 +941,49 @@ async def run_fast_discovery(campaign_id: str, account_id: str) -> dict:
                     f"[fast:{campaign_id}] Stage A: {len(_matched_cos)} companies matched in DB "
                     f"(target={_company_target})"
                 )
-                await database.campaigns_collection.update_one(
-                    {"_id": campaign_oid},
-                    {"$set": {"discovery_companies_matched": len(_matched_cos)}},
-                )
             except Exception as _ca_e:
                 logger.warning(f"[fast:{campaign_id}] Stage A company search failed: {_ca_e}")
                 _matched_cos = []
-        else:
-            logger.info(f"[fast:{campaign_id}] Stage A: skipped (no canonical ICP industry/country)")
+
+        # Vector fallback: when canonicalization produced nothing usable (or the
+        # structured filter matched nothing), semantically match the free-text ICP
+        # against the shared company pool via the companies_vec index instead of
+        # silently falling through to the all-Gemini path.
+        if not _matched_cos:
+            try:
+                from services.embedding_service import embed_one as _embed_one
+                _icp_vec = await _embed_one(icp_prompt, task_type="RETRIEVAL_QUERY")
+                if _icp_vec is not None:
+                    _matched_cos = await _search_cos_vector(
+                        database.db,
+                        profile_query_vec=_icp_vec,
+                        # Keep whatever canonical filters DO exist as pre-filters.
+                        industry_ids=_icp_industry_ids or None,
+                        country_codes=_icp_country_codes or None,
+                        employee_bands=_icp_employee_bands or None,
+                        limit=_company_target,
+                    )
+                    logger.info(
+                        f"[fast:{campaign_id}] Stage A vector fallback: "
+                        f"{len(_matched_cos)} companies matched semantically"
+                    )
+            except Exception as _cv_e:
+                logger.warning(f"[fast:{campaign_id}] Stage A vector fallback failed: {_cv_e}")
+
+        await database.campaigns_collection.update_one(
+            {"_id": campaign_oid},
+            {"$set": {"discovery_companies_matched": len(_matched_cos)}},
+        )
 
         def _db_company_to_sc(co_doc: dict) -> dict:
             """Normalize a DB company doc to the sourced-company dict format used downstream."""
             _loc = co_doc.get("location") or {}
             return {
-                "company_linkedin_url": (co_doc.get("linkedin_url") or "").rstrip("/"),
+                # Canonical full URL (https://www.linkedin.com/company/<slug>) — the DB
+                # stores bare 'linkedin.com/company/<slug>', which neither the Apify
+                # employee actor nor the pool-reuse matcher (exact-match on the pool's
+                # full form) can resolve. Returns None for non-/company/ junk URLs.
+                "company_linkedin_url": _canonical_company_li_url(co_doc.get("linkedin_url")),
                 "company_name": co_doc.get("name"),
                 "company_domain": co_doc.get("domain") or co_doc.get("website"),
                 "company_website": co_doc.get("website"),
@@ -495,17 +996,145 @@ async def run_fast_discovery(campaign_id: str, account_id: str) -> dict:
                 ),
                 "description": co_doc.get("description"),
                 "country": (_loc.get("country") if isinstance(_loc, dict) else None) or "",
-                "_icp_score": 80.0,  # DB companies are pre-qualified; score higher than threshold
                 "_db_company_id": str(co_doc["_id"]),
                 "_source": "db",
             }
 
-        _matched_sc_list: list[dict] = [_db_company_to_sc(co) for co in _matched_cos]
+        # Drop companies whose linkedin_url canonicalizes to None (missing/junk, e.g.
+        # a /search/ URL) — they can't be scraped and would poison attribution.
+        _matched_sc_list: list[dict] = [
+            _sc for co in _matched_cos
+            if (_sc := _db_company_to_sc(co)).get("company_linkedin_url")
+        ]
+        _dropped_bad_url = len(_matched_cos) - len(_matched_sc_list)
+        if _dropped_bad_url:
+            logger.info(f"[fast:{campaign_id}] Stage A: dropped {_dropped_bad_url} companies with missing/invalid linkedin_url")
+
+        # Top-up: drop companies already used by this campaign so the pass finds NEW ones.
+        if generation > 1 and (_topup_excluded_co_urls or _topup_excluded_co_ids):
+            _before_excl = len(_matched_sc_list)
+            _matched_sc_list = [
+                _sc for _sc in _matched_sc_list
+                if (_sc.get("company_linkedin_url") or "").rstrip("/").lower()
+                not in _topup_excluded_co_urls
+                and str(_sc.get("_db_company_id") or "") not in _topup_excluded_co_ids
+            ]
+            if _before_excl - len(_matched_sc_list):
+                logger.info(
+                    f"[fast:{campaign_id}] Stage A: top-up excluded "
+                    f"{_before_excl - len(_matched_sc_list)} already-used companies"
+                )
+
+        # Score DB companies with the same deterministic scorer + threshold gate used
+        # for Stage B sourced companies below, instead of trusting a flat pre-qualified
+        # score. A DB match on industry/country alone doesn't guarantee ICP fit (e.g. a
+        # giant off-ICP company can still satisfy the industry/country filter), and the
+        # un-gated hard-coded 80.0 let those surface ahead of genuinely good matches.
+        for _sc in _matched_sc_list:
+            _sc["_icp_score"] = _score_company_deterministic(_sc, icp_prompt)
+        _kept_matched_sc_list = [
+            _sc for _sc in _matched_sc_list if _sc.get("_icp_score", 0) >= _COMPANY_SCORE_THRESHOLD
+        ]
+        _dropped_low_score = len(_matched_sc_list) - len(_kept_matched_sc_list)
+        if _dropped_low_score:
+            logger.info(
+                f"[fast:{campaign_id}] Stage A: dropped {_dropped_low_score} DB companies "
+                f"below score threshold {_COMPANY_SCORE_THRESHOLD}"
+            )
+        _matched_sc_list = _kept_matched_sc_list
+
+        # Name-normalized dedup ("Barnes & Noble" vs "Barnes andNoble", double
+        # Arbonne) — shared set also consumed by the Stage B callback below.
+        from services.company_gate_service import ai_company_gate, normalize_company_name
+        _seen_co_names: set[str] = set()
+        _name_deduped: list[dict] = []
+        for _sc in _matched_sc_list:
+            _nk = normalize_company_name(_sc.get("company_name"))
+            if _nk and _nk in _seen_co_names:
+                continue
+            if _nk:
+                _seen_co_names.add(_nk)
+            _name_deduped.append(_sc)
+        if len(_name_deduped) != len(_matched_sc_list):
+            logger.info(
+                f"[fast:{campaign_id}] Stage A: name-dedup dropped "
+                f"{len(_matched_sc_list) - len(_name_deduped)} duplicate companies"
+            )
+        _matched_sc_list = _name_deduped
+
+        # AI company-fit judge: the DB industry taxonomy can't tell an oil major
+        # with gas-station "retail" tags from a D2C brand — Gemini judges actual
+        # business-model fit against the ICP. Fail-open on infra errors.
+        if _matched_sc_list:
+            try:
+                _cg_verdicts = await ai_company_gate(
+                    [
+                        {
+                            "index": i,
+                            "name": c.get("company_name"),
+                            "description": c.get("description"),
+                            "industry": (
+                                (c.get("industry") or {}).get("label")
+                                if isinstance(c.get("industry"), dict) else c.get("industry")
+                            ),
+                            "employee_size": c.get("employee_size_estimate") or c.get("employee_band"),
+                        }
+                        for i, c in enumerate(_matched_sc_list)
+                    ],
+                    icp_prompt,
+                )
+                _cg_kept = [
+                    c for i, c in enumerate(_matched_sc_list)
+                    if (_cg_verdicts.get(i) or {}).get("match", True)
+                ]
+                if len(_cg_kept) != len(_matched_sc_list):
+                    _cg_rejected = [
+                        c.get("company_name") for i, c in enumerate(_matched_sc_list)
+                        if not (_cg_verdicts.get(i) or {}).get("match", True)
+                    ]
+                    logger.info(
+                        f"[fast:{campaign_id}] Stage A company gate rejected "
+                        f"{len(_matched_sc_list) - len(_cg_kept)}: {_cg_rejected[:10]}"
+                    )
+                _matched_sc_list = _cg_kept
+            except Exception as _cg_e:
+                logger.warning(f"[fast:{campaign_id}] Stage A company gate failed (fail-open): {_cg_e}")
+
         _matched_urls: set[str] = {
             (sc.get("company_linkedin_url") or "").rstrip("/").lower()
             for sc in _matched_sc_list
             if sc.get("company_linkedin_url")
         }
+
+        # Persist Stage A DB-matched companies to sourced_companies IMMEDIATELY so the
+        # UI shows them within seconds of discovery starting (previously only Gemini
+        # companies were persisted, making DB-first work invisible). Upsert keyed by
+        # campaign+URL so top-up generations don't duplicate rows.
+        if _matched_sc_list:
+            try:
+                _db_sc_ops = [
+                    UpdateOne(
+                        {"campaign_id": campaign_id, "company_linkedin_url": c.get("company_linkedin_url")},
+                        {"$setOnInsert": {
+                            **{k: v for k, v in c.items() if not k.startswith("_")},
+                            "_icp_score": c.get("_icp_score"),
+                            "campaign_id": campaign_id,
+                            "account_id": account_id,
+                            "source": "db_match",
+                            "user_excluded": False,
+                            "employee_scrape_status": "pending",
+                            "employees_scraped_count": 0,
+                            "prospects_created_count": 0,
+                            "created_at": now,
+                            "updated_at": now,
+                        }},
+                        upsert=True,
+                    )
+                    for c in _matched_sc_list
+                ]
+                await database.sourced_companies_collection.bulk_write(_db_sc_ops, ordered=False)
+            except Exception as _ap_e:
+                logger.warning(f"[fast:{campaign_id}] Stage A sourced_companies persist failed: {_ap_e}")
 
         # ── STAGE B: Gap-fill sourcing (only if matched < target) ─────────────────
         # gap == 0 → skip Gemini entirely (the "≥100 companies → don't source" rule).
@@ -517,95 +1146,194 @@ async def run_fast_discovery(campaign_id: str, account_id: str) -> dict:
 
         _sourced_sc_list: list[dict] = []
         if _gap > 0:
-            _sourcing_concurrency = int(campaign.get("discovery_sourcing_concurrency") or 1)
+            _sourcing_concurrency = int(campaign.get("discovery_sourcing_concurrency") or _DEFAULT_SOURCING_CONCURRENCY)
             _want = math.ceil(_gap * _COMPANY_BUFFER)
             logger.info(f"[fast:{campaign_id}] Stage B: sourcing ~{_want} companies (gap={_gap})")
 
+            # Structured hard-requirement hints from canonical ICP → tighter Gemini results.
+            _hint_lines: list[str] = []
+            if campaign.get("icp_industries"):
+                _hint_lines.append(f"- Industry must be one of: {', '.join(campaign['icp_industries'][:8])}")
+            if _icp_country_codes:
+                _hint_lines.append(f"- Headquarters country code must be one of: {', '.join(_icp_country_codes[:8])}")
+            if campaign.get("icp_company_size_min") or campaign.get("icp_company_size_max"):
+                _hint_lines.append(
+                    f"- Employee count between {campaign.get('icp_company_size_min') or 1} "
+                    f"and {campaign.get('icp_company_size_max') or '10000+'}"
+                )
+            _structured_hints = "\n".join(_hint_lines) or None
+
+            # Negative feedback: names rejected by the deterministic company score are fed
+            # back into subsequent batch prompts (the list is mutated by the callback below,
+            # and _build_prompt reads it at batch-execution time).
+            _negative_hints: list[str] = []
+
+            _seen_in_gap: set[str] = set()
+            _incremental_kept: list[dict] = []
+
+            async def _on_sourcing_batch(new_items: list[dict]) -> None:
+                """Process each Gemini batch as it lands: dedup, DB-hit rescue, score,
+                threshold-gate, and persist accepted companies to sourced_companies so
+                the UI streams rows in while other batches are still running."""
+                _batch_urls = [
+                    (c.get("company_linkedin_url") or "").rstrip("/").lower()
+                    for c in new_items if c.get("company_linkedin_url")
+                ]
+                # Companies Gemini found that ALREADY exist in the shared pool: use the
+                # richer DB doc (canonical industry/location/prospect_count) instead of
+                # dropping them like the old dedup did — they're DB-first wins.
+                _db_docs_by_url: dict[str, dict] = {}
+                if _batch_urls:
+                    async for _ex in database.companies_collection.find(
+                        {"linkedin_url": {"$in": _batch_urls}}
+                    ):
+                        _db_docs_by_url[(_ex.get("linkedin_url") or "").rstrip("/").lower()] = _ex
+
+                _accepted_docs: list[dict] = []
+                _raw_count = len(new_items)
+                _batch_pass: list[dict] = []
+                for _co in new_items:
+                    _co_url = (_co.get("company_linkedin_url") or "").rstrip("/").lower()
+                    if not _co_url or _co_url in _matched_urls or _co_url in _seen_in_gap:
+                        continue
+                    if generation > 1 and _co_url in _topup_excluded_co_urls:
+                        continue
+                    _seen_in_gap.add(_co_url)
+                    # Name-normalized dedup vs Stage A + earlier batches.
+                    _nk = normalize_company_name(_co.get("company_name"))
+                    if _nk and _nk in _seen_co_names:
+                        continue
+                    if _nk:
+                        _seen_co_names.add(_nk)
+                    _db_doc = _db_docs_by_url.get(_co_url)
+                    if _db_doc is not None:
+                        _co = _db_company_to_sc(_db_doc)
+                        if not _co.get("company_linkedin_url"):
+                            continue
+                        _co["_source"] = "db"
+                    else:
+                        _co["_source"] = "gemini"
+                    _co["_icp_score"] = _score_company_deterministic(_co, icp_prompt)
+                    if _co.get("_icp_score", 0) < _COMPANY_SCORE_THRESHOLD:
+                        if len(_negative_hints) < 20 and _co.get("company_name"):
+                            _negative_hints.append(f"{_co['company_name']} (weak ICP fit)")
+                        continue
+                    _batch_pass.append(_co)
+
+                # AI company-fit judge on this batch's score survivors (fail-open).
+                if _batch_pass:
+                    try:
+                        _bg_verdicts = await ai_company_gate(
+                            [
+                                {
+                                    "index": i,
+                                    "name": c.get("company_name"),
+                                    "description": c.get("description"),
+                                    "industry": (
+                                        (c.get("industry") or {}).get("label")
+                                        if isinstance(c.get("industry"), dict) else c.get("industry")
+                                    ),
+                                    "employee_size": c.get("employee_size_estimate") or c.get("employee_band"),
+                                }
+                                for i, c in enumerate(_batch_pass)
+                            ],
+                            icp_prompt,
+                        )
+                        _bg_kept: list[dict] = []
+                        for i, c in enumerate(_batch_pass):
+                            _v = _bg_verdicts.get(i) or {}
+                            if _v.get("match", True):
+                                _bg_kept.append(c)
+                            elif len(_negative_hints) < 20 and c.get("company_name"):
+                                _negative_hints.append(
+                                    f"{c['company_name']} ({_v.get('reason') or 'poor business-model fit'})"
+                                )
+                        _batch_pass = _bg_kept
+                    except Exception as _bg_e:
+                        logger.warning(f"[fast:{campaign_id}] Stage B company gate failed (fail-open): {_bg_e}")
+
+                for _co in _batch_pass:
+                    if len(_incremental_kept) >= _gap:
+                        break  # target reached — count raw but stop accepting
+                    _incremental_kept.append(_co)
+                    _accepted_docs.append({
+                        **{k: v for k, v in _co.items() if not k.startswith("_")},
+                        "_icp_score": _co.get("_icp_score"),
+                        "campaign_id": campaign_id,
+                        "account_id": account_id,
+                        "source": "db_match" if _co.get("_source") == "db" else "gemini_grounded",
+                        "user_excluded": False,
+                        "employee_scrape_status": "pending",
+                        "employees_scraped_count": 0,
+                        "prospects_created_count": 0,
+                        "created_at": datetime.utcnow(),
+                        "updated_at": datetime.utcnow(),
+                    })
+
+                # Count ACCEPTED companies (not raw) so matched + sourced == rows the
+                # UI actually shows in the companies list.
+                await database.campaigns_collection.update_one(
+                    {"_id": campaign_oid},
+                    {"$inc": {"curated_companies_sourced": len(_accepted_docs)}},
+                )
+                if _accepted_docs:
+                    try:
+                        await database.sourced_companies_collection.insert_many(_accepted_docs, ordered=False)
+                    except Exception as _ib_e:
+                        logger.warning(f"[fast:{campaign_id}] incremental sourced_companies persist failed: {_ib_e}")
+
             try:
-                _gemini_raw, _gemini_meta = await _with_retries(
-                    lambda: source_companies(
-                        icp_prompt=icp_prompt,
-                        target_count=_want,
-                        exclude_names=[sc.get("company_name") or "" for sc in _matched_sc_list],
-                        account_id=account_id,
-                        campaign_id=campaign_id,
-                        validate_urls=False,
-                        max_concurrency=_sourcing_concurrency,
-                    )
+                # Single retry layer: source_companies retries each Gemini batch
+                # internally (3x with backoff); the old outer _with_retries wrap made
+                # worst-case 9 attempts per batch and tripled tail latency.
+                _gemini_raw, _gemini_meta = await source_companies(
+                    icp_prompt=icp_prompt,
+                    target_count=_want,
+                    exclude_names=[sc.get("company_name") or "" for sc in _matched_sc_list],
+                    account_id=account_id,
+                    campaign_id=campaign_id,
+                    validate_urls=False,
+                    max_concurrency=_sourcing_concurrency,
+                    structured_hints=_structured_hints,
+                    negative_hints=_negative_hints,
+                    on_batch=_on_sourcing_batch,
                 )
             except Exception as _sb_e:
                 logger.warning(f"[fast:{campaign_id}] Stage B Gemini sourcing failed: {_sb_e}")
                 _gemini_raw, _gemini_meta = [], {}
 
-            # Dedupe sourced companies against already-matched DB companies and each other
-            _raw_co_urls = [
-                (c.get("company_linkedin_url") or "").rstrip("/").lower()
-                for c in _gemini_raw
-                if c.get("company_linkedin_url")
-            ]
-            _db_url_existing: set[str] = set()
-            if _raw_co_urls:
-                async for _ex in database.companies_collection.find(
-                    {"linkedin_url": {"$in": _raw_co_urls}},
-                    {"linkedin_url": 1},
-                ):
-                    _db_url_existing.add((_ex.get("linkedin_url") or "").rstrip("/").lower())
-
-            _seen_in_gap: set[str] = set()
-            _deduped: list[dict] = []
-            for _co in _gemini_raw:
-                _co_url = (_co.get("company_linkedin_url") or "").rstrip("/").lower()
-                if not _co_url:
-                    continue
-                if _co_url in _matched_urls or _co_url in _db_url_existing or _co_url in _seen_in_gap:
-                    continue
-                _seen_in_gap.add(_co_url)
-                _co["_source"] = "gemini"
-                _deduped.append(_co)
-
-            # Score and keep above threshold, limited to the gap
-            for _co in _deduped:
-                _co["_icp_score"] = _score_company_deterministic(_co, icp_prompt)
-            _sourced_sc_list = [
-                _co for _co in _deduped
-                if _co.get("_icp_score", 0) >= _COMPANY_SCORE_THRESHOLD
-                and _co.get("company_linkedin_url")
-            ][:_gap]
-
-            await database.campaigns_collection.update_one(
-                {"_id": campaign_oid},
-                {"$set": {"curated_companies_sourced": len(_gemini_raw)}},
-            )
+            _sourced_sc_list = _incremental_kept
             logger.info(
                 f"[fast:{campaign_id}] Stage B: raw={len(_gemini_raw)}, "
-                f"deduped={len(_deduped)}, kept={len(_sourced_sc_list)}"
+                f"kept={len(_sourced_sc_list)} (streamed incrementally, "
+                f"{len(_negative_hints)} negative-feedback hints accumulated)"
             )
         else:
             logger.info(f"[fast:{campaign_id}] Stage B: skipped (DB already has enough companies)")
 
         # Merge DB-matched + Gemini-sourced into the working company set
+        # (both cohorts already persisted to sourced_companies incrementally above)
         kept_companies: list[dict] = _matched_sc_list + _sourced_sc_list
 
-        # Persist Gemini-sourced companies to sourced_companies collection for UI display
-        if _sourced_sc_list:
-            _sc_ui_docs = [{
-                **c,
-                "campaign_id": campaign_id,
-                "account_id": account_id,
-                "source": "gemini_grounded",
-                "user_excluded": False,
-                "employee_scrape_status": "pending",
-                "employees_scraped_count": 0,
-                "prospects_created_count": 0,
-                "created_at": now,
-                "updated_at": now,
-            } for c in _sourced_sc_list]
-            try:
-                await database.sourced_companies_collection.insert_many(_sc_ui_docs, ordered=False)
-            except Exception as _ui_e:
-                logger.warning(f"[fast:{campaign_id}] sourced_companies UI persist failed: {_ui_e}")
-
         if not kept_companies:
+            if generation > 1:
+                # A top-up pass that exhausted new companies is a normal terminal
+                # state, NOT a failure — the earlier generation(s) already enrolled
+                # prospects. Settle the campaign as completed and stop topping up.
+                await database.campaigns_collection.update_one(
+                    {"_id": campaign_oid},
+                    {"$set": {
+                        "discovery_status": "completed",
+                        "discovery_completed_at": datetime.utcnow(),
+                        "discovery_topup_active": False,
+                        "discovery_topup_message": None,
+                    }},
+                )
+                logger.info(
+                    f"[fast:{campaign_id}] top-up gen {generation}: no new companies "
+                    "left to source — settling as completed"
+                )
+                return {"campaign_id": campaign_id, "sourced": 0, "generation": generation}
             await database.campaigns_collection.update_one(
                 {"_id": campaign_oid},
                 {"$set": {
@@ -696,7 +1424,11 @@ async def run_fast_discovery(campaign_id: str, account_id: str) -> dict:
         # Reduce prospect_target by how many we already have from the reuse pool
         prospect_target = max(0, prospect_target - _db_enrolled_count)
 
-        # ── ③ Bulk Apify employee scrape (companies_to_scrape only) ────────────
+        # ── ③ Streaming Apify employee scrape + per-chunk gate/enroll ────────────
+        # Companies are scraped in chunks of ~_SCRAPE_CHUNK_SIZE run concurrently; each
+        # chunk's employees are gated, emailed, upserted, and PRE-ENROLLED as soon as
+        # that chunk's Apify run returns — so prospects stream into the UI instead of
+        # appearing all at once after the slowest scrape finishes.
         await database.campaigns_collection.update_one(
             {"_id": campaign_oid},
             {"$set": {"discovery_status": "scraping_employees"}},
@@ -705,154 +1437,502 @@ async def run_fast_discovery(campaign_id: str, account_id: str) -> dict:
         # ── Per-campaign tuning overrides (campaign doc keys; fall back to module constants) ──
         _scrape_depth = int(campaign.get("discovery_scrape_depth") or _SCRAPE_DEPTH)
         _dropout_buffer = float(campaign.get("discovery_dropout_buffer") or _SCORING_DROPOUT_BUFFER)
+        _profile_mode = campaign.get("discovery_profile_scraper_mode") or _PROFILE_SCRAPER_MODE
         # _enroll_cap already set in Stage C above
-        _sourcing_concurrency = int(campaign.get("discovery_sourcing_concurrency") or 1)
 
         seniority_ids = _icp_seniority_to_actor_ids(campaign.get("icp_seniority_levels") or [])
         functional_ids = _icp_function_to_actor_ids(campaign.get("icp_functional_departments") or [])
+        headcount_bands = _icp_size_to_headcount_bands(
+            campaign.get("icp_company_size_min"), campaign.get("icp_company_size_max")
+        )
         # Only scrape companies not covered by Stage C reuse pool
         company_urls = [c["company_linkedin_url"] for c in companies_to_scrape]
 
+        _scrape_concurrency = int(
+            campaign.get("discovery_scrape_concurrency")
+            or min(_DEFAULT_SCRAPE_CONCURRENCY, max(1, math.ceil(len(company_urls) / _SCRAPE_CHUNK_SIZE)))
+        )
+
         logger.info(
-            f"[fast:{campaign_id}] bulk Apify — {len(company_urls)} cos, "
+            f"[fast:{campaign_id}] streaming Apify — {len(company_urls)} cos, "
             f"scrape_depth={_scrape_depth}, dropout_buffer={_dropout_buffer}, enroll_cap={_enroll_cap}, "
-            f"seniority={seniority_ids}, function={functional_ids}"
+            f"concurrency={_scrape_concurrency}, seniority={seniority_ids}, function={functional_ids}, "
+            f"headcount={headcount_bands}"
         )
 
-        raw_employees = await _with_retries(
-            lambda: bulk_scrape_employees_for_companies(
-                company_urls,
-                max_items_per_company=_scrape_depth,
-                max_total_items=math.ceil(prospect_target * _dropout_buffer),
-                seniority_level_ids=seniority_ids or None,
-                functional_level_ids=functional_ids or None,
-                profile_scraper_mode=_PROFILE_SCRAPER_MODE,
-                account_id=account_id,
-                campaign_id=campaign_id,
-            )
-        )
-        logger.info(f"[fast:{campaign_id}] bulk Apify returned {len(raw_employees)} employees")
+        from services.email_finder_service import find_emails, EmailLookupEntry
+        from utils.scoring import score_prospect_for_campaign as _score_for_campaign
+        from services.campaign_scoring_service import compute_campaign_score
+        from services.prospect_enrollment_service import _pre_enroll_prospects
 
-        # Map each employee to its sourced company (by companyUrl from response).
-        # FIXED: employees whose company URL is present but doesn't match any ICP company
-        # are off-ICP contamination — drop them rather than mis-attributing to kept_companies[0].
-        # Employees with NO company URL (scraper omission, not off-ICP) get the first company
-        # as a fallback, since we can't determine their attribution.
         url_to_sc = {
             (_normalize_li_url(c.get("company_linkedin_url")) or ""): c
             for c in kept_companies
             if c.get("company_linkedin_url")
         }
-        returned_company_urls: set[str] = set()
-        employee_pairs: list[tuple[dict, dict]] = []  # (raw_employee, sourced_company)
-        # Fallback attribution for employees missing a company URL — use first scraped company
-        _fallback_sc = (
-            companies_to_scrape[0] if companies_to_scrape
-            else kept_companies[0] if kept_companies
-            else None
-        )
-        _dropped_off_icp = 0
-        _no_url_fallback = 0
-        for emp in raw_employees:
-            co_url = _extract_company_url_from_employee(emp)
-            if co_url:
-                returned_company_urls.add(co_url)
-                sc = url_to_sc.get(co_url) or _find_closest_sc(co_url, url_to_sc)
-                if sc is None:
-                    # co_url present but off-ICP — drop to avoid polluting attribution
-                    _dropped_off_icp += 1
-                    continue
-            else:
-                # No company URL in scraper response — keep with fallback
-                sc = _fallback_sc
-                if sc is None:
-                    continue
-                _no_url_fallback += 1
-            employee_pairs.append((emp, sc))
-
-        if _dropped_off_icp or _no_url_fallback:
-            logger.info(
-                f"[fast:{campaign_id}] employee attribution: "
-                f"dropped_off_icp={_dropped_off_icp}, no_url_fallback={_no_url_fallback}"
-            )
-
-        # ── ④ Score employees, then find emails for keepers only ────────────────────────
-        logger.info(
-            f"[fast:{campaign_id}] gates: companies_kept={len(kept_companies)}, "
-            f"employees_scraped={len(raw_employees)}"
-        )
-
-        from services.email_finder_service import find_emails_bulk
-
-        transformed = [transform_employee_to_prospect(emp, sc) for emp, sc in employee_pairs]
-
-        # Re-resolve SC using each prospect's own company_linkedin field, which is populated
-        # from the employee's currentPositions data and is reliable even in batch mode.
-        # The actor's batch response often omits currentPositions[0].companyLinkedinUrl, causing
-        # the attribution loop to fall back to kept_companies[0] for most employees.
         _url_to_sc_norm = {
             (c.get("company_linkedin_url") or "").rstrip("/").lower(): c
             for c in kept_companies
             if c.get("company_linkedin_url")
         }
-        _improved_sc = 0
-        for i in range(len(employee_pairs)):
-            emp_i, sc_i = employee_pairs[i]
-            t_co_url = (transformed[i].get("company_linkedin") or "").rstrip("/").lower()
-            if not t_co_url:
-                continue
-            if (sc_i.get("company_linkedin_url") or "").rstrip("/").lower() == t_co_url:
-                continue
-            resolved = _url_to_sc_norm.get(t_co_url)
-            if resolved:
-                employee_pairs[i] = (emp_i, resolved)
-                transformed[i] = transform_employee_to_prospect(emp_i, resolved)
-                _improved_sc += 1
-        if _improved_sc:
-            logger.info(f"[fast:{campaign_id}] SC re-attribution: fixed {_improved_sc}/{len(employee_pairs)} employees")
 
-        from utils.scoring import score_prospect_for_campaign as _score_for_campaign
-
+        # ── Shared accumulators across chunks ──
+        raw_employees: list[dict] = []               # all raw employees (recovery yield calc)
+        returned_company_urls: set[str] = set()
+        employee_pairs: list[tuple[dict, dict]] = [] # all attributed (raw_employee, sc) pairs
+        _relax_pool: list[tuple[dict, dict]] = []    # relaxable gate rejects (global relax ladder)
+        _gate_stats_total: dict[str, int] = {}
+        new_prospect_oids: list[ObjectId] = []
+        _seen_prospect_oids: set = set()
+        per_company_counts: dict = {}
+        _campaign_source_by_oid: dict[ObjectId, dict] = {}
+        _enrolled_running = 0                        # scraped prospects enrolled so far
+        _dropped_off_icp = 0
+        _dropped_no_url = 0
+        _ai_gate_rejected = 0
+        _email_credit_warnings: list[str] = []
         email_by_url: dict[str, str | None] = {}
+        emails_applied = 0
 
-        kept_employees: list[tuple[dict, dict]] = []  # (prospect_dict, sourced_company)
-        for i, (t, (_, sc)) in enumerate(zip(transformed, employee_pairs)):
-            score = _score_for_campaign(t, campaign)
-            t["fit_score"] = score
-            t["ai_prospect_score"] = float(score)
-            if score >= _EMPLOYEE_SCORE_THRESHOLD and (t.get("linkedin") or t.get("email")):
-                kept_employees.append((t, sc))
+        _scoring_version = campaign.get("scoring_version") or DEFAULT_SCORING_VERSION
+        _cohort_id = f"campaign:{campaign_id}:selected"
+
+        _ai_gate_icp = {
+            "job_titles": campaign.get("icp_job_titles") or [],
+            "seniorities": campaign.get("icp_seniority_levels") or [],
+            "functions": campaign.get("icp_functional_departments") or [],
+            "notes": (icp_prompt or "")[:500],
+        }
+
+        async def _apply_ai_title_gate(pairs: list[tuple[dict, dict]]) -> list[tuple[dict, dict]]:
+            """Cheap-LLM judge on titles that survived the deterministic gates. Catches
+            qualifier-mismatch roles token matching can't ("merchandise manager" for a
+            "marketing manager" ICP). Fail-open: gate infra errors keep everyone."""
+            nonlocal _ai_gate_rejected
+            if not pairs:
+                return pairs
+            try:
+                from services.title_gate_service import ai_title_gate
+            except Exception:
+                return pairs
+            try:
+                _cands = [
+                    {"index": i, "title": t.get("job_title") or "", "headline": t.get("headline") or ""}
+                    for i, (t, _) in enumerate(pairs)
+                ]
+                _verdicts = await ai_title_gate(_cands, _ai_gate_icp)
+                _kept = [
+                    pair for i, pair in enumerate(pairs)
+                    if (_verdicts.get(i) or {}).get("match", True)
+                ]
+                _ai_gate_rejected += len(pairs) - len(_kept)
+                return _kept
+            except Exception as _ag_e:
+                logger.warning(f"[fast:{campaign_id}] AI title gate failed (fail-open): {_ag_e}")
+                return pairs
+
+        async def _find_emails_for(pairs: list[tuple[dict, dict]]) -> None:
+            """Bulk GrowthToolkit email lookup for one chunk's kept prospects."""
+            nonlocal emails_applied
+            _entries = [
+                EmailLookupEntry(
+                    first_name=t["first_name"],
+                    last_name=t["last_name"],
+                    domain=t["company_domain"],
+                    key=t["linkedin"],
+                )
+                for t, _ in pairs
+                if not t.get("email") and t.get("linkedin") and t["linkedin"] not in email_by_url
+                and t.get("first_name") and t.get("last_name") and t.get("company_domain")
+            ]
+            if not _entries:
+                return
+            try:
+                _found = await find_emails(
+                    _entries,
+                    account_id=str(account_id) if account_id else None,
+                    credit_warnings=_email_credit_warnings,
+                )
+                email_by_url.update(_found)
+            except Exception as _ef_e:
+                logger.warning(f"[fast:{campaign_id}] email finder failed (continuing): {_ef_e}")
+            for t, _ in pairs:
+                if not t.get("email") and t.get("linkedin"):
+                    _f = email_by_url.get(t["linkedin"])
+                    if _f:
+                        t["email"] = _f
+                        emails_applied += 1
+
+        async def _persist_and_enroll(pairs: list[tuple[dict, dict]], *, label: str) -> int:
+            """Upsert + cohort-score + pre-enroll a list of (prospect_dict, sc) pairs.
+            Idempotent per prospect (dedup via _seen_prospect_oids; _pre_enroll_prospects
+            skips already-enrolled). Returns number of newly persisted prospects."""
+            nonlocal new_prospect_oids
+            if not pairs:
+                return 0
+            _chunk_oids: list[ObjectId] = []
+            _cascade_groups: list[tuple[ObjectId, str]] = []  # (prospect_oid, company_url)
+            # Each upsert is keyed by its own linkedin/email and independent of
+            # the others — run them concurrently instead of one round trip at a
+            # time; bookkeeping below still runs in the original pair order.
+            _upsert_oids = await asyncio.gather(
+                *[_upsert_curated_prospect(t, campaign_oid, account_id) for t, sc in pairs]
+            )
+            for (t, sc), oid in zip(pairs, _upsert_oids):
+                if not oid or oid in _seen_prospect_oids:
+                    continue
+                _seen_prospect_oids.add(oid)
+                new_prospect_oids.append(oid)
+                _chunk_oids.append(oid)
+                _campaign_source_by_oid[oid] = t
+                sc_id = sc.get("_id") or sc.get("company_linkedin_url", "")
+                per_company_counts[sc_id] = per_company_counts.get(sc_id, 0) + 1
+                _cg_url = (t.get("company_linkedin") or sc.get("company_linkedin_url") or "").rstrip("/").lower()
+                if _cg_url:
+                    _cascade_groups.append((oid, _cg_url))
+
+            if not _chunk_oids:
+                return 0
+
+            _score_ops = []
+            for _oid in _chunk_oids:
+                _source = _campaign_source_by_oid.get(_oid)
+                if not _source:
+                    continue
+                _score_result = compute_campaign_score(
+                    _source,
+                    campaign,
+                    profile=_source.get("linkedin_profile_data"),
+                    company=_source.get("company_data"),
+                )
+                _source["_campaign_fit_score"] = _score_result["fit_score"]
+                _source["_campaign_priority_tier"] = _score_result["priority_tier"]
+                _score_ops.append(score_update_operation(
+                    account_id=account_id,
+                    campaign_id=campaign_oid,
+                    prospect_id=_oid,
+                    result=_score_result,
+                    scoring_version=_scoring_version,
+                    cohort_id=_cohort_id,
+                    cohort_label="selected",
+                ))
+            await persist_campaign_scores(_score_ops)
+            await ensure_cohort_membership(
+                account_id=account_id,
+                campaign_id=campaign_oid,
+                prospect_ids=_chunk_oids,
+                cohort_id=_cohort_id,
+                cohort_label="selected",
+                scoring_version=_scoring_version,
+            )
+
+            _chunk_full = await database.prospects_collection.find(
+                {"_id": {"$in": _chunk_oids}}
+            ).to_list(length=None)
+            for _persisted in _chunk_full:
+                _source = _campaign_source_by_oid.get(_persisted.get("_id")) or {}
+                if _source.get("_campaign_fit_score") is not None:
+                    _persisted["_campaign_fit_score"] = _source["_campaign_fit_score"]
+                if _source.get("_campaign_priority_tier") is not None:
+                    _persisted["_campaign_priority_tier"] = _source["_campaign_priority_tier"]
+            if _chunk_full:
+                await _pre_enroll_prospects(campaign, _chunk_full)
+
+            # Tag primaries with cascade grouping (position 0) so the rotation
+            # engine can find their backups when the sequence exhausts unanswered.
+            if _cascade_groups:
+                try:
+                    await database.campaign_enrollments_collection.bulk_write(
+                        [
+                            UpdateOne(
+                                {"campaign_id": campaign_oid, "prospect_id": _p_oid},
+                                {"$set": {"cascade_group_id": _cg, "cascade_position": 0, "cascade_status": "primary"}},
+                            )
+                            for _p_oid, _cg in _cascade_groups
+                        ],
+                        ordered=False,
+                    )
+                except Exception as _cgt_e:
+                    logger.warning(f"[fast:{campaign_id}] cascade tagging failed: {_cgt_e}")
+
+            logger.info(f"[fast:{campaign_id}] {label}: persisted+enrolled {len(_chunk_oids)} prospects")
+            return len(_chunk_oids)
+
+        _backup_counts: dict = {}
+
+        async def _create_backup_enrollments(pairs: list[tuple[dict, dict]]) -> int:
+            """Store next-best gate survivors per company as cascade_waiting backups:
+            prospect upserted to the pool, minimal enrollment doc created — NO email
+            lookup, NO message generation. The engine activates position N+1 when the
+            primary (position 0) exhausts the sequence with status not_replied."""
+            if not pairs:
+                return 0
+            _now = datetime.utcnow()
+            # Independent upserts (own linkedin/email key each) — run concurrently,
+            # then build enrollment docs in the original pair order below.
+            _upsert_oids = await asyncio.gather(
+                *[_upsert_curated_prospect(t, campaign_oid, account_id) for t, sc in pairs]
+            )
+            _backup_ops: list[UpdateOne] = []
+            for (t, sc), oid in zip(pairs, _upsert_oids):
+                if not oid or oid in _seen_prospect_oids:
+                    continue
+                _seen_prospect_oids.add(oid)
+                _cg_url = (t.get("company_linkedin") or sc.get("company_linkedin_url") or "").rstrip("/").lower()
+                if not _cg_url or _backup_counts.get(f"pos:{_cg_url}", 0) >= _PER_COMPANY_BACKUP_COUNT:
+                    continue
+                _pos = _backup_counts.get(f"pos:{_cg_url}", 0) + 1
+                _backup_counts[f"pos:{_cg_url}"] = _pos
+                _backup_ops.append(UpdateOne(
+                    {"campaign_id": campaign_oid, "prospect_id": oid},
+                    {"$setOnInsert": {
+                        "campaign_id": campaign_oid,
+                        "account_id": campaign.get("account_id"),
+                        "prospect_id": oid,
+                        "status": "cascade_waiting",
+                        "cascade_status": "waiting",
+                        "cascade_group_id": _cg_url,
+                        "cascade_position": _pos,
+                        "cascade_activate_at": None,  # event-driven, not timed
+                        "created_at": _now,
+                        "updated_at": _now,
+                    }},
+                    upsert=True,
+                ))
+
+            _created = 0
+            if _backup_ops:
+                try:
+                    await database.campaign_enrollments_collection.bulk_write(_backup_ops, ordered=False)
+                    _created = len(_backup_ops)
+                except Exception as _be_e:
+                    logger.warning(f"[fast:{campaign_id}] backup enrollment bulk_write failed: {_be_e}")
+            if _created:
+                logger.info(f"[fast:{campaign_id}] stored {_created} cascade backups")
+            return _created
+
+        async def _process_scraped_employees(
+            chunk_employees: list[dict],
+            chunk_urls: list[str],
+            *,
+            label: str,
+            skip_ai_gate: bool = False,
+        ) -> int:
+            """Full per-chunk pipeline: attribute → transform → score → strict gate →
+            AI title gate → per-company cap → remaining-target cap → email → re-score →
+            persist/enroll → live counter updates. Returns enrolled count for the chunk."""
+            nonlocal _enrolled_running, _dropped_off_icp, _dropped_no_url
+            raw_employees.extend(chunk_employees)
+
+            _pairs: list[tuple[dict, dict]] = []
+            for emp in chunk_employees:
+                co_url = _extract_company_url_from_employee(emp)
+                if co_url:
+                    returned_company_urls.add(co_url)
+                    sc = url_to_sc.get(co_url) or _find_closest_sc(co_url, url_to_sc)
+                    if sc is None:
+                        _dropped_off_icp += 1
+                        continue
+                else:
+                    _dropped_no_url += 1
+                    continue
+                _pairs.append((emp, sc))
+            employee_pairs.extend(_pairs)
+
+            _transformed = [transform_employee_to_prospect(emp, sc) for emp, sc in _pairs]
+            # Re-resolve SC via the prospect's own company_linkedin (reliable in batch mode)
+            for i in range(len(_pairs)):
+                emp_i, sc_i = _pairs[i]
+                t_co_url = (_transformed[i].get("company_linkedin") or "").rstrip("/").lower()
+                if not t_co_url or (sc_i.get("company_linkedin_url") or "").rstrip("/").lower() == t_co_url:
+                    continue
+                resolved = _url_to_sc_norm.get(t_co_url)
+                if resolved:
+                    _pairs[i] = (emp_i, resolved)
+                    _transformed[i] = transform_employee_to_prospect(emp_i, resolved)
+
+            _candidates: list[tuple[dict, dict]] = []
+            for t, (_, sc) in zip(_transformed, _pairs):
+                score = _score_for_campaign(t, campaign)
+                t["fit_score"] = score
+                t["ai_prospect_score"] = float(score)
+                _candidates.append((t, sc))
+
+            # Strict-only gate per chunk; relaxable rejects pool globally and the relax
+            # ladder runs ONCE after all chunks (same floor semantics as before).
+            _kept, _stats = _gate_and_select(
+                _candidates, campaign, prospect_target,
+                campaign_id=campaign_id, label=label, collect_relaxable=_relax_pool,
+            )
+            for k, v in _stats.items():
+                _gate_stats_total[k] = _gate_stats_total.get(k, 0) + v
+
+            if not skip_ai_gate:
+                _kept = await _apply_ai_title_gate(_kept)
+
+            # Per-company enrollment cap (global counter — companies can span chunks
+            # after re-attribution).
+            _capped: list[tuple[dict, dict]] = []
+            _chunk_co_counts: dict = {}
+            _kept.sort(key=lambda p: p[0].get("fit_score", 0), reverse=True)
+            for t, sc in _kept:
+                sc_id = sc.get("_id") or sc.get("company_linkedin_url", "")
+                if per_company_counts.get(sc_id, 0) + _chunk_co_counts.get(sc_id, 0) >= _enroll_cap:
+                    continue
+                _chunk_co_counts[sc_id] = _chunk_co_counts.get(sc_id, 0) + 1
+                _capped.append((t, sc))
+
+            # Cap to remaining global target
+            _remaining = max(0, prospect_target - _enrolled_running)
+            _capped = _capped[:_remaining]
+
+            # Backups: next-best gate survivors per company beyond the primary cap —
+            # stored as cascade_waiting (no email spend), rotated in on no-reply.
+            _sel = {id(t) for t, _ in _capped}
+            _backup_pairs: list[tuple[dict, dict]] = []
+            for t, sc in _kept:
+                if id(t) in _sel:
+                    continue
+                _bk_url = (t.get("company_linkedin") or sc.get("company_linkedin_url") or "").rstrip("/").lower()
+                if not _bk_url or _backup_counts.get(f"pos:{_bk_url}", 0) >= _PER_COMPANY_BACKUP_COUNT:
+                    continue
+                _backup_pairs.append((t, sc))
+            if _backup_pairs:
+                await _create_backup_enrollments(_backup_pairs)
+
+            if not _capped:
+                return 0
+
+            await _find_emails_for(_capped)
+            # Re-score with email+industry populated (activates the 15-pt email and
+            # 18-pt industry components).
+            for t, _ in _capped:
+                _up = _score_for_campaign(t, campaign)
+                t["fit_score"] = _up
+                t["ai_prospect_score"] = float(_up)
+
+            _n = await _persist_and_enroll(_capped, label=label)
+            _enrolled_running += _n
+
+            # Live progress: counters tick + per-company scrape status flips as each
+            # chunk lands (consumed by the discovery SSE stream + polling UI).
+            try:
+                await database.campaigns_collection.update_one(
+                    {"_id": campaign_oid},
+                    {"$inc": {
+                        "discovery_prospects_found": _n,
+                        "discovery_prospects_from_apify": _n,
+                    }},
+                )
+                if chunk_urls:
+                    await database.sourced_companies_collection.update_many(
+                        {"campaign_id": campaign_id, "company_linkedin_url": {"$in": chunk_urls}},
+                        {"$set": {"employee_scrape_status": "completed", "updated_at": datetime.utcnow()}},
+                    )
+            except Exception as _lp_e:
+                logger.warning(f"[fast:{campaign_id}] live progress update failed: {_lp_e}")
+            return _n
+
+        # ── Stage C reused prospects: enroll FIRST (instant, no scraping needed) ──
+        # Pool reuse never implies score reuse — evaluate each against this campaign.
+        for _rp, _ in _reused_pairs:
+            _reused_score = _score_for_campaign(_rp, campaign)
+            _rp["fit_score"] = _reused_score
+            _rp["_campaign_fit_score"] = float(_reused_score)
+        _db_enrolled_count = await _persist_and_enroll(_reused_pairs, label="pool_reuse")
+        if _db_enrolled_count:
+            try:
+                await database.campaigns_collection.update_one(
+                    {"_id": campaign_oid},
+                    {"$inc": {
+                        "discovery_prospects_found": _db_enrolled_count,
+                        "discovery_prospects_from_db": _db_enrolled_count,
+                    }},
+                )
+            except Exception:
+                pass
+
+        # ── Scrape chunks concurrently; process each as it completes ──
+        _chunks: list[list[str]] = [
+            company_urls[i:i + _SCRAPE_CHUNK_SIZE]
+            for i in range(0, len(company_urls), _SCRAPE_CHUNK_SIZE)
+        ]
+        _scrape_sem = asyncio.Semaphore(max(1, _scrape_concurrency))
+
+        async def _scrape_chunk(idx: int, urls: list[str]) -> tuple[list[str], list[dict]]:
+            async with _scrape_sem:
+                try:
+                    _emps = await _with_retries(
+                        lambda: bulk_scrape_employees_for_companies(
+                            urls,
+                            max_items_per_company=_scrape_depth,
+                            max_total_items=math.ceil(len(urls) * _scrape_depth),
+                            seniority_level_ids=seniority_ids or None,
+                            functional_level_ids=functional_ids or None,
+                            profile_scraper_mode=_profile_mode,
+                            account_id=account_id,
+                            campaign_id=campaign_id,
+                            max_concurrency=1,
+                            company_headcount_bands=headcount_bands or None,
+                        ),
+                        retries=2,
+                    )
+                    return urls, _emps
+                except Exception as _sc_e:
+                    logger.warning(f"[fast:{campaign_id}] scrape chunk {idx} failed: {_sc_e}")
+                    return urls, []
+
+        for _fut in asyncio.as_completed([_scrape_chunk(i, u) for i, u in enumerate(_chunks)]):
+            _c_urls, _c_emps = await _fut
+            if _c_emps:
+                await _process_scraped_employees(_c_emps, _c_urls, label="first_pass")
 
         logger.info(
-            f"[fast:{campaign_id}] after employee score: "
-            f"{len(kept_employees)}/{len(transformed)} pass threshold"
+            f"[fast:{campaign_id}] streaming scrape done — raw={len(raw_employees)}, "
+            f"enrolled={_enrolled_running}, ai_gate_rejected={_ai_gate_rejected}, "
+            f"dropped_off_icp={_dropped_off_icp}, dropped_no_url={_dropped_no_url}"
         )
 
-        # Per-company enrollment cap: keep only top-N by score per company
-        _company_buckets: dict[str, list] = {}
-        for pair in kept_employees:
-            t_pr, sc_pr = pair
-            co_url = (t_pr.get("company_linkedin") or t_pr.get("company_linkedin_url") or sc_pr.get("company_linkedin_url") or "").rstrip("/").lower()
-            _company_buckets.setdefault(co_url, []).append(pair)
+        # ── Global relax ladder (runs once, after all chunks) ──
+        import math as _math_relax
+        _relax_floor = int(_math_relax.ceil(_GATE_RELAX_FRACTION * max(1, prospect_target)))
+        if _enrolled_running < _relax_floor and _relax_pool:
+            _relax_pool.sort(key=lambda p: p[0].get("fit_score", 0), reverse=True)
+            _need = _relax_floor - _enrolled_running
+            # Relax admissions must STILL pass the AI title judge — skipping it here
+            # was the hole that let function-adjacent titles back in.
+            _readmit = await _apply_ai_title_gate(_relax_pool[:_need * 2])
+            _readmit = _readmit[:_need]
+            logger.warning(
+                f"[fast:{campaign_id}] gate relax: enrolled {_enrolled_running} < floor "
+                f"{_relax_floor} — re-admitting {len(_readmit)} best-scored "
+                f"title-ambiguous rejects (function mismatches + blocklist stay enforced)"
+            )
+            await _find_emails_for(_readmit)
+            _relaxed_n = await _persist_and_enroll(_readmit, label="relax_ladder")
+            _enrolled_running += _relaxed_n
+            _gate_stats_total["relaxed_in"] = _relaxed_n
+            if _relaxed_n:
+                try:
+                    await database.campaigns_collection.update_one(
+                        {"_id": campaign_oid},
+                        {"$inc": {
+                            "discovery_prospects_found": _relaxed_n,
+                            "discovery_prospects_from_apify": _relaxed_n,
+                        }},
+                    )
+                except Exception:
+                    pass
 
-        kept_employees = []
-        for co_url, _pairs in _company_buckets.items():
-            _pairs.sort(key=lambda p: p[0].get("fit_score", 0), reverse=True)
-            kept_employees.extend(_pairs[:_enroll_cap])
+        try:
+            await database.campaigns_collection.update_one(
+                {"_id": campaign_oid},
+                {"$set": {"discovery_gate_stats": {"first_pass": _gate_stats_total}}},
+            )
+        except Exception:
+            pass
 
-        logger.info(
-            f"[fast:{campaign_id}] after per-company cap ({_enroll_cap}/co): "
-            f"{len(kept_employees)} prospects across {len(_company_buckets)} companies"
-        )
-
-        # Soft cap after first-pass scoring: keep only a buffered overshoot of the target
-        # to bound the recovery pass and email-finder cost.
-        _keep_cap = math.ceil(prospect_target * 1.3)
-        if len(kept_employees) > _keep_cap:
-            kept_employees.sort(key=lambda pair: pair[0].get("fit_score", 0), reverse=True)
-            kept_employees = kept_employees[:_keep_cap]
-
-        # ── ⑤ Recovery for low-yield companies ─────────────────────────────────
+        # ── ⑤ Recovery for low-yield companies (reuses the streaming chunk pipeline) ──
         # Short mode doesn't return companyLinkedinUrl, so per-company URL tracking
         # is unreliable. Trigger recovery on ALL companies if first-pass yield is
         # < 1 employee per company on average (indicates most got 0 results).
@@ -865,7 +1945,7 @@ async def run_fast_discovery(campaign_id: str, account_id: str) -> dict:
             ]
 
         low_yield = len(raw_employees) < len(company_urls)  # < 1 emp per company
-        remaining_needed = prospect_target - len(kept_employees)
+        remaining_needed = prospect_target - _enrolled_running
         if zero_emp_urls and low_yield and remaining_needed > 0:
             logger.info(
                 f"[fast:{campaign_id}] recovery: {len(zero_emp_urls)} companies, "
@@ -882,141 +1962,51 @@ async def run_fast_discovery(campaign_id: str, account_id: str) -> dict:
                         max_total_items=math.ceil(remaining_needed * _dropout_buffer),
                         seniority_level_ids=broad_seniority or None,
                         functional_level_ids=broad_function or None,
-                        profile_scraper_mode=_PROFILE_SCRAPER_MODE,
+                        profile_scraper_mode=_profile_mode,
                         account_id=account_id,
                         campaign_id=campaign_id,
-                    )
+                        company_headcount_bands=headcount_bands or None,
+                        max_concurrency=int(
+                            campaign.get("discovery_scrape_concurrency")
+                            or min(_DEFAULT_SCRAPE_CONCURRENCY, max(1, math.ceil(len(zero_emp_urls) / _SCRAPE_CHUNK_SIZE)))
+                        ),
+                    ),
+                    retries=2,
                 )
                 if recovery_employees:
-                    r_pairs = [
-                        (emp, _find_closest_sc(_extract_company_url_from_employee(emp) or "", url_to_sc) or _fallback_sc)
-                        for emp in recovery_employees
-                    ]
-                    r_transformed = [transform_employee_to_prospect(emp, sc) for emp, sc in r_pairs]
-                    r_kept = 0
-                    for i, (t, (_, sc)) in enumerate(zip(r_transformed, r_pairs)):
-                        score = _score_for_campaign(t, campaign)
-                        t["fit_score"] = score
-                        t["ai_prospect_score"] = float(score)
-                        if score >= _EMPLOYEE_SCORE_THRESHOLD and (t.get("linkedin") or t.get("email")):
-                            kept_employees.append((t, sc))
-                            r_kept += 1
-                    logger.info(
-                        f"[fast:{campaign_id}] recovery added {r_kept} prospects"
+                    # Same attribution + gates + enroll tail as first-pass chunks.
+                    _rn = await _process_scraped_employees(
+                        recovery_employees, zero_emp_urls, label="recovery",
                     )
-                    # Re-cap so recovery cannot blow past target.
-                    if len(kept_employees) > prospect_target:
-                        kept_employees.sort(key=lambda pair: pair[0].get("fit_score", 0), reverse=True)
-                        kept_employees = kept_employees[:prospect_target]
+                    logger.info(f"[fast:{campaign_id}] recovery added {_rn} prospects")
             except Exception as e:
                 logger.warning(f"[fast:{campaign_id}] recovery scrape failed (skipping): {e}")
 
-        # Final hard cap: guarantees email-finder, upsert, and enrollment never exceed target.
-        kept_employees.sort(key=lambda pair: pair[0].get("fit_score", 0), reverse=True)
-        kept_employees = kept_employees[:prospect_target]
+        if _email_credit_warnings:
+            logger.error(
+                f"[fast:{campaign_id}] email finder credit warning(s): {_email_credit_warnings}"
+            )
+            await database.campaigns_collection.update_one(
+                {"_id": campaign_oid},
+                {"$addToSet": {"discovery_warnings": {"$each": _email_credit_warnings}}},
+            )
 
-        # ── ⑥ Apply prefetched emails; residual find for late (recovery) prospects ──────
-        # email_by_url was filled concurrently with scoring in phase ④.
-        # Only run the actor again for recovery prospects added in phase ⑤ (rare).
-        #
-        # OLD ACTOR — to revert, uncomment the block below and delete the new code,
-        # then remove the asyncio.gather + _resolve_emails in phase ④ above:
-        # missing_email_urls = list({
-        #     t["linkedin"] for t, _ in kept_employees
-        #     if not t.get("email") and t.get("linkedin")
-        # })
-        # email_by_url: dict[str, str | None] = {}
-        # if missing_email_urls:
-        #     logger.info(f"[fast:{campaign_id}] email finder — {len(missing_email_urls)} URLs")
-        #     try:
-        #         from services.email_finder_service import find_emails_for_linkedin_urls
-        #         email_by_url = await _with_retries(
-        #             lambda: find_emails_for_linkedin_urls(
-        #                 missing_email_urls,
-        #                 account_id=account_id,
-        #                 campaign_id=campaign_id,
-        #             ),
-        #             fail_sentinel={},
-        #         )
-        #     except Exception as e:
-        #         logger.warning(f"[fast:{campaign_id}] email finder failed (continuing without): {e}")
-        still_missing = list({
-            t["linkedin"] for t, _ in kept_employees
-            if not t.get("email") and t.get("linkedin") and t["linkedin"] not in email_by_url
-        })
-        if still_missing:
-            logger.info(f"[fast:{campaign_id}] email finder — {len(still_missing)} kept prospects needing email")
-            try:
-                residual = await _with_retries(
-                    lambda: find_emails_bulk(still_missing, account_id=account_id, campaign_id=campaign_id),
-                    fail_sentinel={},
-                )
-                email_by_url.update(residual)
-            except Exception as e:
-                logger.warning(f"[fast:{campaign_id}] residual email finder failed (continuing): {e}")
-
-        # Apply emails
-        emails_applied = 0
-        for t, _ in kept_employees:
-            if not t.get("email") and t.get("linkedin"):
-                found = email_by_url.get(t["linkedin"])
-                if found:
-                    t["email"] = found
-                    emails_applied += 1
-
-        with_email = sum(1 for t, _ in kept_employees if t.get("email"))
+        _all_kept_sources = list(_campaign_source_by_oid.values())
+        with_email = sum(1 for t in _all_kept_sources if t.get("email"))
         logger.info(
-            f"[fast:{campaign_id}] email fill: {with_email}/{len(kept_employees)} have email "
+            f"[fast:{campaign_id}] email fill: {with_email}/{len(_all_kept_sources)} have email "
             f"({emails_applied} new from finder)"
         )
-
-        # Re-score now that email + industry are populated (activates two previously-dead
-        # components: 15-pt email component and 18-pt industry component).
-        for t, _ in kept_employees:
-            updated_score = _score_for_campaign(t, campaign)
-            t["fit_score"] = updated_score
-            t["ai_prospect_score"] = float(updated_score)
-
-        if kept_employees:
-            _scores = sorted(set(round(t["fit_score"], 1) for t, _ in kept_employees))
-            _sc_vals = [t["fit_score"] for t, _ in kept_employees]
-            _score_mean = sum(_sc_vals) / len(_sc_vals)
+        if _all_kept_sources:
+            _sc_vals = [t.get("fit_score", 0) for t in _all_kept_sources]
             logger.info(
-                f"[fast:{campaign_id}] FINAL SCORES after re-score: "
-                f"distinct={len(_scores)} min={min(_sc_vals):.1f} max={max(_sc_vals):.1f} "
-                f"mean={_score_mean:.1f} values={_scores[:15]}"
-            )
-            _industries = sorted(set(t.get("industry") or "MISSING" for t, _ in kept_employees))
-            _with_industry = sum(1 for t, _ in kept_employees if t.get("industry"))
-            logger.info(
-                f"[fast:{campaign_id}] INDUSTRY FILL: {_with_industry}/{len(kept_employees)} "
-                f"have industry — values={_industries[:10]}"
-            )
-            _domains = sorted(set(t.get("company_domain") or "NONE" for t, _ in kept_employees))
-            logger.info(
-                f"[fast:{campaign_id}] DOMAIN DISTRIBUTION: {len(_domains)} distinct domains "
-                f"— sample={_domains[:10]}"
+                f"[fast:{campaign_id}] FINAL SCORES: n={len(_sc_vals)} "
+                f"min={min(_sc_vals):.1f} max={max(_sc_vals):.1f} "
+                f"mean={sum(_sc_vals)/len(_sc_vals):.1f}"
             )
 
-        # ── ⑦ Upsert prospects (scraped + reused) ──────────────────────────────
-        new_prospect_oids: list[ObjectId] = []
-        per_company_counts: dict = {}
-        for t, sc in kept_employees:
-            oid = await _upsert_curated_prospect(t, campaign_oid, account_id)
-            if oid:
-                new_prospect_oids.append(oid)
-                sc_id = sc.get("_id") or sc.get("company_linkedin_url", "")
-                per_company_counts[sc_id] = per_company_counts.get(sc_id, 0) + 1
-
-        # Upsert Stage C reused prospects (already in DB — this ensures stage/score are current)
-        for _rp, _rsc in _reused_pairs:
-            _rp_oid = await _upsert_curated_prospect(_rp, campaign_oid, account_id)
-            if _rp_oid:
-                new_prospect_oids.append(_rp_oid)
-                _rsc_id = _rsc.get("_id") or _rsc.get("company_linkedin_url", "")
-                per_company_counts[_rsc_id] = per_company_counts.get(_rsc_id, 0) + 1
-
-        # Update per-company stats in sourced_companies
+        # ── Final per-company stats + counter sync (absolute values reconcile the
+        # incremental $inc updates made during streaming) ──
         for sc in kept_companies:
             sc_id = sc.get("_id") or sc.get("company_linkedin_url", "")
             co_url = sc.get("company_linkedin_url")
@@ -1046,82 +2036,131 @@ async def run_fast_discovery(campaign_id: str, account_id: str) -> dict:
             }},
         )
 
-        # ── ⑧ Pre-enroll + channel planning + Day-1 message generation ─────────
-        from services.campaign_prospect_finder_service import (
-            _pre_enroll_prospects,
-        )
+        # ── ⑧ Channel planning + Day-1 message generation ─────────
+        # (upsert + cohort scoring + pre-enroll already happened per chunk above)
 
-        new_prospects_full = await database.prospects_collection.find(
-            {"_id": {"$in": new_prospect_oids}}
-        ).to_list(length=None)
-
-        # Supplement with reused prospect docs (already have all fields; avoids re-fetch)
-        _reused_ids_in_db = {str(p["_id"]) for p in new_prospects_full}
-        for _rp, _ in _reused_pairs:
-            if _rp.get("_id") and str(_rp["_id"]) not in _reused_ids_in_db:
-                new_prospects_full.append(_rp)
-
-        if new_prospects_full:
-            await _pre_enroll_prospects(campaign, new_prospects_full)
-
-        # ── Mark discovery complete ──────────────────────────────────────────────
-        await database.campaigns_collection.update_one(
-            {"_id": campaign_oid},
-            {"$set": {
-                "discovery_status": "completed",
-                "discovery_completed_at": datetime.utcnow(),
-                "status": "awaiting_approval",
-                "approved_send_days": [],
-            }},
-        )
+        # NOTE: the terminal completed/awaiting_approval flip is deferred until after
+        # channel planning + the top-up decision below, so a top-up generation isn't
+        # prematurely marked "completed" (which would make the next generation's job
+        # short-circuit as already-completed and hide the "finding more" banner).
 
         # ── Channel planning (auto-pick senders + assign channel+day to enrollments) ──
         plan_result = await finalize_channel_plan(campaign_id, account_id)
         total_assigned = plan_result.get("assigned", 0)
 
-        # Write UI metadata to match database-mode flow
-        await database.campaigns_collection.update_one(
-            {"_id": campaign_oid},
-            {"$set": {
-                "discovery_prospects_planned": total_assigned,
-                "discovery_prospects_enrolled": total_assigned,
-            }},
+        # Recompute total_enrolled from the live enrollments (not = assigned) so it
+        # stays correct across top-up generations (each generation appends).
+        total_enrolled = await database.campaign_enrollments_collection.count_documents({
+            "campaign_id": campaign_oid,
+            "status": {"$nin": ["skipped_no_channel", "archived", "pending_teammate_review", "cascade_waiting"]},
+        })
+
+        # ── Auto top-up decision ──────────────────────────────────────────────────
+        # If this generation's yield leaves us under the target and we haven't hit
+        # the generation cap AND this pass actually added prospects, enqueue an
+        # append-only follow-up generation sourcing NEW companies.
+        _should_topup = (
+            total_enrolled < prospect_target_full * _TOPUP_THRESHOLD
+            and generation < _MAX_TOPUP_GENERATIONS
+            and total_prospects > 0
         )
 
-        # ── Fire deep enrichment (post scrape + intelligence) then Day-1 messages ──
-        # Day-1 cohort gets enriched first so messages use prospect_intelligence.
-        # Remaining days are enriched + messaged in background after Day 1 is done.
+        _meta_set: dict = {
+            "discovery_prospects_planned": total_assigned,
+            "discovery_prospects_enrolled": total_assigned,
+            "total_enrolled": total_enrolled,
+        }
+        if _should_topup:
+            _next_gen = generation + 1
+            _topup_msg = (
+                f"Finding more prospects — {total_enrolled} of ~{prospect_target_full} so far…"
+            )
+            _meta_set.update({
+                "discovery_status": "topping_up",
+                "discovery_topup_active": True,
+                "discovery_topup_message": _topup_msg,
+                # The follow-up job's tenant-ownership check matches on
+                # discovery_generation, so advance it before enqueueing.
+                "discovery_generation": _next_gen,
+            })
+            await database.campaigns_collection.update_one(
+                {"_id": campaign_oid}, {"$set": _meta_set}
+            )
+            from services.enrichment_job_service import enqueue_campaign_discovery
+            await enqueue_campaign_discovery(
+                account_id=str(account_id),
+                campaign_id=campaign_id,
+                generation=_next_gen,
+            )
+            logger.info(
+                f"[fast:{campaign_id}] top-up: enrolled={total_enrolled} < "
+                f"{prospect_target_full * _TOPUP_THRESHOLD:.0f} — enqueued generation {_next_gen}"
+            )
+        else:
+            # Terminal: target met, capped, or this pass added nothing new.
+            _meta_set.update({
+                "discovery_status": "completed",
+                "discovery_completed_at": datetime.utcnow(),
+                "status": "awaiting_approval",
+                "discovery_topup_active": False,
+            })
+            # Only clear approvals on the first generation — a top-up must not wipe an
+            # approval the user already granted on an earlier generation.
+            if generation == 1:
+                _meta_set["approved_send_days"] = []
+            await database.campaigns_collection.update_one(
+                {"_id": campaign_oid}, {"$set": _meta_set}
+            )
+
+        # Queue Day-1 enrichment (all enrolled) + Day-1 message generation under the
+        # durable worker lease. This runs on every generation so top-up additions
+        # also get enriched.
         if total_assigned > 0:
-            day1_enrs = await database.campaign_enrollments_collection.find(
-                {"campaign_id": campaign_oid, "smart_campaign_send_day": 1, "status": "active"}
-            ).to_list(length=5000)
-            day1_oids = [e["prospect_id"] for e in day1_enrs]
-            asyncio.create_task(
-                _run_deep_enrichment_then_messages(
-                    campaign_id=campaign_id,
-                    account_id=str(account_id),
-                    day1_prospect_oids=day1_oids,
-                    all_prospect_oids=new_prospect_oids,
-                )
+            await _enqueue_day1_enrichment_and_messages(
+                campaign_id, str(account_id)
             )
         else:
             # No prospects assigned (no sender or no contactable prospects) — resolve
             # the spinner explicitly so the UI shows the actionable "No schedule yet" state.
+            # Surface WHY: distinguish "0 scraped/found" from "found but unplannable"
+            # (finalize_channel_plan only sets a reason for the latter). Skip the error
+            # when a top-up is in flight — the next generation may still find prospects.
+            _zero_update: dict = {
+                "message_gen_status": "completed",
+                "message_gen_completed_at": datetime.utcnow(),
+            }
+            if (
+                generation == 1
+                and not _should_topup
+                and total_prospects == 0
+                and not campaign.get("discovery_error")
+            ):
+                _zero_msg = (
+                    f"Found {len(kept_companies)} matching companies but couldn't extract any "
+                    "contactable people from them. Try broadening the ICP (seniority/titles/"
+                    "departments) or removing narrow filters, then re-run discovery."
+                )
+                _zero_update["discovery_error"] = _zero_msg
+                _zero_update["discovery_failure_reason"] = _zero_msg
+                logger.warning(f"[fast:{campaign_id}] 0 prospects from {len(kept_companies)} companies — {_zero_msg}")
             await database.campaigns_collection.update_one(
                 {"_id": campaign_oid},
-                {"$set": {
-                    "message_gen_status": "completed",
-                    "message_gen_completed_at": datetime.utcnow(),
-                }},
+                {"$set": _zero_update},
             )
 
         logger.info(
-            f"[fast:{campaign_id}] complete — "
+            f"[fast:{campaign_id}] complete (gen {generation}) — "
             f"companies={len(kept_companies)} (scraped={len(companies_to_scrape)}, reused_co={len(kept_companies)-len(companies_to_scrape)}), "
             f"prospects={total_prospects} (scraped={max(0,_scraped_count)}, reused={_db_enrolled_count}), "
-            f"assigned={total_assigned}"
+            f"assigned={total_assigned}, enrolled={total_enrolled}, topping_up={_should_topup}"
         )
-        return {"campaign_id": campaign_id, "prospects_created": total_prospects, "prospects_from_db": _db_enrolled_count}
+        return {
+            "campaign_id": campaign_id,
+            "prospects_created": total_prospects,
+            "prospects_from_db": _db_enrolled_count,
+            "generation": generation,
+            "topping_up": _should_topup,
+        }
 
     except Exception as e:
         logger.exception(f"[fast:{campaign_id}] failed")
@@ -1196,8 +2235,8 @@ async def _run_deep_enrichment_then_messages(
         try:
             # Get enrolled company URLs from the campaign's prospects
             all_enrolled_prospects = await database.prospects_collection.find(
-                {"source_industry_ids": f"curated:{campaign_id}"}
-            ).to_list(length=500)
+                {"_id": {"$in": all_prospect_oids}}
+            ).to_list(length=len(all_prospect_oids))
 
             enrolled_co_urls = list({
                 (p.get("company_linkedin") or "").rstrip("/")
@@ -1208,9 +2247,7 @@ async def _run_deep_enrichment_then_messages(
             if enrolled_co_urls:
                 logger.info(f"[fast:{campaign_id}] scraping {len(enrolled_co_urls)} enrolled company LinkedIn pages")
                 from services.company_scraper_service import scrape_company_pages
-                import asyncio as _asyncio_co
-                loop = _asyncio_co.get_event_loop()
-                _, co_pages = await loop.run_in_executor(None, scrape_company_pages, enrolled_co_urls)
+                _, co_pages = await scrape_company_pages(enrolled_co_urls)
 
                 if co_pages:
                     from services.employee_scraper_service import _save_company
@@ -1253,9 +2290,7 @@ async def _run_deep_enrichment_then_messages(
 
         if enable_company_research:
             try:
-                from services.competitor_research_service import research_competitors
-                from services.news_research_service import research_company_news
-                from services.openrouter_service import OpenRouterClient as _ORClient
+                from services.company_research_service import deep_research_companies_bulk
 
                 # Collect unique companies from all enrolled prospects
                 _all_enrolled = await database.prospects_collection.find(
@@ -1277,63 +2312,43 @@ async def _run_deep_enrichment_then_messages(
                     f"[fast:{campaign_id}] company research: {len(_companies_for_research)} unique companies"
                 )
 
-                _research_sem = asyncio.Semaphore(3)  # max 3 concurrent Perplexity calls
-
-                async def _research_one(li_url: str, co: dict) -> tuple[str, dict]:
-                    async with _research_sem:
-                        _res: dict = {"competitors": [], "news": []}
-                        if not co.get("name"):
-                            return li_url, _res
-                        _rc = _ORClient()
-                        try:
-                            _res["competitors"] = await research_competitors(
-                                co["name"],
-                                company_website=co.get("domain") or None,
-                                industry=co.get("industry") or None,
-                                limit=3,
-                                client=_rc,
-                            )
-                            _res["news"] = await research_company_news(
-                                co["name"],
-                                limit=3,
-                                days_back=90,
-                                client=_rc,
-                            )
-                        except Exception as _re:
-                            logger.warning(
-                                f"[fast:{campaign_id}] research failed for {co['name']}: {_re}"
-                            )
-                        finally:
-                            await _rc.close()
-                        return li_url, _res
-
-                _research_results = await asyncio.gather(
-                    *[_research_one(u, c) for u, c in _companies_for_research.items()],
-                    return_exceptions=False,
+                # Seller context for best-performer ranking (relative to what we pitch)
+                _acct_profile = await database.company_profiles_collection.find_one(
+                    {"account_id": account_id}
                 )
 
-                # Cache and persist to companies_collection
-                from pymongo import UpdateOne as _ResUpdateOne
-                _res_ops = []
-                for _li_url, _res in _research_results:
-                    co_research_by_url[_li_url] = _res
-                    if _li_url:
-                        _res_ops.append(_ResUpdateOne(
-                            {"linkedin_url": _li_url},
-                            {"$set": {"research": {**_res, "fetched_at": datetime.utcnow()}}},
-                            upsert=True,
-                        ))
-                if _res_ops:
-                    await database.companies_collection.bulk_write(_res_ops, ordered=False)
+                co_research_by_url = await deep_research_companies_bulk(
+                    _companies_for_research,
+                    _acct_profile,
+                    cost_tags={
+                        "account_id": str(account_id),
+                        "campaign_id": str(campaign_id),
+                        "feature": "company_research",
+                    },
+                    max_concurrency=8,
+                    persist=True,   # stored on companies_collection.research per contract
+                )
 
                 logger.info(
                     f"[fast:{campaign_id}] company research complete: "
                     f"{len(co_research_by_url)} companies, "
                     f"{sum(len(v.get('news', [])) for v in co_research_by_url.values())} news items, "
-                    f"{sum(len(v.get('competitors', [])) for v in co_research_by_url.values())} competitors"
+                    f"{sum(len(v.get('competitors', [])) for v in co_research_by_url.values())} competitors, "
+                    f"{sum(len(v.get('buying_signals', [])) for v in co_research_by_url.values())} buying signals, "
+                    f"{sum(len(v.get('company_posts', [])) for v in co_research_by_url.values())} company posts"
                 )
             except Exception as _re:
                 logger.warning(f"[fast:{campaign_id}] company research phase failed (non-fatal): {_re}")
+                co_research_by_url = {}
+                # Durable breadcrumb: without this, a total research failure is
+                # indistinguishable from "companies genuinely have no research".
+                try:
+                    await database.campaigns_collection.update_one(
+                        {"_id": ObjectId(campaign_id)},
+                        {"$set": {"discovery_research_error": f"{type(_re).__name__}: {_re}"[:300]}},
+                    )
+                except Exception:
+                    pass
 
         # ── Day-1 deep enrichment ─────────────────────────────────────────────
         if day1_prospect_oids:
@@ -1361,17 +2376,22 @@ async def _run_deep_enrichment_then_messages(
             await generate_messages_for_campaign(campaign_id, account_id, send_day=1)
             logger.info(f"[fast:{campaign_id}] Day-1 messages generated")
 
-        # ── Days 2-5 enrichment + message gen (background, non-blocking) ──────
+        # ── Days 2-5 enrichment + message gen (durable, out-of-band) ─────────
+        # Enqueue a leased job instead of a fire-and-forget task so the work
+        # survives a worker restart. Keyed by campaign so a discovery re-run
+        # coalesces onto the single in-flight remaining-days job. Fail closed on
+        # missing tenant context: without an account_id the job cannot be owned.
         remaining_oids = [oid for oid in all_prospect_oids if oid not in set(day1_prospect_oids)]
         if remaining_oids:
-            asyncio.create_task(
-                _enrich_remaining_days(
-                    campaign_id=campaign_id,
-                    account_id=account_id,
-                    remaining_oids=remaining_oids,
-                    co_research_by_url=co_research_by_url or None,
-                    skip_message_gen=skip_message_gen,
-                )
+            if not account_id:
+                raise ValueError("cannot enqueue remaining-days enrichment without account_id")
+            from services.enrichment_job_service import enqueue_campaign_remaining_days
+            await enqueue_campaign_remaining_days(
+                account_id=account_id,
+                campaign_id=campaign_id,
+                remaining_oids=remaining_oids,
+                co_research_by_url=co_research_by_url or None,
+                skip_message_gen=skip_message_gen,
             )
 
     except Exception as e:
@@ -1409,13 +2429,38 @@ async def _enrich_prospect_cohort(
     if not prospect_oids:
         return
 
+    _campaign_meta = await database.campaigns_collection.find_one(
+        {"_id": ObjectId(campaign_id)}, {"scoring_version": 1}
+    )
+    _scoring_version = (_campaign_meta or {}).get("scoring_version") or DEFAULT_SCORING_VERSION
+
+    async def _transition_many(state: str, ids: list[ObjectId], **kwargs) -> None:
+        # Same state + kwargs for every id in this cohort — one bulk_write
+        # instead of one find_one_and_update round trip per prospect.
+        await bulk_transition_enrichment(
+            account_id=account_id,
+            campaign_id=campaign_id,
+            prospect_ids=ids,
+            state=state,
+            scoring_version=_scoring_version,
+            **kwargs,
+        )
+
+    await _transition_many("running", prospect_oids)
+
     try:
         prospects = await database.prospects_collection.find(
             {"_id": {"$in": prospect_oids}}
         ).to_list(length=len(prospect_oids))
 
         if not prospects:
+            await _transition_many("not_found", prospect_oids, outcome="prospect_missing")
             return
+
+        found_ids = {p["_id"] for p in prospects}
+        missing_ids = [pid for pid in prospect_oids if pid not in found_ids]
+        if missing_ids:
+            await _transition_many("not_found", missing_ids, outcome="prospect_missing")
 
         company_profile = await database.company_profiles_collection.find_one(
             {"account_id": account_id}
@@ -1439,15 +2484,23 @@ async def _enrich_prospect_cohort(
         for p in prospects:
             p_copy = dict(p)
             p_copy["posts"] = posts_by_url.get(p.get("linkedin") or "", [])
-            # Inject company-level research so AI intel can reference news + competitors
+            # Inject company-level research so AI intel can reference news, competitors,
+            # best performer, buying signals and company posts (full contract object).
             if co_research_by_url:
                 co_url = (p.get("company_linkedin") or "").rstrip("/")
-                research = co_research_by_url.get(co_url) or {}
+                research = (
+                    co_research_by_url.get(co_url)
+                    or co_research_by_url.get(co_url.lower())
+                    or {}
+                )
                 if research:
+                    p_copy["company_research"] = research
                     p_copy["company_competitors"] = research.get("competitors", [])
                     p_copy["company_news"] = research.get("news", [])
                     # Also inject into fields the batch message prompt reads
                     p_copy["recent_news"] = research.get("news", [])
+                    if research.get("buying_signals"):
+                        p_copy["buying_signals"] = research["buying_signals"]
                     _comp_names = [c.get("name", "") for c in research.get("competitors", [])[:3] if c.get("name")]
                     if _comp_names:
                         p_copy.setdefault("ai_assessment", {})["competitor_summary"] = ", ".join(_comp_names)
@@ -1505,7 +2558,37 @@ async def _enrich_prospect_cohort(
                 await database.prospects_collection.bulk_write(_posts_ops, ordered=False)
                 logger.info(f"[fast:{campaign_id}] persisted posts for {len(_posts_ops)} prospects")
 
+        # One durable terminal outcome per prospect. A provider returning no
+        # intelligence is distinct from an exception and remains retryable by
+        # policy only when explicitly classified that way. State/result vary
+        # per prospect, so this batches into one bulk_write of heterogeneous
+        # ops rather than one find_one_and_update round trip each.
+        _terminal_ops = [
+            transition_enrichment_operation(
+                account_id=account_id,
+                campaign_id=campaign_id,
+                prospect_id=_prospect["_id"],
+                scoring_version=_scoring_version,
+                state="succeeded" if _intel else "not_found",
+                outcome="intelligence_generated" if _intel else "no_intelligence",
+                result={
+                    "prospect_intelligence": _intel,
+                    "posts": posts_by_url.get(_prospect.get("linkedin") or "", []),
+                } if _intel else None,
+            )
+            for _prospect, _intel in zip(prospects, intelligence_list)
+        ]
+        if _terminal_ops:
+            await bulk_write_state_operations(_terminal_ops)
+
     except Exception as e:
+        await _transition_many(
+            "retryable_failure",
+            prospect_oids,
+            outcome="pipeline_exception",
+            error_code=type(e).__name__,
+            error_message=str(e),
+        )
         logger.warning(f"[fast:{campaign_id}] {label} enrichment failed (continuing): {e}")
 
 
@@ -1602,76 +2685,6 @@ def _score_company_deterministic(company: dict, icp_prompt: str) -> float:
     return min(100.0, score)
 
 
-async def _score_companies_with_llm(
-    companies: list[dict],
-    icp_prompt: str,
-    client,
-) -> list[int]:
-    """Haiku batch scores a list of companies. Returns list of ints (0-100), same order."""
-    if not companies:
-        return []
-
-    from utils.prompts import COMPANY_BATCH_SCORE_SYSTEM_PROMPT, build_company_batch_score_prompt
-
-    # Chunk at 100 to keep token count reasonable
-    all_scores: list[int] = []
-    for chunk in _chunk(companies, 100):
-        try:
-            resp = await client.chat_completion(
-                messages=[
-                    {"role": "system", "content": COMPANY_BATCH_SCORE_SYSTEM_PROMPT},
-                    {"role": "user", "content": build_company_batch_score_prompt(chunk, icp_prompt)},
-                ],
-                model=settings.mini_enrichment_model,
-                temperature=0.1,
-                max_tokens=512,
-                response_format={"type": "json_object"},
-            )
-            raw_scores = resp.get("scores", [])
-            if not isinstance(raw_scores, list) or len(raw_scores) != len(chunk):
-                raise ValueError(f"Expected {len(chunk)} scores, got {len(raw_scores)}")
-            all_scores.extend(int(s) for s in raw_scores)
-        except Exception as e:
-            logger.warning(f"[fast] company scoring chunk failed ({e}), using rule-based fallback")
-            all_scores.extend(_rule_score_companies(chunk))
-    return all_scores
-
-
-async def _score_employees_with_llm(
-    employees: list[dict],
-    icp_prompt: str,
-    sender_context: str,
-    client,
-) -> list[int]:
-    """Haiku batch scores a list of employee/prospect dicts. Returns list of ints."""
-    if not employees:
-        return []
-
-    from utils.prompts import EMPLOYEE_BATCH_SCORE_SYSTEM_PROMPT, build_employee_batch_score_prompt
-
-    all_scores: list[int] = []
-    for chunk in _chunk(employees, 100):
-        try:
-            resp = await client.chat_completion(
-                messages=[
-                    {"role": "system", "content": EMPLOYEE_BATCH_SCORE_SYSTEM_PROMPT},
-                    {"role": "user", "content": build_employee_batch_score_prompt(chunk, icp_prompt, sender_context)},
-                ],
-                model=settings.mini_enrichment_model,
-                temperature=0.1,
-                max_tokens=512,
-                response_format={"type": "json_object"},
-            )
-            raw_scores = resp.get("scores", [])
-            if not isinstance(raw_scores, list) or len(raw_scores) != len(chunk):
-                raise ValueError(f"Expected {len(chunk)} scores, got {len(raw_scores)}")
-            all_scores.extend(int(s) for s in raw_scores)
-        except Exception as e:
-            logger.warning(f"[fast] employee scoring chunk failed ({e}), using rule-based fallback")
-            all_scores.extend(_rule_score_employees(chunk))
-    return all_scores
-
-
 # ──────────────────────────────────────────────────────────────────────────────
 # Retry wrapper
 # ──────────────────────────────────────────────────────────────────────────────
@@ -1695,43 +2708,177 @@ async def _with_retries(fn, retries: int = 3, backoffs: tuple = (1, 4, 16), fail
 
 
 # ──────────────────────────────────────────────────────────────────────────────
-# Rule-based fallbacks (used when Haiku fails)
+# ICP title synthesis (fallback when prefill left icp_job_titles empty)
 # ──────────────────────────────────────────────────────────────────────────────
 
-def _rule_score_companies(companies: list[dict]) -> list[int]:
-    return [50 for _ in companies]  # neutral score; let through
+_FUNCTION_TITLE_NOUNS = {
+    "marketing": "Marketing",
+    "sales": "Sales",
+    "engineering": "Engineering",
+    "product": "Product",
+    "operations": "Operations",
+    "finance": "Finance",
+    "hr": "People",
+    "human resources": "People",
+    "it": "IT",
+    "customer success": "Customer Success",
+    "design": "Design",
+    "legal": "Legal",
+    "growth": "Growth",
+    "ecommerce": "Ecommerce",
+}
+
+_C_SUITE_BY_FUNCTION = {
+    "marketing": ["CMO", "Chief Marketing Officer"],
+    "sales": ["CRO", "Chief Revenue Officer"],
+    "engineering": ["CTO", "Chief Technology Officer"],
+    "product": ["CPO", "Chief Product Officer"],
+    "operations": ["COO", "Chief Operating Officer"],
+    "finance": ["CFO", "Chief Financial Officer"],
+}
 
 
-def _rule_score_employees(employees: list[dict]) -> list[int]:
-    scores = []
-    for e in employees:
-        s = 0
-        title = (e.get("job_title") or e.get("headline") or "").lower()
-        seniority = (e.get("seniority") or e.get("seniority_level") or "").lower()
-        if any(k in title for k in ("vp", "vice president", "director", "head of", "ceo", "cto", "cfo", "founder")):
-            s += 35
-        elif any(k in title for k in ("manager", "lead", "senior", "principal")):
-            s += 20
-        if seniority in ("vp", "director", "head", "c_suite", "founder", "owner"):
-            s += 30
-        elif seniority == "manager":
-            s += 20
-        if e.get("email"):
-            s += 15
-        scores.append(min(s, 100))
-    return scores
+def _synthesize_icp_titles(functions: list[str], seniorities: list[str]) -> list[str]:
+    """Derive concrete target titles from function × seniority when the campaign
+    has none (e.g. ["marketing"] × ["manager"] → ["Marketing Manager",
+    "Head of Marketing", ...]). Keeps the title gates active instead of blind."""
+    titles: list[str] = []
+    fns = [str(f).strip().lower() for f in functions if f and str(f).strip()]
+    sens = {str(s).strip().lower() for s in seniorities if s and str(s).strip()}
+
+    for fn in fns:
+        noun = _FUNCTION_TITLE_NOUNS.get(fn) or fn.title()
+        if not sens or "manager" in sens or "senior" in sens:
+            titles += [f"{noun} Manager", f"Senior {noun} Manager"]
+        if "director" in sens:
+            titles += [f"Director of {noun}", f"{noun} Director"]
+        if "vp" in sens:
+            titles += [f"VP {noun}", f"Vice President of {noun}"]
+        if sens & {"c_suite", "csuite"}:
+            titles += _C_SUITE_BY_FUNCTION.get(fn, [f"Chief {noun} Officer"])
+        titles.append(f"Head of {noun}")
+
+    if sens & {"founder", "owner"}:
+        titles += ["Founder", "Co-Founder", "CEO", "Owner"]
+
+    # Dedup, preserve order, cap
+    seen: set[str] = set()
+    out: list[str] = []
+    for t in titles:
+        k = t.lower()
+        if k not in seen:
+            seen.add(k)
+            out.append(t)
+    return out[:12]
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Deterministic person-fit gate + strict-then-relax selection
+# ──────────────────────────────────────────────────────────────────────────────
+
+def _gate_and_select(
+    candidates: list[tuple[dict, dict]],
+    campaign: dict,
+    target_count: int,
+    *,
+    campaign_id: str = "",
+    label: str = "first_pass",
+    collect_relaxable: list | None = None,
+) -> tuple[list[tuple[dict, dict]], dict]:
+    """Apply the deterministic person-fit hard gate + score threshold to scored
+    (prospect_dict, sourced_company) pairs, with a strict-then-relax ladder.
+
+    collect_relaxable: when a list is passed, relaxable rejects are APPENDED to it
+    and the internal relax ladder is skipped — the caller runs one global ladder
+    after all streaming chunks complete (per-chunk ladders would over-relax).
+
+    Hard gates (per utils.scoring.person_fit_gate):
+      - title blocklist + icp_exclude_keywords  (NEVER relaxed)
+      - function inference vs icp_functional_departments  (relaxable)
+      - title-or-seniority match when the campaign specified either  (relaxable)
+      - contactability (linkedin or email)  (never relaxed)
+      - fit_score >= _EMPLOYEE_SCORE_THRESHOLD as secondary ranking  (never relaxed)
+
+    Relax ladder: if strict survivors < _GATE_RELAX_FRACTION * target_count,
+    re-admit the best-scored candidates rejected ONLY by the relaxable gates
+    ("function_mismatch" / "no_title_or_seniority_match") until the floor is met.
+
+    Returns (kept_pairs, stats_dict).
+    """
+    from utils.scoring import person_fit_gate
+
+    kept: list[tuple[dict, dict]] = []
+    relaxable_rejects: list[tuple[dict, dict]] = []
+    stats: dict = {
+        "candidates": len(candidates),
+        "no_contact": 0,
+        "below_score": 0,
+        "title_keyword_blocklisted": 0,
+        "non_decision_maker_title": 0,
+        "function_mismatch": 0,
+        "no_title_or_seniority_match": 0,
+        "kept_strict": 0,
+        "relaxed_in": 0,
+    }
+    # July 23: function_mismatch is NO LONGER relaxable — the relax ladder was
+    # re-admitting grocery buyers / merchandise managers into marketing campaigns
+    # (verified in prod gate stats: 30 function rejects, 24 re-admitted). A known
+    # wrong function is a hard no; only title/seniority ambiguity may relax.
+    _RELAXABLE = {"no_title_or_seniority_match"}
+
+    for t, sc in candidates:
+        if not (t.get("linkedin") or t.get("email")):
+            stats["no_contact"] += 1
+            continue
+        if (t.get("fit_score") or 0) < _EMPLOYEE_SCORE_THRESHOLD:
+            stats["below_score"] += 1
+            continue
+        ok, reason = person_fit_gate(t, campaign)
+        if ok:
+            kept.append((t, sc))
+        else:
+            stats[reason] = stats.get(reason, 0) + 1
+            if reason in _RELAXABLE:
+                relaxable_rejects.append((t, sc))
+
+    stats["kept_strict"] = len(kept)
+
+    if collect_relaxable is not None:
+        collect_relaxable.extend(relaxable_rejects)
+        logger.info(f"[fast:{campaign_id}] {label} person-fit gate (strict-only): {stats}")
+        return kept, stats
+
+    import math as _math
+    floor = int(_math.ceil(_GATE_RELAX_FRACTION * max(1, target_count)))
+    if len(kept) < floor and relaxable_rejects:
+        relaxable_rejects.sort(key=lambda pair: pair[0].get("fit_score", 0), reverse=True)
+        need = floor - len(kept)
+        readmitted = relaxable_rejects[:need]
+        kept.extend(readmitted)
+        stats["relaxed_in"] = len(readmitted)
+        logger.warning(
+            f"[fast:{campaign_id}] {label} gate relax: strict survivors "
+            f"{stats['kept_strict']} < floor {floor} — re-admitted {len(readmitted)} "
+            f"best-scored function/title-gate rejects (blocklist stays enforced)"
+        )
+
+    logger.info(f"[fast:{campaign_id}] {label} person-fit gate: {stats}")
+    return kept, stats
 
 
 # ──────────────────────────────────────────────────────────────────────────────
 # Seniority / function broadening for recovery pass
 # ──────────────────────────────────────────────────────────────────────────────
 
-_SENIORITY_ORDERING = ["120", "220", "210", "300", "310", "320"]  # senior→manager→director→vp→csuite→founder
+_SENIORITY_ORDERING = ["120", "210", "220", "300", "310", "320"]  # senior→manager→director→vp→csuite→founder
 
 def _broaden_seniority_ids(ids: list[str]) -> list[str]:
-    """Add 1 adjacent tier on each side of each selected ID."""
+    """Add 1 adjacent tier on each side of each selected ID.
+
+    Empty input returns empty: no filter means the actor already scrapes
+    unfiltered, and recovery must NOT silently relax targeting gates."""
     if not ids:
-        return _SENIORITY_ORDERING  # no filter → all levels
+        return []
     result = set(ids)
     for sid in ids:
         if sid in _SENIORITY_ORDERING:
@@ -1743,20 +2890,30 @@ def _broaden_seniority_ids(ids: list[str]) -> list[str]:
     return sorted(result)
 
 
+# LinkedIn standard function taxonomy (functionIds 1-26). Adjacency used only to
+# broaden the recovery pass when a first-pass scrape comes back near-empty.
 _FUNCTION_ADJACENCY: dict[str, list[str]] = {
-    "4": ["24", "20"],    # engineering → product, operations
-    "24": ["4", "25"],    # product → engineering, sales
-    "25": ["15", "20"],   # sales → marketing, operations
-    "15": ["25", "24"],   # marketing → sales, product
-    "5": ["20", "10"],    # finance → operations, hr
-    "10": ["20", "5"],    # hr → operations, finance
-    "20": ["25", "5"],    # operations → sales, finance
+    "8": ["19", "18"],    # engineering → product management, operations
+    "19": ["8", "25"],    # product management → engineering, sales
+    "25": ["15", "18"],   # sales → marketing, operations
+    "15": ["25", "19"],   # marketing → sales, product management
+    "10": ["18", "12"],   # finance → operations, hr
+    "12": ["18", "10"],   # human resources → operations, finance
+    "18": ["25", "10"],   # operations → sales, finance
+    "4": ["25", "15"],    # business development → sales, marketing
+    "13": ["8", "18"],    # information technology → engineering, operations
+    "14": ["18", "6"],    # legal → operations, consulting
+    "6": ["4", "18"],     # consulting → business development, operations
+    "26": ["25", "18"],   # customer success and support → sales, operations
 }
 
 def _broaden_function_ids(ids: list[str]) -> list[str]:
-    """Add 1 adjacent function for each selected ID."""
+    """Add 1 adjacent function for each selected ID.
+
+    Empty input returns empty: no filter means the actor already scrapes
+    unfiltered, and recovery must NOT silently relax targeting gates."""
     if not ids:
-        return list(_FUNCTION_ADJACENCY.keys())  # all functions
+        return []
     result = set(ids)
     for fid in ids:
         for adj in _FUNCTION_ADJACENCY.get(fid, [])[:1]:
@@ -1821,17 +2978,25 @@ async def _upsert_curated_prospect(
         try:
             _aid = str(account_id)
             _pid = str(prospect_oid)
+            from utils.prospect_filter_keys import build_filter_keys
             await database.prospect_state_collection.update_one(
                 {"account_id": _aid, "prospect_id": _pid},
-                {"$setOnInsert": {
-                    "account_id": _aid,
-                    "prospect_id": _pid,
-                    "status": "new",
-                    "tags": [],
-                    "used_by": [],
-                    "created_at": now,
-                    "last_updated_at": now,
-                }},
+                {
+                    # `result` is the post-upsert prospect doc — refresh the
+                    # denormalized filter keys (routes/prospects.py list
+                    # filters match on pk.*) on every pass so they track the
+                    # prospect doc.
+                    "$set": {"pk": build_filter_keys(result)},
+                    "$setOnInsert": {
+                        "account_id": _aid,
+                        "prospect_id": _pid,
+                        "status": "new",
+                        "tags": [],
+                        "used_by": [],
+                        "created_at": now,
+                        "last_updated_at": now,
+                    },
+                },
                 upsert=True,
             )
         except Exception as _oe:
@@ -1877,42 +3042,168 @@ def _build_sender_context(company_profile: dict | None) -> str:
     return " | ".join(parts)
 
 
+def _normalize_icp_label(label: str) -> str:
+    """lowercase, strip punctuation, collapse spaces/hyphens to underscores."""
+    import re
+    s = (label or "").lower().strip()
+    s = re.sub(r"[^\w\s-]", "", s)      # strip punctuation except hyphens
+    s = re.sub(r"[\s\-]+", "_", s).strip("_")   # "C-Level" → "c_level"
+    return s
+
+
+# Actor seniorityLevelIds: 120=Senior, 210=Manager, 220=Director, 300=VP,
+# 310=CXO, 320=Owner/Partner (verified against the live actor schema).
 _SENIORITY_LABEL_TO_ACTOR_ID: dict[str, list[str]] = {
+    # C-suite / executive tier → CXO
     "c_suite": ["310"],
     "csuite": ["310"],
+    "c_level": ["310"],
+    "clevel": ["310"],
+    "cxo": ["310"],
+    "executive": ["310"],
+    "exec": ["310"],
+    "chief": ["310"],
+    "president": ["320", "310"],
+    # Founders / owners / partners
     "founder": ["320"],
+    "co_founder": ["320"],
+    "cofounder": ["320"],
     "owner": ["320"],
     "partner": ["320"],
+    # VP tier
     "vp": ["300"],
-    "director": ["210"],
-    "head": ["210"],
-    "manager": ["220"],
+    "vice_president": ["300"],
+    "svp": ["300"],
+    "evp": ["300"],
+    # Director tier
+    "director": ["220"],
+    "head": ["220"],
+    "head_of": ["220"],
+    # Manager tier
+    "manager": ["210"],
+    # Senior IC tier
     "senior": ["120"],
+    "lead": ["120"],
+    "principal": ["120"],
 }
 
 
 def _icp_seniority_to_actor_ids(labels: list[str]) -> list[str]:
     out: set[str] = set()
     for label in labels:
-        key = (label or "").lower().replace("-", "_").replace(" ", "_")
-        for actor_id in _SENIORITY_LABEL_TO_ACTOR_ID.get(key, []):
-            out.add(actor_id)
+        key = _normalize_icp_label(label)
+        ids = _SENIORITY_LABEL_TO_ACTOR_ID.get(key)
+        if not ids:
+            # substring fallback for compound labels ("c_level_executives", "vp_of_sales")
+            for lk, lids in _SENIORITY_LABEL_TO_ACTOR_ID.items():
+                if lk and lk in key:
+                    ids = lids
+                    break
+        if ids:
+            out.update(ids)
+        elif key:
+            logger.warning(
+                f"[icp_map] unmapped ICP seniority label {label!r} — "
+                f"no actor seniorityLevelIds filter contributed for it"
+            )
     return sorted(out)
 
 
+# LinkedIn standard function taxonomy (harvestapi/linkedin-company-employees
+# actor `functionIds`, enum 1-26). Verified against the live actor schema.
+# Synonyms only map to IDs already verified above — never guess new IDs.
+_FUNCTION_LABEL_TO_ACTOR_IDS: dict[str, list[str]] = {
+    "engineering": ["8"],
+    "eng": ["8"],
+    "software": ["8"],
+    "tech": ["8", "13"],
+    "technology": ["8", "13"],
+    "sales": ["25"],
+    "revenue": ["25"],
+    "marketing": ["15"],
+    "growth": ["25", "15"],
+    "gtm": ["25", "15"],
+    "go_to_market": ["25", "15"],
+    "revops": ["25", "18"],
+    "revenue_operations": ["25", "18"],
+    "product": ["19"],
+    "product_management": ["19"],
+    "finance": ["10"],
+    "accounting": ["10"],
+    "hr": ["12"],
+    "human_resources": ["12"],
+    "people": ["12"],
+    "talent": ["12"],
+    "recruiting": ["12"],
+    "operations": ["18"],
+    "ops": ["18"],
+    "business_development": ["4"],
+    "biz_dev": ["4"],
+    "bd": ["4"],
+    "partnerships": ["4"],
+    "information_technology": ["13"],
+    "it": ["13"],
+    "legal": ["14"],
+    "compliance": ["14"],
+    "consulting": ["6"],
+    "customer_success": ["26"],
+    "customer_support": ["26"],
+    "support": ["26"],
+    "cs": ["26"],
+}
+
+
 def _icp_function_to_actor_ids(labels: list[str]) -> list[str]:
-    mapping = {
-        "engineering": "4",
-        "sales": "25",
-        "marketing": "15",
-        "product": "24",
-        "product_management": "24",
-        "finance": "5",
-        "hr": "10",
-        "human_resources": "10",
-        "operations": "20",
-    }
-    return [mapping[l.lower().replace(" ", "_")] for l in labels if l.lower().replace(" ", "_") in mapping]
+    out: set[str] = set()
+    for label in labels:
+        key = _normalize_icp_label(label)
+        ids = _FUNCTION_LABEL_TO_ACTOR_IDS.get(key)
+        if not ids:
+            # substring fallback for compound labels ("sales_and_marketing")
+            for lk, lids in _FUNCTION_LABEL_TO_ACTOR_IDS.items():
+                if len(lk) >= 4 and lk in key:
+                    ids = lids
+                    break
+        if ids:
+            out.update(ids)
+        elif key:
+            logger.warning(
+                f"[icp_map] unmapped ICP function label {label!r} — "
+                f"no actor functionIds filter contributed for it"
+            )
+    return sorted(out)
+
+
+# harvestapi/linkedin-company-employees actor `companyHeadcount` bands (verified
+# against the live actor schema). Each tuple is (band_letter, min_size, max_size);
+# max_size None means unbounded.
+_COMPANY_HEADCOUNT_BANDS: list[tuple[str, int, Optional[int]]] = [
+    ("A", 0, 0),          # Self-Employed
+    ("B", 1, 10),
+    ("C", 11, 50),
+    ("D", 51, 200),
+    ("E", 201, 500),
+    ("F", 501, 1000),
+    ("G", 1001, 5000),
+    ("H", 5001, 10000),
+    ("I", 10001, None),
+]
+
+
+def _icp_size_to_headcount_bands(size_min: int | None, size_max: int | None) -> list[str]:
+    """Map an ICP company-size range to the actor's companyHeadcount bands
+    (inclusive overlap). Returns [] when no size range is set (no filter)."""
+    if size_min is None and size_max is None:
+        return []
+    lo = size_min if size_min is not None else 0
+    hi = size_max  # None == unbounded
+    bands: list[str] = []
+    for letter, band_lo, band_hi in _COMPANY_HEADCOUNT_BANDS:
+        band_hi_cmp = band_hi if band_hi is not None else float("inf")
+        hi_cmp = hi if hi is not None else float("inf")
+        if band_hi_cmp >= lo and band_lo <= hi_cmp:
+            bands.append(letter)
+    return bands
 
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -1929,8 +3220,9 @@ def _extract_company_url_from_employee(emp: dict) -> str | None:
 
     Priority order (highest reliability first):
     1. _meta.query.currentCompanies[0] — echoes the exact URL we passed to the actor (100% reliable)
-    2. currentPosition[0].companyLinkedinUrl (singular list, present on ~87% of records)
-    3. currentPositions[0] (plural, legacy harvestapi field — rarely populated)
+    2. currentPositions[0].companyLinkedinUrl (plural — the actor's primary field in both
+       Short and Full profileScraperMode)
+    3. currentPosition[0].companyLinkedinUrl (singular — seen on some response variants)
     4. Top-level companyUrl / companyLinkedinUrl
     """
     # Primary: actor echoes the requested URL in _meta.query.currentCompanies[0]
@@ -1943,15 +3235,15 @@ def _extract_company_url_from_employee(emp: dict) -> str | None:
     except Exception:
         pass
 
-    # Secondary: currentPosition (singular) — actor returns this as a list
-    positions = emp.get("currentPosition") or []
+    # Secondary: currentPositions (plural) — the actor's standard field name
+    positions = emp.get("currentPositions") or []
     if positions:
         url = positions[0].get("companyLinkedinUrl") or positions[0].get("companyUrl")
         if url:
             return _normalize_li_url(url)
 
-    # Legacy: currentPositions (plural) — harvestapi used to return this
-    legacy = emp.get("currentPositions") or []
+    # Fallback: currentPosition (singular) — seen on some response variants
+    legacy = emp.get("currentPosition") or []
     if legacy:
         url = legacy[0].get("companyLinkedinUrl") or legacy[0].get("companyUrl")
         if url:
@@ -1973,6 +3265,25 @@ def _normalize_li_url(url: str | None) -> str | None:
     return url.lower()
 
 
+def _canonical_company_li_url(raw: str | None) -> str | None:
+    """Canonicalize any LinkedIn company URL to the exact form the prospect pool and
+    the Apify employee actor expect: 'https://www.linkedin.com/company/<slug>'
+    (lowercased, no scheme/www variance, no trailing slash, query stripped).
+
+    Returns None for missing values or non-company URLs (e.g. '/search/results/...'),
+    so junk company rows are dropped upstream instead of scraping nothing.
+    """
+    if not raw:
+        return None
+    u = raw.strip().lower()
+    if "/company/" not in u:
+        return None
+    slug = u.split("/company/", 1)[1].split("/")[0].split("?")[0].strip()
+    if not slug:
+        return None
+    return f"https://www.linkedin.com/company/{slug}"
+
+
 def _find_closest_sc(company_url: str, url_to_sc: dict) -> dict | None:
     """Find a sourced company by partial URL match when exact key misses."""
     if not company_url:
@@ -1987,6 +3298,76 @@ def _find_closest_sc(company_url: str, url_to_sc: dict) -> dict | None:
 # ──────────────────────────────────────────────────────────────────────────────
 # Per-day approval: generate next day's messages on demand (D5)
 # ──────────────────────────────────────────────────────────────────────────────
+
+async def backfill_missing_intelligence(
+    prospect_ids: list,
+    campaign_id: str,
+    account_id: str,
+    label: str,
+) -> int:
+    """Run deep cohort enrichment for prospects that lack it, in place.
+
+    ``run_enrichment_pipeline`` (Path B: company scrape + AI score) does NOT
+    produce ``prospect_intelligence_base``, ``pitch``, person ``posts`` or reuse
+    company deep-research — but the prospect-detail page and message
+    personalization all expect them. This backfills that rich data for any of
+    the given prospects still missing ``prospect_intelligence_base`` by running
+    the curated cohort enrichment (Path A), reusing already-stored company
+    research. Shared by the per-day approval flow and the durable day-enrichment
+    worker. Returns the number of prospects enriched.
+    """
+    oids = [ObjectId(str(p)) for p in prospect_ids if ObjectId.is_valid(str(p))]
+    if not oids:
+        return 0
+    need_intel = await database.prospects_collection.find(
+        {
+            "_id": {"$in": oids},
+            "prospect_intelligence_base": {"$exists": False},
+            # Exclude prospects that have already failed generation twice —
+            # otherwise every day-approval/worker run re-pays for a fresh
+            # Apify post scrape + AI call on a permanently-failing prospect.
+            "$or": [
+                {"intel_attempts": {"$exists": False}},
+                {"intel_attempts": {"$lt": 2}},
+            ],
+        },
+        {"_id": 1},
+    ).to_list(length=len(oids))
+    if not need_intel:
+        return 0
+    need_oids = [d["_id"] for d in need_intel]
+
+    # Reload already-stored company research so enrichment reuses it instead of
+    # re-running the (paid) deep-research pass.
+    co_research_by_url: dict = {}
+    enrolled_prospects = await database.prospects_collection.find(
+        {"_id": {"$in": need_oids}},
+        {"company_linkedin": 1},
+    ).to_list(length=len(need_oids))
+    co_urls = list({
+        (p.get("company_linkedin") or "").rstrip("/")
+        for p in enrolled_prospects
+        if p.get("company_linkedin")
+    })
+    if co_urls:
+        async for co_doc in database.companies_collection.find(
+            {"linkedin_url": {"$in": co_urls}},
+            {"linkedin_url": 1, "research": 1},
+        ):
+            url = (co_doc.get("linkedin_url") or "").rstrip("/")
+            research = co_doc.get("research")
+            if url and research:
+                co_research_by_url[url.lower()] = research
+
+    await _enrich_prospect_cohort(
+        prospect_oids=need_oids,
+        campaign_id=campaign_id,
+        account_id=account_id,
+        label=label,
+        co_research_by_url=co_research_by_url,
+    )
+    return len(need_oids)
+
 
 async def ensure_day_ready_then_generate(
     campaign_id: str,
@@ -2014,69 +3395,41 @@ async def ensure_day_ready_then_generate(
         enr_count = await database.campaign_enrollments_collection.count_documents({
             "campaign_id": campaign_oid,
             "smart_campaign_send_day": day,
-            "status": {"$nin": ["archived", "skipped_no_channel", "failed"]},
+            "status": {"$nin": ["archived", "skipped_no_channel", "failed", "cascade_waiting"]},
         })
         if enr_count == 0:
             logger.info(f"[day_gen:{campaign_id}] day {day} has no eligible enrollments — no-op")
             return
 
-        # Spot-check for missing intelligence (enrichment may have failed for some)
+        # Backfill deep enrichment (intelligence/pitch/posts/research) for any
+        # day-N prospect that lacks it, before generating messages.
         enr_docs = await database.campaign_enrollments_collection.find(
             {
                 "campaign_id": campaign_oid,
                 "smart_campaign_send_day": day,
-                "status": {"$nin": ["archived", "skipped_no_channel", "failed"]},
+                "status": {"$nin": ["archived", "skipped_no_channel", "failed", "cascade_waiting"]},
                 "message_gen_status": {"$in": [None, "pending", "scheduled_later"]},
             },
             {"prospect_id": 1},
         ).to_list(length=500)
 
         if enr_docs:
-            pids = [e["prospect_id"] for e in enr_docs]
-            need_intel = await database.prospects_collection.find(
-                {"_id": {"$in": pids}, "prospect_intelligence_base": {"$exists": False}},
-                {"_id": 1},
-            ).to_list(length=len(pids))
-
-            if need_intel:
-                need_oids = [d["_id"] for d in need_intel]
-                logger.info(
-                    f"[day_gen:{campaign_id}] day {day}: enriching {len(need_oids)} prospects "
-                    f"missing intelligence before message gen"
+            try:
+                n_enriched = await backfill_missing_intelligence(
+                    prospect_ids=[e["prospect_id"] for e in enr_docs],
+                    campaign_id=campaign_id,
+                    account_id=account_id,
+                    label=f"day{day}_on_demand",
                 )
-                try:
-                    # Reload company research from DB for use in enrichment
-                    co_research_by_url: dict = {}
-                    enrolled_prospects = await database.prospects_collection.find(
-                        {"_id": {"$in": need_oids}},
-                        {"company_linkedin": 1},
-                    ).to_list(length=len(need_oids))
-                    co_urls = list({
-                        (p.get("company_linkedin") or "").rstrip("/")
-                        for p in enrolled_prospects
-                        if p.get("company_linkedin")
-                    })
-                    if co_urls:
-                        async for co_doc in database.companies_collection.find(
-                            {"linkedin_url": {"$in": co_urls}},
-                            {"linkedin_url": 1, "research": 1},
-                        ):
-                            url = (co_doc.get("linkedin_url") or "").rstrip("/")
-                            research = co_doc.get("research")
-                            if url and research:
-                                co_research_by_url[url.lower()] = research
-
-                    await _enrich_prospect_cohort(
-                        prospect_oids=need_oids,
-                        campaign_id=campaign_id,
-                        account_id=account_id,
-                        label=f"day{day}_on_demand",
-                        co_research_by_url=co_research_by_url,
+                if n_enriched:
+                    logger.info(
+                        f"[day_gen:{campaign_id}] day {day}: backfilled intelligence for "
+                        f"{n_enriched} prospects before message gen"
                     )
-                except Exception as _enr_e:
-                    logger.warning(
-                        f"[day_gen:{campaign_id}] day {day} spot-enrichment failed (continuing): {_enr_e}"
-                    )
+            except Exception as _enr_e:
+                logger.warning(
+                    f"[day_gen:{campaign_id}] day {day} spot-enrichment failed (continuing): {_enr_e}"
+                )
 
         # Generate messages for this day (idempotent — skips already-generated enrollments)
         logger.info(f"[day_gen:{campaign_id}] generating messages for day {day}")

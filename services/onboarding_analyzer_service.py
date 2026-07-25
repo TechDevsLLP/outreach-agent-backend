@@ -139,6 +139,15 @@ def _build_system_prompt() -> str:
         '- "sender_role": string — the likely job title/role of the person doing outreach '
         "(infer from About/Team page, scraped meta, or company context; e.g. "
         '"Head of Growth", "Account Executive", "Founder"; return empty string if unclear)\n'
+        '- "company_name": string — the company\'s actual name as branded on the site '
+        "(use the provided name if given, else extract from the website)\n"
+        '- "description": string — 1-2 plain sentences describing what the company does '
+        "(their own elevator pitch, not who they sell to)\n"
+        '- "value_propositions": array of strings — the concrete value/outcomes customers get '
+        "(2-5 items, outcome-oriented, e.g. \"32% average sales lift within 2 months\")\n"
+        '- "company_industries": array of strings — the industry/category the company ITSELF '
+        'operates in (1-3 items, e.g. "Marketing & Advertising" for an ad agency — distinct '
+        'from "industries", which is who they SELL to)\n'
         '- "case_studies": array of objects — up to 3 client success stories found in '
         '"Case Studies", "Customers", "Results", or testimonial sections of the website. '
         "Each object must have: "
@@ -184,10 +193,15 @@ def _validate_result(raw: dict) -> dict:
         "icp_description": "",
         "sender_role": "",
         "case_studies": [],
+        "company_name": "",
+        "description": "",
+        "value_propositions": [],
+        "company_industries": [],
     }
     result = {**defaults, **raw}
     # Coerce any string values to single-item lists for list fields
-    for key in ("services", "industries", "differentiators", "pain_points"):
+    for key in ("services", "industries", "differentiators", "pain_points",
+                "value_propositions", "company_industries"):
         if isinstance(result[key], str):
             result[key] = [result[key]] if result[key] else []
         elif not isinstance(result[key], list):
@@ -206,7 +220,8 @@ def _validate_result(raw: dict) -> dict:
                     "industry": cs.get("industry"),
                 })
         result["case_studies"] = valid_cs
-    # Coerce sender_role to string
-    if not isinstance(result["sender_role"], str):
-        result["sender_role"] = str(result["sender_role"]) if result["sender_role"] else ""
+    # Coerce sender_role / description / company_name to string
+    for key in ("sender_role", "description", "company_name"):
+        if not isinstance(result[key], str):
+            result[key] = str(result[key]) if result[key] else ""
     return result

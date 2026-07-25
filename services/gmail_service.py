@@ -1,7 +1,7 @@
 """
 Gmail API service for sending emails and reading threads.
 
-Uses httpx for async HTTP calls (consistent with the SendGrid path),
+Uses httpx for async HTTP calls (consistent with the Zoho/SMTP providers),
 avoiding the synchronous google-api-python-client library.
 """
 
@@ -17,11 +17,30 @@ import httpx
 from bson import ObjectId
 
 import database
+from utils.crypto import encrypt
+from utils.email_html import html_to_plain_text
 
 logger = logging.getLogger(__name__)
 
 GMAIL_API_BASE = "https://gmail.googleapis.com/gmail/v1/users/me"
 GOOGLE_TOKEN_URL = "https://oauth2.googleapis.com/token"
+
+
+def _attach_alternatives(
+    msg: MIMEMultipart,
+    html_body: str,
+    text_body: Optional[str],
+) -> None:
+    """
+    Attach the text/plain and text/html parts of a multipart/alternative message.
+
+    Order matters: RFC 2046 says the last part is the most-preferred rendering,
+    so plain text must be attached before HTML. A caller that omits `text_body`
+    still gets a plain part derived from the HTML, so no message ever ships with
+    an empty text alternative.
+    """
+    msg.attach(MIMEText(text_body if text_body is not None else html_to_plain_text(html_body), "plain"))
+    msg.attach(MIMEText(html_body, "html"))
 
 
 async def refresh_token_if_needed(email_account: dict) -> Optional[str]:
@@ -76,12 +95,12 @@ async def refresh_token_if_needed(email_account: dict) -> Optional[str]:
         expires_in = token_data.get("expires_in", 3600)
         new_expiry = datetime.now(timezone.utc) + timedelta(seconds=expires_in)
 
-        # Persist updated token
+        # Persist updated token (encrypted at rest)
         await database.email_accounts_collection.update_one(
             {"_id": email_account["_id"]},
             {
                 "$set": {
-                    "oauth_access_token": new_access_token,
+                    "oauth_access_token": encrypt(new_access_token),
                     "oauth_token_expiry": new_expiry,
                     "updated_at": datetime.now(timezone.utc),
                 }
@@ -101,9 +120,17 @@ async def send_gmail_email(
     to_email: str,
     subject: str,
     html_body: str,
+    *,
+    text_body: Optional[str] = None,
+    in_reply_to: Optional[str] = None,
+    thread_id: Optional[str] = None,
+    references: Optional[str] = None,
 ) -> Optional[dict]:
     """
     Send an email via Gmail API.
+
+    Pass `in_reply_to` (the RFC Message-ID being replied to) and `thread_id`
+    (Gmail's threadId) to send a threaded reply instead of a new thread.
 
     Returns a dict with:
       - message_id: Gmail's message ID (used as provider_message_id)
@@ -126,10 +153,17 @@ async def send_gmail_email(
     msg["To"] = to_email
     msg["Subject"] = subject
     msg["Message-ID"] = rfc_message_id
-    msg.attach(MIMEText(html_body, "html"))
+    if in_reply_to:
+        msg["In-Reply-To"] = in_reply_to
+        msg["References"] = references or in_reply_to
+    _attach_alternatives(msg, html_body, text_body)
 
     # Base64url encode for Gmail API
     raw = base64.urlsafe_b64encode(msg.as_bytes()).decode("utf-8")
+
+    payload = {"raw": raw}
+    if thread_id:
+        payload["threadId"] = thread_id
 
     try:
         async with httpx.AsyncClient(timeout=30) as client:
@@ -139,7 +173,7 @@ async def send_gmail_email(
                     "Authorization": f"Bearer {access_token}",
                     "Content-Type": "application/json",
                 },
-                json={"raw": raw},
+                json=payload,
             )
 
         if resp.status_code not in (200, 201):
@@ -158,6 +192,75 @@ async def send_gmail_email(
 
     except Exception as e:
         logger.error(f"Gmail send error for {sender_email} -> {to_email}: {e}")
+        return None
+
+
+async def create_gmail_draft(
+    email_account: dict,
+    to_email: str,
+    subject: str,
+    html_body: str,
+    *,
+    text_body: Optional[str] = None,
+    in_reply_to: Optional[str] = None,
+    thread_id: Optional[str] = None,
+    references: Optional[str] = None,
+) -> Optional[dict]:
+    """
+    Create a native Gmail draft (visible in the user's Drafts folder).
+
+    Returns a dict with `draft_id`, `message_id`, `thread_id` or None on failure.
+    """
+    access_token = await refresh_token_if_needed(email_account)
+    if not access_token:
+        logger.error(f"Cannot create Gmail draft — no valid access token for {email_account.get('email')}")
+        return None
+
+    sender_email = email_account.get("email", "")
+
+    msg = MIMEMultipart("alternative")
+    msg["From"] = sender_email
+    msg["To"] = to_email
+    msg["Subject"] = subject
+    if in_reply_to:
+        msg["In-Reply-To"] = in_reply_to
+        msg["References"] = references or in_reply_to
+    _attach_alternatives(msg, html_body, text_body)
+
+    raw = base64.urlsafe_b64encode(msg.as_bytes()).decode("utf-8")
+
+    message_payload = {"raw": raw}
+    if thread_id:
+        message_payload["threadId"] = thread_id
+
+    try:
+        async with httpx.AsyncClient(timeout=30) as client:
+            resp = await client.post(
+                f"{GMAIL_API_BASE}/drafts",
+                headers={
+                    "Authorization": f"Bearer {access_token}",
+                    "Content-Type": "application/json",
+                },
+                json={"message": message_payload},
+            )
+
+        if resp.status_code not in (200, 201):
+            logger.error(
+                f"Gmail draft creation failed for {sender_email} -> {to_email}: "
+                f"HTTP {resp.status_code}: {resp.text}"
+            )
+            return None
+
+        data = resp.json()
+        message = data.get("message", {})
+        return {
+            "draft_id": data.get("id", ""),
+            "message_id": message.get("id", ""),
+            "thread_id": message.get("threadId", ""),
+        }
+
+    except Exception as e:
+        logger.error(f"Gmail draft creation error for {sender_email} -> {to_email}: {e}")
         return None
 
 

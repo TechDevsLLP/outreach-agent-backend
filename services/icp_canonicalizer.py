@@ -14,7 +14,7 @@ from bson import ObjectId
 from bson.binary import Binary
 
 import database
-from services.industry_canonicalizer import expand_icp_to_industry_ids
+from services.industry_canonicalizer import expand_icp_to_industry_ids, suggest_industry_expansions
 from services.geo_resolver import resolve as geo_resolve
 from services.embedding_service import embed_one
 
@@ -37,13 +37,18 @@ _SENIORITY_RULES: list[tuple[list[str], str]] = [
 
 
 def _normalize_seniority(raw_list: list[str]) -> list[str]:
-    """Map free-text seniority strings to canonical tokens. One input may yield many tokens."""
+    """Map free-text seniority strings to canonical tokens. One input may yield many tokens.
+
+    Patterns match on word boundaries (not raw substrings) so short acronyms
+    like "cto"/"coo" don't fire inside unrelated words — e.g. "Director"
+    contains "cto" and used to be wrongly canonicalized as c_suite.
+    """
     result: list[str] = []
     for raw in raw_list:
         lower = raw.lower()
         for patterns, token in _SENIORITY_RULES:
             for pattern in patterns:
-                if pattern in lower:
+                if re.search(r"(?<![a-z])" + re.escape(pattern) + r"s?(?![a-z])", lower):
                     if token not in result:
                         result.append(token)
                     break  # matched this rule; continue to next rule
@@ -140,11 +145,12 @@ async def canonicalize_icp(icp: dict) -> dict:
 
     Returns:
       {
-        "industry_ids":    list[str],
-        "country_codes":   list[str],
-        "seniorities":     list[str],
-        "employee_bands":  list[str],
-        "title_query_vec": Optional[Binary],  # int8 BSON Binary subtype 9, or None
+        "industry_ids":            list[str],
+        "suggested_industry_ids":  list[str],  # opt-in only, never auto-merged
+        "country_codes":           list[str],
+        "seniorities":             list[str],
+        "employee_bands":          list[str],
+        "title_query_vec":         Optional[Binary],  # int8 BSON Binary subtype 9, or None
       }
     """
     raw_industries = _extract_industries(icp)
@@ -153,13 +159,22 @@ async def canonicalize_icp(icp: dict) -> dict:
     raw_sizes = _extract_company_sizes(icp)
     raw_titles = _extract_job_titles(icp)
 
-    # --- Industry IDs ---
+    # --- Industry IDs (strict resolution only) ---
     industry_ids: list[str] = []
+    suggested_industry_ids: list[str] = []
     if raw_industries:
         try:
             industry_ids = await expand_icp_to_industry_ids(raw_industries)
         except Exception as exc:
             logger.warning("icp_canonicalizer: industry resolution failed: %s", exc)
+
+        try:
+            raw_suggestions = await suggest_industry_expansions(raw_industries)
+            suggested_industry_ids = [
+                sid for sid in raw_suggestions if sid not in industry_ids
+            ]
+        except Exception as exc:
+            logger.warning("icp_canonicalizer: industry suggestion failed: %s", exc)
 
     # --- Country codes (resolved concurrently) ---
     country_codes: list[str] = []
@@ -212,6 +227,7 @@ async def canonicalize_icp(icp: dict) -> dict:
 
     return {
         "industry_ids": industry_ids,
+        "suggested_industry_ids": suggested_industry_ids,
         "country_codes": country_codes,
         "seniorities": seniorities,
         "employee_bands": employee_bands,

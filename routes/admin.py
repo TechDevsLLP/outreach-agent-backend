@@ -10,19 +10,28 @@ from pathlib import Path
 from typing import Optional
 
 from bson import ObjectId
-from fastapi import APIRouter, Depends, HTTPException, Query, status
+from fastapi import APIRouter, Depends, HTTPException, Query, Request, Response, status
 from fastapi.responses import FileResponse, JSONResponse
 from pydantic import BaseModel
 
 import database
+from config import get_settings
 from auth import (
+    ADMIN_SESSION_COOKIE_NAME,
+    clear_admin_session_cookie,
     create_impersonation_token,
+    decode_access_token,
+    get_current_user,
     get_super_admin,
     hash_password,
+    is_browser_session_request,
+    set_session_cookies,
 )
+from services.admin_audit_service import log_admin_action
 from services.user_provisioning import create_user_with_account
 
 router = APIRouter(prefix="/api/admin", tags=["Admin"])
+settings = get_settings()
 
 
 # ---------------------------------------------------------------------------
@@ -257,7 +266,7 @@ async def update_user(
 @router.delete("/users/{user_id}", status_code=status.HTTP_204_NO_CONTENT)
 async def disable_user(
     user_id: str,
-    _admin: dict = Depends(get_super_admin),
+    admin: dict = Depends(get_super_admin),
 ):
     user = await _load_user(user_id)
     account_id = await _get_account_id(user)
@@ -269,6 +278,10 @@ async def disable_user(
     await database.users_collection.update_one(
         {"_id": user["_id"]},
         {"$set": {"is_active": False, "updated_at": now}},
+    )
+    await log_admin_action(
+        admin["email"], "user.disable", "user", user_id,
+        {"email": user.get("email"), "account_id": str(account_id)},
     )
 
 
@@ -354,6 +367,8 @@ async def get_user_activity(
 @router.post("/impersonate/{user_id}")
 async def impersonate_user(
     user_id: str,
+    request: Request,
+    response: Response,
     admin: dict = Depends(get_super_admin),
 ):
     user = await _load_user(user_id)
@@ -367,6 +382,33 @@ async def impersonate_user(
         target_email=user["email"],
         admin_user_id=admin["_id"],
     )
+    await log_admin_action(
+        admin["email"], "user.impersonate", "user", user_id,
+        {"target_email": user["email"], "account_id": account_id_str, "ttl_minutes": 30},
+    )
+    if is_browser_session_request(request):
+        admin_token = request.cookies.get("auth_token")
+        if not admin_token:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail="Browser impersonation requires an active cookie session",
+            )
+        set_session_cookies(
+            response,
+            token,
+            ttl_minutes=30,
+            admin_token=admin_token,
+        )
+        response.headers["Cache-Control"] = "no-store"
+        return {
+            "impersonating": True,
+            "user": {
+                "_id": str(user["_id"]),
+                "email": user["email"],
+                "name": user["name"],
+            },
+            "expires_at": expires_at.isoformat(),
+        }
     return {
         "token": token,
         "user": {
@@ -376,6 +418,45 @@ async def impersonate_user(
         },
         "expires_at": expires_at.isoformat(),
     }
+
+
+@router.post("/impersonation/stop")
+async def stop_impersonating(
+    request: Request,
+    response: Response,
+    current_user: dict = Depends(get_current_user),
+):
+    """Restore the original superadmin session without exposing either JWT."""
+    if not current_user.get("_is_impersonating"):
+        raise HTTPException(status_code=409, detail="No active impersonation session")
+
+    admin_token = request.cookies.get(ADMIN_SESSION_COOKIE_NAME)
+    if not admin_token:
+        raise HTTPException(status_code=401, detail="Original admin session is unavailable")
+
+    try:
+        payload = decode_access_token(admin_token)
+        admin_id = payload.get("sub")
+        if not admin_id or admin_id != current_user.get("_impersonated_by"):
+            raise ValueError("impersonation session mismatch")
+        admin = await database.users_collection.find_one({"_id": ObjectId(admin_id)})
+    except Exception:
+        raise HTTPException(status_code=401, detail="Original admin session is invalid")
+
+    configured_admin = (settings.super_admin_email or "").lower()
+    if not admin or not configured_admin or admin.get("email", "").lower() != configured_admin:
+        raise HTTPException(status_code=403, detail="Original admin access is no longer valid")
+
+    set_session_cookies(response, admin_token)
+    clear_admin_session_cookie(response)
+    response.headers["Cache-Control"] = "no-store"
+    await log_admin_action(
+        admin["email"],
+        "user.impersonation.stop",
+        "user",
+        current_user["_id"],
+    )
+    return {"impersonating": False}
 
 
 # ---------------------------------------------------------------------------
@@ -571,17 +652,32 @@ async def get_usage_summary(
         agg = await collection.aggregate(pipeline).to_list(1)
         return round(agg[0]["total"] if agg else 0.0, 6)
 
+    async def _sum_gt_credits(start: datetime) -> int:
+        """GrowthToolkit usage is tracked in credits (no USD constant exists)."""
+        pipeline = [
+            {"$match": {"created_at": {"$gte": start}}},
+            {"$group": {"_id": None, "total": {"$sum": {"$ifNull": ["$credits_used", 0]}}}},
+        ]
+        try:
+            agg = await database.growthtoolkit_usage_collection.aggregate(pipeline).to_list(1)
+        except Exception:
+            return 0
+        return agg[0]["total"] if agg else 0
+
     (
-        apify_today, or_today,
-        apify_week, or_week,
-        apify_month, or_month,
+        apify_today, or_today, gt_today,
+        apify_week, or_week, gt_week,
+        apify_month, or_month, gt_month,
     ) = await asyncio.gather(
         _sum_cost(database.apify_usage_collection, "started_at", today_start),
         _sum_cost(database.openrouter_usage_collection, "requested_at", today_start),
+        _sum_gt_credits(today_start),
         _sum_cost(database.apify_usage_collection, "started_at", week_start),
         _sum_cost(database.openrouter_usage_collection, "requested_at", week_start),
+        _sum_gt_credits(week_start),
         _sum_cost(database.apify_usage_collection, "started_at", month_start),
         _sum_cost(database.openrouter_usage_collection, "requested_at", month_start),
+        _sum_gt_credits(month_start),
     )
 
     top_accounts_pipeline = [
@@ -601,9 +697,9 @@ async def get_usage_summary(
     top_campaigns = await database.openrouter_usage_collection.aggregate(top_campaigns_pipeline).to_list(10)
 
     return {
-        "today": {"apify_cost": apify_today, "openrouter_cost": or_today},
-        "this_week": {"apify_cost": apify_week, "openrouter_cost": or_week},
-        "this_month": {"apify_cost": apify_month, "openrouter_cost": or_month},
+        "today": {"apify_cost": apify_today, "openrouter_cost": or_today, "growthtoolkit_credits": gt_today},
+        "this_week": {"apify_cost": apify_week, "openrouter_cost": or_week, "growthtoolkit_credits": gt_week},
+        "this_month": {"apify_cost": apify_month, "openrouter_cost": or_month, "growthtoolkit_credits": gt_month},
         "top_accounts_by_cost": [{"account_id": r["_id"], "total_cost": r["total_cost"]} for r in top_accounts],
         "top_campaigns_by_cost": [{"campaign_id": r["_id"], "total_cost": r["total_cost"]} for r in top_campaigns],
     }

@@ -10,6 +10,7 @@ Valid transitions:
   active         → awaiting_human     (HARD_OBJECTION hostile ≥0.6 → escalate)
   active         → completed          (HARD_OBJECTION non-hostile → graceful close)
   active         → opted_out          (UNSUBSCRIBE)
+  active         → not_replied        (sequence exhausted with no reply — terminal)
   meeting_proposed → meeting_booked   (prospect confirms slot)
   meeting_proposed → active           (72h no-confirm → re-engage at n5)
   meeting_booked   → active           (calendar cancellation → re-engage)
@@ -33,7 +34,14 @@ logger = logging.getLogger(__name__)
 VALID_STATUSES = {
     "active", "enrolled", "paused", "paused_ooo", "meeting_proposed",
     "meeting_booked", "awaiting_human", "completed", "opted_out", "replied",
+    "not_replied",
 }
+
+# Terminal statuses that must never silently flip back to "active" — a reply,
+# opt-out, unsubscribe, or graceful close is a final outcome. Reactivating one
+# is only ever legitimate for a small set of known flows (72h no-confirm,
+# calendar cancellation), which must say so explicitly via allow_reactivation.
+TERMINAL_STATUSES = {"replied", "opted_out", "unsubscribed", "completed"}
 
 
 async def transition(
@@ -43,10 +51,15 @@ async def transition(
     resume_at: Optional[datetime] = None,
     meeting_id: Optional[str] = None,
     extra_fields: Optional[dict] = None,
+    allow_reactivation: bool = False,
 ) -> bool:
     """
     Apply a status transition to an enrollment.
-    Returns True on success, False if the enrollment was not found or transition invalid.
+
+    Returns True on success, False if the enrollment was not found, the
+    transition is invalid, or (to_status="active" only) the enrollment is
+    currently in a terminal state (TERMINAL_STATUSES) and allow_reactivation
+    was not passed.
     """
     if to_status not in VALID_STATUSES:
         logger.warning(f"Invalid target status: {to_status}")
@@ -66,7 +79,7 @@ async def transition(
     elif to_status == "paused_ooo" and resume_at:
         update["ooo_resume_at"] = resume_at
         update["next_action_at"] = resume_at
-    elif to_status in ("completed", "opted_out", "meeting_booked", "replied"):
+    elif to_status in ("completed", "opted_out", "meeting_booked", "replied", "not_replied"):
         update["next_action_at"] = None
         update["completed_at"] = now
     elif to_status == "awaiting_human":
@@ -83,13 +96,20 @@ async def transition(
     if extra_fields:
         update.update(extra_fields)
 
+    query: dict = {"_id": ObjectId(enrollment_id)}
+    if to_status == "active" and not allow_reactivation:
+        query["status"] = {"$nin": list(TERMINAL_STATUSES)}
+
     try:
         result = await database.campaign_enrollments_collection.update_one(
-            {"_id": ObjectId(enrollment_id)},
+            query,
             {"$set": update},
         )
         if result.matched_count == 0:
-            logger.warning(f"Enrollment {enrollment_id} not found for transition to {to_status}")
+            logger.warning(
+                f"Enrollment {enrollment_id} not found for transition to {to_status} "
+                "(or blocked: terminal state requires allow_reactivation)"
+            )
             return False
         logger.info(f"Enrollment {enrollment_id}: → {to_status} ({reason or 'no reason'})")
         return True
@@ -110,6 +130,7 @@ async def reactivate_after_no_confirm(enrollment_id: str) -> bool:
         to_status="active",
         reason="meeting_proposed_no_confirm_72h",
         extra_fields={"next_action_at": resume_at},
+        allow_reactivation=True,
     )
 
 
@@ -125,6 +146,7 @@ async def handle_calendar_cancel(enrollment_id: str) -> bool:
         to_status="active",
         reason="meeting_booked_cancelled_by_prospect",
         extra_fields={"next_action_at": resume_at, "meeting_id": None},
+        allow_reactivation=True,
     )
 
 

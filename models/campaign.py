@@ -92,6 +92,7 @@ class CampaignBase(BaseModel):
     active_count: int = 0
     completed_count: int = 0
     replied_count: int = 0
+    not_replied_count: int = 0  # sequence exhausted without any reply (terminal)
     bounced_count: int = 0
     opted_out_count: int = 0
     meetings_booked: int = 0
@@ -116,13 +117,37 @@ class CampaignBase(BaseModel):
     is_smart_campaign: bool = False
 
     # Discovery mode for smart campaigns
-    discovery_mode: str = "curated"  # "curated" (AI-sourced company list + per-company employee scrape)
+    discovery_mode: str = "curated"  # "curated" (AI-sourced company list + per-company employee scrape) | "upload" (BYOL)
     curated_icp_prompt: Optional[str] = None  # free-text ICP description; if absent, synthesized from icp_* fields
-    curated_company_count_target: int = Field(default=100, ge=10, le=500)  # target number of companies to source
+    curated_company_count_target: int = Field(default=50, ge=10, le=300)  # target number of companies to source
     curated_companies_sourced: int = 0
     curated_companies_approved: int = 0
     curated_companies_scraped: int = 0
     prospect_count_target: int = 100  # 100–500 slider
+
+    # ── Upload-a-Lead-List (BYOL) fields ──
+    # discovery_source distinguishes the targeting source inside smart campaigns:
+    #   "discovery" (AI finds leads) vs "upload" (user brings their own list).
+    discovery_source: str = "discovery"  # "discovery" | "upload"
+    upload_batch_id: Optional[str] = None  # -> lead_upload_batches._id (string) when discovery_source == "upload"
+    # Scoring floor for enrollment. Curated discovery leaves this None (module
+    # default 25 applies). BYOL sets it to 0 so no uploaded lead is ever dropped
+    # for a low fit score (scores are display/sort only). See critical risk #4.
+    discovery_min_enroll_score: Optional[int] = None
+    # Review arrays surfaced in the awaiting_approval "rows needing attention" panel.
+    # upload_unresolvable_rows: rows we could not turn into a prospect (no linkedin,
+    #   no resolvable domain/email). Shape: {row_index, raw_row, reason}.
+    # upload_skipped_rows: resolvable rows that pre-enroll guards (double-contact /
+    #   teammate-cooldown / no-eligible-channel) declined. Shape: {row_index,
+    #   name, company, reason}.
+    upload_unresolvable_rows: list[dict] = Field(default_factory=list)
+    upload_skipped_rows: list[dict] = Field(default_factory=list)
+    # BYOL counters echoed by get_discovery_status / SSE.
+    upload_rows_total: int = 0
+    upload_rows_person: int = 0
+    upload_rows_company: int = 0
+    upload_rows_email_only: int = 0
+    upload_rows_unresolvable: int = 0
 
     # ICP Target Market
     icp_industries: list[str] = Field(default_factory=list)
@@ -149,6 +174,11 @@ class CampaignBase(BaseModel):
     outreach_sequence: Optional[dict] = None   # serialized OutreachSequence
     messaging_config: Optional[dict] = None    # per-channel tone settings
 
+    # Branching multi-touch sequence graph (frontend React Flow editor contract).
+    # Present ONLY on new sequence campaigns; when absent the campaign uses the
+    # legacy single-touch / follow_up_flow path unchanged. See services/sequence_service.py.
+    sequence_graph: Optional[dict] = None
+
     # Discovery lifecycle
     discovery_status: str = "idle"  # idle|searching_db|running|scraping|enriching|scoring|generating_messages|completed|failed|sourcing_companies|awaiting_company_approval|scraping_employees
     discovery_started_at: Optional[datetime] = None
@@ -158,6 +188,10 @@ class CampaignBase(BaseModel):
     discovery_prospects_enrolled: int = 0
     discovery_companies_found: int = 0
     discovery_apify_triggered: bool = False
+    # Non-fatal issues surfaced from discovery (e.g. GrowthToolkit email finder
+    # credits exhausted) so the frontend can show a warning banner even though
+    # discovery itself completed successfully.
+    discovery_warnings: list[str] = Field(default_factory=list)
 
     # Message generation lifecycle
     message_gen_status: str = "idle"  # idle|running|completed|failed
@@ -251,7 +285,10 @@ class SmartCampaignCreateRequest(BaseModel):
     description: Optional[str] = None
     discovery_mode: str = "curated"
     curated_icp_prompt: Optional[str] = None
-    curated_company_count_target: int = Field(default=100, ge=10, le=500)
+    curated_company_count_target: int = Field(default=50, ge=10, le=300)
+    # BYOL: when discovery_mode == "upload", this references a `ready`
+    # lead_upload_batches doc owned by the account (validated in create_smart_campaign).
+    upload_batch_id: Optional[str] = None
     email_account_id: Optional[str] = None
     linkedin_account_id: Optional[str] = None
     timezone: Optional[str] = None
@@ -259,8 +296,10 @@ class SmartCampaignCreateRequest(BaseModel):
     send_hour_start: int = 9
     send_hour_end: int = 17
 
-    # Prospect count target
-    prospect_count_target: int = Field(100, ge=25, le=500)
+    # Prospect count target — DERIVED from curated_company_count_target (× per-company
+    # target). No longer a user sizing input; kept optional for backward compatibility
+    # (status echo, legacy finder defaults). run_fast_discovery ignores it.
+    prospect_count_target: Optional[int] = None
 
     # ICP Target Market
     icp_industries: list[str] = Field(default_factory=list)
@@ -300,6 +339,11 @@ class SmartCampaignCreateRequest(BaseModel):
     # Follow-up flow engine
     follow_up_flow: Optional[dict] = None
 
+    # Branching multi-touch sequence graph (frontend React Flow editor contract).
+    # Optional — the frontend already sends it for sequence campaigns. Validated
+    # and persisted at creation; absence preserves legacy single-touch behaviour.
+    sequence_graph: Optional[dict] = None
+
     # ── Discovery tuning knobs (optional; when absent, module constants apply) ─
     # These mirror the per-campaign doc fields read by run_fast_discovery so
     # callers (scripts, API, frontend advanced panel) can override the defaults.
@@ -310,7 +354,7 @@ class SmartCampaignCreateRequest(BaseModel):
     )
     discovery_dropout_buffer: Optional[float] = Field(
         default=None, ge=1.0, le=5.0,
-        description="Multiplier on prospect_count_target for Apify max_total_items (default: 2.5)"
+        description="Multiplier on the derived prospect target for Apify max_total_items (default: 2.5)"
     )
     discovery_enrollment_cap: Optional[int] = Field(
         default=None, ge=1, le=10,
@@ -318,7 +362,12 @@ class SmartCampaignCreateRequest(BaseModel):
     )
     discovery_sourcing_concurrency: Optional[int] = Field(
         default=None, ge=1, le=8,
-        description="Max parallel Gemini company-sourcing calls (default: 1)"
+        description="Max parallel Gemini company-sourcing calls (default: 4)"
+    )
+    discovery_scrape_concurrency: Optional[int] = Field(
+        default=None, ge=1, le=8,
+        description="Max parallel Apify employee-scrape runs; company list is split "
+                    "into this many concurrent chunks (default: ~ceil(companies/10), max 5)"
     )
     discovery_enable_company_research: Optional[bool] = Field(
         default=None,

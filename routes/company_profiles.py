@@ -16,13 +16,15 @@ def _serialize(doc: dict) -> dict:
         doc["account_id"] = str(doc["account_id"])
     if isinstance(doc.get("user_id"), ObjectId):
         doc["user_id"] = str(doc["user_id"])
+    # title_query_vec is a BSON Binary embedding vector — not JSON-serializable
+    doc.pop("title_query_vec", None)
     return doc
 
 
 @router.get("")
 async def get_company_profile(ctx: dict = Depends(get_account_context)):
     """Return the company profile for this account, or null if not yet configured."""
-    account_id = ObjectId(ctx["account"]["_id"])
+    account_id = str(ctx["account"]["_id"])
     profile = await company_profiles_collection.find_one({"account_id": account_id})
     if profile is None:
         return {"profile": None}
@@ -36,7 +38,7 @@ async def upsert_company_profile(
     ctx: dict = Depends(get_account_context),
 ):
     """Create or update the company profile for this account."""
-    account_id = ObjectId(ctx["account"]["_id"])
+    account_id = str(ctx["account"]["_id"])
     user_id = ObjectId(ctx["user"]["_id"])
 
     update_fields = body.model_dump(exclude_none=True)

@@ -80,17 +80,16 @@ def _serialize_oids(doc: dict) -> dict:
 
 
 async def _get_campaign_or_404(campaign_id: str, account_oid: ObjectId) -> dict:
-    """Fetch campaign scoped to account, raise 404/403 as appropriate."""
+    """Fetch campaign scoped to account, raise 404 if missing.
+    Cross-tenant access also returns 404 (no existence leak)."""
     try:
         oid = ObjectId(campaign_id)
     except Exception:
         raise HTTPException(status_code=404, detail="Campaign not found")
 
     doc = await database.campaigns_collection.find_one({"_id": oid})
-    if doc is None:
+    if doc is None or doc.get("account_id") != account_oid:
         raise HTTPException(status_code=404, detail="Campaign not found")
-    if doc.get("account_id") != account_oid:
-        raise HTTPException(status_code=403, detail="Access denied")
     return doc
 
 

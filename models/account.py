@@ -20,8 +20,8 @@ class AccountBase(BaseModel):
     sender_email: Optional[str] = None
     reply_to_email: Optional[str] = None
 
-    # Usage quotas
-    daily_email_quota: int = 50
+    # Usage quotas (display defaults; runtime caps enforced by daily_cap_service)
+    daily_email_quota: int = 20
     daily_linkedin_connection_quota: int = 20
     daily_linkedin_inmail_quota: int = 5
     enrichment_batch_limit: int = 50

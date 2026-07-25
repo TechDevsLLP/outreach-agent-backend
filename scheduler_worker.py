@@ -30,10 +30,7 @@ async def main():
 
     from services.scheduler_service import start_scheduler, shutdown_scheduler
     from services.notification_service import shutdown_sse
-    from services.outreach_executor_service import resume_interrupted_schedules
-
     start_scheduler()
-    await resume_interrupted_schedules()
     logger.info("Scheduler worker running. Press Ctrl+C to stop.")
 
     stop_event = asyncio.Event()

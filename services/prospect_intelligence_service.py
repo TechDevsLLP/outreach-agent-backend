@@ -20,6 +20,7 @@ from bson import ObjectId
 import database
 from config import get_settings
 from services.openrouter_service import OpenRouterClient
+from utils.prompts import _format_funding_line
 
 logger = logging.getLogger(__name__)
 settings = get_settings()
@@ -43,6 +44,15 @@ PROSPECT_INTELLIGENCE_SCHEMA = {
 PROSPECT_PITCH_SCHEMA = {
     "pitch_angle": str,         # how to position THE OFFER for this specific person
     "why_they_need_us": str,    # specific reason based on their content + our offer
+    # Hyper-personalized free-value CTA — a named, zero-commitment asset derived
+    # from company research (competitors/best performer/news/buying signals).
+    # e.g. {"asset_type": "teardown", "asset_name": "5-point teardown of how
+    # Acme wins organic traffic vs {company}", "cta_line": "Worth sending over?"}
+    "free_value_cta": {
+        "asset_type": str,      # "teardown" | "audit" | "playbook" | "deck" | "benchmark"
+        "asset_name": str,      # specific, named asset (references real research facts)
+        "cta_line": str,        # single-question yes ask, e.g. "Worth sending over?"
+    },
 }
 
 _INTELLIGENCE_BATCH_SIZE = 5
@@ -74,14 +84,25 @@ If no posts are available, infer what you can from profile/company data and mark
 
 _PITCH_SYSTEM_PROMPT = """You are a B2B outreach strategist.
 
-Given base intelligence summaries for prospects and a seller's context, generate a minimal pitch overlay
-for each prospect.
+Given base intelligence summaries for prospects (plus company research: competitors, the best-performing
+competitor and why it's winning, recent news, buying signals) and a seller's context, generate a pitch
+overlay for each prospect.
 
 Return a JSON object: {"pitches": [<one object per prospect in same order as input>]}
 
 Each pitch object must have these exact keys:
 - pitch_angle: 1-sentence recommendation for how to position the seller's offer for THIS specific person
-- why_they_need_us: 1-2 sentences, specific to their content, role, and pain signals — no generic claims"""
+- why_they_need_us: 1-2 sentences, specific to their content, role, and pain signals — no generic claims
+- free_value_cta: an object {"asset_type", "asset_name", "cta_line"} describing ONE free, zero-commitment
+  asset the seller can offer this prospect. Rules:
+  * asset_type: one of "teardown" | "audit" | "playbook" | "deck" | "benchmark"
+  * asset_name: SPECIFIC and NAMED, built from the research facts — reference the best-performing
+    competitor, a buying signal, or a concrete news item. Good: "5-point teardown of how {best
+    competitor} wins {category} traffic vs {company}". Bad: "a free consultation", "some ideas".
+  * The asset must be obviously valuable to THIS person's role and require nothing from them to receive.
+  * cta_line: ONE short question inviting a simple yes — e.g. "Worth sending over?" — never a meeting ask.
+  If the research is too thin to name a specific asset, still produce the best possible named asset from
+  the prospect's role + industry (never return an empty free_value_cta)."""
 
 # ---------------------------------------------------------------------------
 # Prompt builders
@@ -115,6 +136,72 @@ def _build_base_intelligence_prompt(prospects: list[dict]) -> str:
             specs = company_data["specialties"]
             if isinstance(specs, list):
                 parts.append(f"Company Specialties: {', '.join(str(s) for s in specs[:5])}")
+
+        # ── Injected company research (news / competitors / best performer /
+        # buying signals / company posts) — see company_research_service contract.
+        research = p.get("company_research") or {}
+        news = p.get("company_news") or research.get("news") or []
+        if news:
+            parts.append("Recent Company News:")
+            for item in news[:3]:
+                if not isinstance(item, dict):
+                    continue
+                title = item.get("title") or ""
+                summary = (item.get("summary") or "")[:150]
+                published = item.get("published_date") or ""
+                if title:
+                    parts.append(f"  - [{published}] {title}" + (f": {summary}" if summary else ""))
+
+        competitors = p.get("company_competitors") or research.get("competitors") or []
+        if competitors:
+            comp_bits = []
+            for c in competitors[:3]:
+                if isinstance(c, dict) and c.get("name"):
+                    diff = (c.get("differentiation") or "")[:80]
+                    comp_bits.append(f"{c['name']}" + (f" ({diff})" if diff else ""))
+                elif isinstance(c, str):
+                    comp_bits.append(c)
+            if comp_bits:
+                parts.append(f"Known Competitors: {'; '.join(comp_bits)}")
+
+        best = research.get("best_performer") or None
+        if isinstance(best, dict) and best.get("name"):
+            why = (best.get("why_winning") or "")[:200]
+            parts.append(
+                f"Best-Performing Competitor: {best['name']}"
+                + (f" — why winning: {why}" if why else "")
+            )
+
+        buying_signals = research.get("buying_signals") or []
+        if buying_signals:
+            parts.append(
+                "Company Buying Signals: "
+                + "; ".join(str(s)[:120] for s in buying_signals[:4])
+            )
+
+        funding_line = _format_funding_line(research.get("funding"))
+        if funding_line:
+            parts.append(f"Company Funding: {funding_line}")
+
+        hiring_signals = research.get("hiring_signals") or []
+        if hiring_signals:
+            parts.append(
+                "Company Hiring Signals (buying intent): "
+                + "; ".join(str(h)[:100] for h in hiring_signals[:4])
+            )
+
+        company_posts = research.get("company_posts") or []
+        if company_posts:
+            parts.append(f"Recent COMPANY-page Posts ({len(company_posts)} total):")
+            for cpost in company_posts[:3]:
+                if not isinstance(cpost, dict):
+                    continue
+                ctext = (cpost.get("text") or "").strip()
+                if ctext:
+                    parts.append(
+                        f'  [{cpost.get("posted_at") or ""}] '
+                        f'[{cpost.get("reactions", 0)} reactions] "{ctext[:200]}"'
+                    )
 
         posts = p.get("posts") or []
         if posts:
@@ -172,6 +259,33 @@ def _build_pitch_batch_prompt(
             parts.append(f"Best Hook: {base['best_hook']}")
         if base.get("dont_pitch"):
             parts.append(f"Avoid: {', '.join(str(x) for x in base['dont_pitch'])}")
+
+        # Company research context — fuels the named free_value_cta asset
+        research = p.get("company_research") or {}
+        best = research.get("best_performer")
+        if isinstance(best, dict) and best.get("name"):
+            why = (best.get("why_winning") or "")[:200]
+            parts.append(
+                f"Best-Performing Competitor: {best['name']}"
+                + (f" — {why}" if why else "")
+            )
+        buying_signals = research.get("buying_signals") or []
+        if buying_signals:
+            parts.append("Buying Signals: " + "; ".join(str(s)[:100] for s in buying_signals[:3]))
+        funding_line = _format_funding_line(research.get("funding"))
+        if funding_line:
+            parts.append(f"Funding: {funding_line}")
+        hiring_signals = research.get("hiring_signals") or []
+        if hiring_signals:
+            parts.append(
+                "Hiring Now (buying intent): "
+                + "; ".join(str(h)[:100] for h in hiring_signals[:3])
+            )
+        news = research.get("news") or p.get("company_news") or []
+        if news:
+            headlines = [n.get("title", "") for n in news[:2] if isinstance(n, dict) and n.get("title")]
+            if headlines:
+                parts.append("Recent News: " + "; ".join(headlines))
 
         parts.append("")
 
@@ -346,16 +460,30 @@ async def store_base_intelligence(
     """
     Persist base intelligence onto each prospect doc in MongoDB.
     Writes to prospects.prospect_intelligence_base (tenant-agnostic).
-    Silently skips missing/failed entries.
+    A failed generation bumps intel_attempts + intel_last_failed_at instead of
+    being silently skipped, so callers (e.g. backfill_missing_intelligence) can
+    stop re-paying for Apify scrape + AI calls on prospects that keep failing.
+    A success resets the counter.
     """
+    now = datetime.now(timezone.utc)
     for pid, intel in zip(prospect_ids, intelligence_list):
-        if not intel:
-            continue
         try:
-            await database.prospects_collection.update_one(
-                {"_id": pid},
-                {"$set": {"prospect_intelligence_base": intel}},
-            )
+            if intel:
+                await database.prospects_collection.update_one(
+                    {"_id": pid},
+                    {
+                        "$set": {"prospect_intelligence_base": intel},
+                        "$unset": {"intel_attempts": "", "intel_last_failed_at": ""},
+                    },
+                )
+            else:
+                await database.prospects_collection.update_one(
+                    {"_id": pid},
+                    {
+                        "$inc": {"intel_attempts": 1},
+                        "$set": {"intel_last_failed_at": now},
+                    },
+                )
         except Exception as e:
             logger.warning(f"[intelligence] failed to store base intel for prospect {pid}: {e}")
 
@@ -376,13 +504,20 @@ async def store_pitch_for_account(
         if not pitch:
             continue
         try:
+            # Refresh denormalized list-filter keys too (the upsert may create
+            # the state row, which must carry pk for routes/prospects.py filters).
+            from utils.prospect_filter_keys import fetch_filter_keys
+            set_fields = {"pitch": pitch, "last_updated_at": now}
+            try:
+                pk = await fetch_filter_keys(pid)
+                if pk is not None:
+                    set_fields["pk"] = pk
+            except Exception:
+                pass
             await database.prospect_state_collection.update_one(
                 {"account_id": str(account_id), "prospect_id": str(pid)},
                 {
-                    "$set": {
-                        "pitch": pitch,
-                        "last_updated_at": now,
-                    },
+                    "$set": set_fields,
                     "$setOnInsert": {
                         "status": "new",
                         "used_by": [],

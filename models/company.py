@@ -39,7 +39,7 @@ class GeoPoint(BaseModel):
 
 
 class WebsiteData(BaseModel):
-    """Reserved slot for future website scraping (not scraped yet)."""
+    """Structured company website scrape (services/website_scraper_service.fetch_website_data)."""
     url: Optional[str] = None
     title: Optional[str] = None
     meta_desc: Optional[str] = None
@@ -89,11 +89,31 @@ class CompanyBase(BaseModel):
 
     # Raw data blobs
     linkedin_data: Optional[dict] = None       # raw Apify company page scrape
-    website_data: Optional[WebsiteData] = None # reserved slot (not scraped yet)
+    website_data: Optional[WebsiteData] = None # structured website scrape (populated on enrichment)
 
     # Competitor cache (shared / tenant-agnostic)
     competitors: list[dict] = Field(default_factory=list)
     competitors_last_fetched: Optional[datetime] = None
+
+    # Deep company research (services/company_research_service.deep_research_company).
+    # Contract (do not drift — other services build against these exact keys):
+    #   competitors:  [{name, website_url, linkedin_url, differentiation,
+    #                   market_position, is_best_performer: bool, why_winning: str|None}]
+    #   best_performer: {name: str, why_winning: str} | None
+    #   news:         [{title, url, published_date, source, summary, sentiment}]
+    #   buying_signals: [str]   — hiring surges, funding, expansion, tech adoption,
+    #                             leadership changes, product launches
+    #   funding:      {latest_round: str|None, amount: str|None, date: str|None,
+    #                  investors: [str], summary: str|None}
+    #   hiring_signals: [str]   — roles/teams actively being hired (buying intent)
+    #   tech_stack:   [str]
+    #   recent_launches: [str]  — products/features/markets launched, last 12 months
+    #   company_posts: [{text, posted_at, url, reactions, comments}]
+    #   status:       "ok" | "partial" | "failed"  — partial = some sections
+    #                 empty due to error (see errors)
+    #   errors:       [str]     — which section(s) failed and why
+    #   fetched_at:   datetime  — bulk research reuses entries <30d old with status "ok"
+    research: Optional[dict] = None
 
 
 class CompanyDocument(CompanyBase):
@@ -101,9 +121,6 @@ class CompanyDocument(CompanyBase):
     created_at: datetime = Field(default_factory=datetime.utcnow)
     last_updated_at: datetime = Field(default_factory=datetime.utcnow)
     last_scraped_at: Optional[datetime] = None
-
-    # Denormalized prospect count (maintained by employee scraper)
-    prospect_count: int = 0
 
     class Config:
         populate_by_name = True

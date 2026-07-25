@@ -1,18 +1,26 @@
 [Unit]
 Description=OutFlo Frontend (Next.js)
-After=network.target
+Wants=network-online.target
+After=network-online.target
 
 [Service]
 Type=simple
 User=outflo
 Group=outflo
-WorkingDirectory=/opt/outflo/frontend
+WorkingDirectory=/opt/outflo/current/frontend
 Environment=NODE_ENV=production
 Environment=PORT=3000
-Environment=HOSTNAME=0.0.0.0
+Environment=HOSTNAME=127.0.0.1
 ExecStart=/usr/bin/node server.js
-Restart=always
+Restart=on-failure
 RestartSec=5
+TimeoutStopSec=30
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectHome=true
+ProtectSystem=full
+RestrictSUIDSGID=true
+LockPersonality=true
 StandardOutput=journal
 StandardError=journal
 

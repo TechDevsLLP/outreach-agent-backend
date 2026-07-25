@@ -38,6 +38,7 @@ class VoiceOverrideRequest(BaseModel):
     tone_markers: Optional[list[str]] = None
     formality_level: Optional[str] = None
     synthesized_summary: Optional[str] = None
+    sender_linkedin_url: Optional[str] = None
 
 
 @router.patch("")
@@ -55,6 +56,8 @@ async def update_sender_voice(
         update["sender_voice_profile.formality_level"] = body.formality_level
     if body.synthesized_summary is not None:
         update["sender_voice_profile.synthesized_summary"] = body.synthesized_summary
+    if body.sender_linkedin_url is not None:
+        update["sender_linkedin_url"] = body.sender_linkedin_url
     if len(update) == 1:
         return {"ok": True, "message": "Nothing to update"}
     await database.company_profiles_collection.update_one(

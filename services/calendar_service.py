@@ -4,12 +4,16 @@ Uses the same httpx + OAuth token pattern as gmail_service.py.
 """
 
 import asyncio
+import hashlib
 import logging
+import secrets
 from datetime import datetime, timedelta, timezone
 from typing import Optional
+from urllib.parse import quote, urlsplit
 from uuid import uuid4
 
 import httpx
+from bson import ObjectId
 
 import database
 from services.gmail_service import refresh_token_if_needed
@@ -19,28 +23,74 @@ logger = logging.getLogger(__name__)
 CALENDAR_API_BASE = "https://www.googleapis.com/calendar/v3"
 
 
+class CalendarEventFetchError(RuntimeError):
+    """A bounded reconciliation fetch failed without authoritative event state."""
+
+    def __init__(self, message: str, *, status_code: int | None = None):
+        super().__init__(message)
+        self.status_code = status_code
+
+
 # ---------------------------------------------------------------------------
 # Internal: token retrieval
 # ---------------------------------------------------------------------------
 
-async def _get_calendar_access_token(account_id: str) -> Optional[str]:
+async def _get_calendar_access_token(
+    account_id: str, provider_account_id: str | None = None
+) -> Optional[str]:
     """
     Look up the Gmail email account for account_id that has calendar scope,
     refresh the token if needed, and return a valid access token.
     Returns None if no matching account exists or refresh fails.
     """
-    email_account = await database.email_accounts_collection.find_one({
+    credential = await _get_calendar_credential(account_id, provider_account_id)
+    return credential[1] if credential else None
+
+
+async def _get_calendar_credential(
+    account_id: str, provider_account_id: str | None = None
+) -> Optional[tuple[dict, str]]:
+    """Return one exact tenant-owned Google account and its usable token.
+
+    A caller-supplied provider account is matched by both ``_id`` and tenant.
+    Without one, selection succeeds only when the tenant has exactly one
+    calendar-capable Google account. This prevents mailbox drift when a second
+    Google account is connected after a meeting is booked.
+    """
+    if not account_id or not str(account_id).strip():
+        raise ValueError("account_id is required for calendar access")
+
+    query: dict = {
         "account_id": account_id,
-        "provider": "gmail",
+        "provider": "google",
         "oauth_scopes": {"$elemMatch": {"$regex": "calendar"}},
-    })
+        "status": {"$in": ["connected", "active"]},
+    }
+    if provider_account_id:
+        try:
+            query["_id"] = ObjectId(str(provider_account_id))
+        except Exception:
+            logger.warning("Invalid Google provider account binding")
+            return None
+        email_account = await database.email_accounts_collection.find_one(query)
+    else:
+        candidates = await database.email_accounts_collection.find(query).limit(2).to_list(2)
+        if len(candidates) != 1:
+            if candidates:
+                logger.warning(
+                    "Calendar account selection is ambiguous for account_id=%s",
+                    account_id,
+                )
+            return None
+        email_account = candidates[0]
     if not email_account:
         logger.warning(
             f"No Gmail account with calendar scope found for account_id={account_id}"
         )
         return None
 
-    return await refresh_token_if_needed(email_account)
+    token = await refresh_token_if_needed(email_account)
+    return (email_account, token) if token else None
 
 
 # ---------------------------------------------------------------------------
@@ -240,7 +290,13 @@ async def propose_three_slots(account_id: str, duration_minutes: int = 25) -> li
         return await _deterministic_slots(3)
 
 
-async def create_event(account_id: str, event_data: dict) -> Optional[dict]:
+async def create_event(
+    account_id: str,
+    event_data: dict,
+    *,
+    provider_account_id: str | None = None,
+    calendar_id: str = "primary",
+) -> Optional[dict]:
     """
     Create a Google Calendar event on the account's primary calendar.
 
@@ -248,17 +304,20 @@ async def create_event(account_id: str, event_data: dict) -> Optional[dict]:
     Pass conferenceData in event_data to request a Google Meet link; this function
     automatically appends conferenceDataVersion=1 to the query.
     """
-    access_token = await _get_calendar_access_token(account_id)
-    if not access_token:
+    credential = await _get_calendar_credential(account_id, provider_account_id)
+    if not credential:
         logger.warning(
             f"Cannot create calendar event — no valid token for account_id={account_id}"
         )
         return None
+    email_account, access_token = credential
+    bound_provider_account_id = str(email_account["_id"])
+    encoded_calendar_id = quote(str(calendar_id), safe="")
 
     try:
         async with httpx.AsyncClient(timeout=30) as client:
             resp = await client.post(
-                f"{CALENDAR_API_BASE}/calendars/primary/events",
+                f"{CALENDAR_API_BASE}/calendars/{encoded_calendar_id}/events",
                 headers={
                     "Authorization": f"Bearer {access_token}",
                     "Content-Type": "application/json",
@@ -267,6 +326,23 @@ async def create_event(account_id: str, event_data: dict) -> Optional[dict]:
                 json=event_data,
             )
 
+        # Event IDs generated by meeting_service are deterministic. If a prior
+        # request crossed the provider boundary but its response was lost,
+        # Google returns 409; fetch that exact event instead of creating a
+        # duplicate with a new provider request.
+        if resp.status_code == 409 and event_data.get("id"):
+            async with httpx.AsyncClient(timeout=15) as client:
+                existing = await client.get(
+                    f"{CALENDAR_API_BASE}/calendars/{encoded_calendar_id}/events/"
+                    f"{quote(str(event_data['id']), safe='')}",
+                    headers={"Authorization": f"Bearer {access_token}"},
+                )
+            if existing.status_code == 200:
+                result = existing.json()
+                result["_outflo_provider_account_id"] = bound_provider_account_id
+                result["_outflo_calendar_id"] = str(calendar_id)
+                return result
+
         if resp.status_code not in (200, 201):
             logger.warning(
                 f"Calendar create_event failed for account_id={account_id}: "
@@ -274,13 +350,75 @@ async def create_event(account_id: str, event_data: dict) -> Optional[dict]:
             )
             return None
 
-        return resp.json()
+        result = resp.json()
+        result["_outflo_provider_account_id"] = bound_provider_account_id
+        result["_outflo_calendar_id"] = str(calendar_id)
+        return result
 
     except Exception as exc:
         logger.warning(
             f"Calendar create_event error for account_id={account_id}: {exc}"
         )
         return None
+
+
+async def get_event(
+    account_id: str,
+    *,
+    provider_account_id: str,
+    calendar_id: str,
+    event_id: str,
+) -> dict:
+    """Fetch an event through its immutable tenant/mailbox/calendar binding.
+
+    A 404/410 is authoritative deletion evidence and is normalized as a
+    cancelled event. Authentication, rate-limit, server and transport failures
+    raise ``CalendarEventFetchError`` so reconciliation preserves local state
+    and retries later.
+    """
+    if not all(str(value or "").strip() for value in (
+        account_id, provider_account_id, calendar_id, event_id
+    )):
+        raise ValueError("Exact calendar event binding is required")
+    credential = await _get_calendar_credential(account_id, provider_account_id)
+    if not credential:
+        raise CalendarEventFetchError("Bound Google calendar account is unavailable")
+    email_account, access_token = credential
+    if str(email_account.get("_id")) != str(provider_account_id):
+        raise CalendarEventFetchError("Google calendar account binding changed")
+
+    url = (
+        f"{CALENDAR_API_BASE}/calendars/{quote(str(calendar_id), safe='')}/events/"
+        f"{quote(str(event_id), safe='')}"
+    )
+    try:
+        async with httpx.AsyncClient(timeout=15) as client:
+            response = await client.get(
+                url,
+                headers={"Authorization": f"Bearer {access_token}"},
+                params={"alwaysIncludeEmail": "true"},
+            )
+    except Exception as exc:
+        raise CalendarEventFetchError("Google Calendar event fetch failed") from exc
+
+    if response.status_code in {404, 410}:
+        return {
+            "id": str(event_id),
+            "status": "cancelled",
+            "_outflo_not_found": True,
+        }
+    if response.status_code != 200:
+        raise CalendarEventFetchError(
+            f"Google Calendar event fetch returned HTTP {response.status_code}",
+            status_code=response.status_code,
+        )
+    try:
+        event = response.json()
+    except Exception as exc:
+        raise CalendarEventFetchError("Google Calendar returned invalid JSON") from exc
+    if str(event.get("id") or "") != str(event_id):
+        raise CalendarEventFetchError("Google Calendar returned the wrong event")
+    return event
 
 
 def _build_calendar_event(
@@ -331,22 +469,83 @@ async def register_calendar_watch(account_id: str, webhook_url: str) -> Optional
     """
     Register a Google Calendar push notification channel for the account's primary calendar.
 
-    The channel token is set to account_id so we can identify the account in webhook callbacks.
-    Returns the channel resource dict on success, or None on failure.
+    Idempotent: if an active channel for this (account, mailbox) still has more
+    than 24h left before expiration, it is returned as-is with no new Google API
+    call. Otherwise a new channel is created and any other active channels for
+    the same (account, mailbox) are stopped via Google's `channels/stop` API and
+    marked ``stopped`` — without this, a caller re-registering on every poll
+    (e.g. the 15-min fallback poller) mints a fresh, never-cleaned-up channel
+    every time.
+
+    A random high-entropy channel token is stored only as a SHA-256 digest. The
+    callback later resolves account/provider ownership from our channel record;
+    no tenant identity supplied by the caller is trusted.
     """
-    access_token = await _get_calendar_access_token(account_id)
-    if not access_token:
+    from config import get_settings
+
+    settings = get_settings()
+    expected_url = f"{settings.api_base_url.rstrip('/')}/api/calendar/webhooks/google"
+    parsed = urlsplit(webhook_url)
+    expected = urlsplit(expected_url)
+    if (
+        parsed.scheme != expected.scheme
+        or parsed.netloc != expected.netloc
+        or parsed.path != expected.path
+        or parsed.query
+        or parsed.fragment
+        or (parsed.scheme != "https" and settings.app_env.strip().lower() not in {"development", "test"})
+    ):
+        raise ValueError("webhook_url must be the configured OutFlo calendar callback")
+
+    credential = await _get_calendar_credential(account_id)
+    if not credential:
         logger.warning(
             f"Cannot register calendar watch — no valid token for account_id={account_id}"
         )
         return None
+    email_account, access_token = credential
+    provider_account_id = str(email_account["_id"])
+
+    now = datetime.now(timezone.utc)
+    existing = await database.calendar_webhook_channels_collection.find_one({
+        "account_id": str(account_id),
+        "provider_account_id": provider_account_id,
+        "status": "active",
+        "expires_at": {"$gt": now + timedelta(hours=24)},
+    })
+    if existing:
+        return {
+            "id": existing["channel_id"],
+            "resource_id": existing.get("resource_id"),
+            "expiration": existing["expires_at"].isoformat(),
+            "status": "active",
+        }
+
+    channel_id = str(uuid4())
+    channel_token = secrets.token_urlsafe(32)
+    token_digest = hashlib.sha256(channel_token.encode("utf-8")).hexdigest()
 
     channel_body = {
-        "id": str(uuid4()),
+        "id": channel_id,
         "type": "web_hook",
         "address": webhook_url,
-        "token": account_id,
+        "token": channel_token,
     }
+
+    channel_doc = {
+        "channel_id": channel_id,
+        "channel_token_hash": token_digest,
+        "account_id": str(account_id),
+        "provider": "google",
+        "provider_account_id": provider_account_id,
+        "resource_id": None,
+        "status": "pending",
+        "last_message_number": 0,
+        "created_at": now,
+        # Pending rows cannot accumulate forever if the provider request dies.
+        "expires_at": now + timedelta(hours=1),
+    }
+    await database.calendar_webhook_channels_collection.insert_one(channel_doc)
 
     try:
         async with httpx.AsyncClient(timeout=15) as client:
@@ -364,18 +563,151 @@ async def register_calendar_watch(account_id: str, webhook_url: str) -> Optional
                 f"Calendar watch registration failed for account_id={account_id}: "
                 f"HTTP {resp.status_code}: {resp.text}"
             )
+            await database.calendar_webhook_channels_collection.delete_one(
+                {"channel_id": channel_id, "status": "pending"}
+            )
+            return None
+
+        provider_channel = resp.json()
+        resource_id = provider_channel.get("resourceId")
+        response_channel_id = provider_channel.get("id")
+        if response_channel_id != channel_id or not resource_id:
+            logger.error("Calendar watch response did not match the registered channel")
+            await database.calendar_webhook_channels_collection.delete_one(
+                {"channel_id": channel_id, "status": "pending"}
+            )
+            return None
+
+        try:
+            expiration = datetime.fromtimestamp(
+                int(provider_channel.get("expiration")) / 1000,
+                tz=timezone.utc,
+            )
+        except (TypeError, ValueError, OSError):
+            expiration = now + timedelta(days=7)
+
+        updated = await database.calendar_webhook_channels_collection.update_one(
+            {
+                "channel_id": channel_id,
+                "account_id": str(account_id),
+                "provider_account_id": provider_account_id,
+                "status": "pending",
+            },
+            {
+                "$set": {
+                    "resource_id": str(resource_id),
+                    "resource_uri": provider_channel.get("resourceUri"),
+                    "status": "active",
+                    "expires_at": expiration,
+                    "updated_at": datetime.now(timezone.utc),
+                }
+            },
+        )
+        if updated.matched_count != 1:
+            logger.error("Calendar watch ownership changed during registration")
             return None
 
         logger.info(
             f"Registered Google Calendar push channel for account_id={account_id}"
         )
-        return resp.json()
+
+        await _stop_superseded_channels(
+            account_id=str(account_id),
+            provider_account_id=provider_account_id,
+            keep_channel_id=channel_id,
+            access_token=access_token,
+        )
+        await _cleanup_stale_channels()
+
+        # Never expose the provider callback token or its digest.
+        return {
+            "id": channel_id,
+            "resource_id": str(resource_id),
+            "expiration": expiration.isoformat(),
+            "status": "active",
+        }
 
     except Exception as exc:
+        await database.calendar_webhook_channels_collection.delete_one(
+            {"channel_id": channel_id, "status": "pending"}
+        )
         logger.warning(
             f"Calendar watch registration error for account_id={account_id}: {exc}"
         )
         return None
+
+
+async def _stop_superseded_channels(
+    *,
+    account_id: str,
+    provider_account_id: str,
+    keep_channel_id: str,
+    access_token: str,
+) -> None:
+    """Stop and mark ``stopped`` any other active channel for this (account, mailbox).
+
+    Best-effort: a failed `channels/stop` call just leaves that channel to
+    expire on its own 7-day TTL instead of blocking the new registration.
+    """
+    cursor = database.calendar_webhook_channels_collection.find({
+        "account_id": account_id,
+        "provider_account_id": provider_account_id,
+        "status": "active",
+        "channel_id": {"$ne": keep_channel_id},
+    })
+    async for doc in cursor:
+        stopped = await _stop_google_channel(access_token, doc["channel_id"], doc.get("resource_id"))
+        await database.calendar_webhook_channels_collection.update_one(
+            {"_id": doc["_id"], "status": "active"},
+            {"$set": {
+                "status": "stopped" if stopped else "stop_failed",
+                "stopped_at": datetime.now(timezone.utc),
+            }},
+        )
+
+
+async def _stop_google_channel(access_token: str, channel_id: str, resource_id: Optional[str]) -> bool:
+    """Best-effort call to Google's `channels/stop`. Returns whether it succeeded."""
+    if not resource_id:
+        return False
+    try:
+        async with httpx.AsyncClient(timeout=15) as client:
+            resp = await client.post(
+                f"{CALENDAR_API_BASE}/channels/stop",
+                headers={
+                    "Authorization": f"Bearer {access_token}",
+                    "Content-Type": "application/json",
+                },
+                json={"id": channel_id, "resourceId": resource_id},
+            )
+        if resp.status_code in (200, 204):
+            return True
+        # A 404 means Google already dropped the channel — treat as stopped.
+        if resp.status_code == 404:
+            return True
+        logger.debug(
+            f"channels/stop returned HTTP {resp.status_code} for channel {channel_id}: {resp.text}"
+        )
+        return False
+    except Exception as exc:
+        logger.debug(f"channels/stop failed for channel {channel_id}: {exc}")
+        return False
+
+
+async def _cleanup_stale_channels() -> None:
+    """Opportunistically purge channel docs that expired more than 7 days ago.
+
+    The `calendar_channel_expiry_ttl_idx` TTL index already reaps documents at
+    `expires_at`; this is a belt-and-braces sweep for stragglers, not the
+    primary cleanup path.
+    """
+    cutoff = datetime.now(timezone.utc) - timedelta(days=7)
+    try:
+        await database.calendar_webhook_channels_collection.delete_many(
+            {"expires_at": {"$lt": cutoff}}
+        )
+    except Exception as exc:
+        logger.debug(f"Stale calendar channel cleanup failed: {exc}")
 
 
 # ---------------------------------------------------------------------------

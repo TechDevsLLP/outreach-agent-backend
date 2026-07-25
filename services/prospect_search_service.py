@@ -542,13 +542,34 @@ async def ensure_prospect_state(
     """
     Ensure a prospect_state overlay exists for this (account, prospect) pair.
     Creates it with status="new" if absent. Returns the overlay doc.
+
+    Accepts db=None (some callers, e.g. enrichment_pipeline, pass None) — falls
+    back to the default database handle. Previously None crashed with a
+    TypeError that callers' broad try/excepts swallowed, silently skipping the
+    overlay write.
     """
+    if db is None:
+        import database as _database
+        db = _database.db
     prospect_state_col = db["prospect_state"]
     now = datetime.utcnow()
+
+    # Denormalized filter keys for routes/prospects.py list filters — refresh
+    # on every ensure so pk tracks the prospect doc.
+    from utils.prospect_filter_keys import PK_PROJECTION, build_filter_keys
+    from bson import ObjectId as _OID
+    pk_set: dict = {}
+    try:
+        p_doc = await db["prospects"].find_one({"_id": _OID(str(prospect_id))}, PK_PROJECTION)
+        if p_doc:
+            pk_set = {"$set": {"pk": build_filter_keys(p_doc)}}
+    except Exception:
+        pass
 
     result = await prospect_state_col.find_one_and_update(
         {"account_id": str(account_id), "prospect_id": str(prospect_id)},
         {
+            **pk_set,
             "$setOnInsert": {
                 "account_id": str(account_id),
                 "prospect_id": str(prospect_id),
@@ -557,50 +578,12 @@ async def ensure_prospect_state(
                 "tags": [],
                 "created_at": now,
                 "last_updated_at": now,
-            }
+            },
         },
         upsert=True,
         return_document=True,
     )
     return result or {}
-
-
-async def push_used_by(
-    db,
-    *,
-    account_id: str,
-    prospect_id: str,
-    user_id: str,
-    campaign_id: str,
-    status: str = "active",
-) -> None:
-    """
-    Append a used_by entry to the prospect_state overlay.
-    Called alongside campaign_enrollments creation.
-    """
-    prospect_state_col = db["prospect_state"]
-    now = datetime.utcnow()
-
-    entry = {
-        "user_id": str(user_id),
-        "campaign_id": str(campaign_id),
-        "status": status,
-        "enrolled_at": now,
-    }
-
-    await prospect_state_col.update_one(
-        {"account_id": str(account_id), "prospect_id": str(prospect_id)},
-        {
-            "$push": {"used_by": entry},
-            "$set": {"last_updated_at": now},
-            "$setOnInsert": {
-                "status": "new",
-                "tags": [],
-                "created_at": now,
-            },
-        },
-        upsert=True,
-    )
 
 
 async def update_used_by_status(
@@ -678,3 +661,71 @@ async def search_companies_structured(
     ]).limit(limit).to_list(length=limit)
 
     return companies
+
+
+async def search_companies_vector(
+    db,
+    *,
+    profile_query_vec,
+    industry_ids: Optional[list[str]] = None,
+    country_codes: Optional[list[str]] = None,
+    employee_bands: Optional[list[str]] = None,
+    exclude_linkedin_urls: Optional[set[str]] = None,
+    limit: int = 200,
+    min_score: float = 0.55,
+) -> list[dict]:
+    """
+    Semantic company match via the `companies_vec` Atlas Vector Search index
+    (companies.profile_vec, 768-dim cosine; filter fields: industry.id,
+    industry.group, location.country_code, employee_band).
+
+    Fallback for when ICP canonicalization produced no industry_ids/country_codes
+    and search_companies_structured therefore has nothing to filter on — embed the
+    free-text ICP and match against the shared company pool instead of skipping
+    DB-first discovery entirely.
+
+    profile_query_vec: query embedding from embedding_service.embed_one(...,
+    task_type="RETRIEVAL_QUERY") — BSON Binary int8 (subtype 9) or list[float];
+    Atlas accepts both as queryVector.
+
+    Returns company docs annotated with `_vector_score`, filtered to
+    `_vector_score >= min_score`, sorted by score desc.
+    """
+    companies_col = db["companies"]
+
+    pre_filter: dict = {}
+    if industry_ids:
+        pre_filter["industry.id"] = {"$in": industry_ids}
+    if country_codes:
+        pre_filter["location.country_code"] = {"$in": country_codes}
+    if employee_bands:
+        pre_filter["employee_band"] = {"$in": employee_bands}
+
+    vector_stage: dict = {
+        "$vectorSearch": {
+            "index": "companies_vec",
+            "path": "profile_vec",
+            "queryVector": profile_query_vec,
+            "numCandidates": max(limit * 6, 600),
+            "limit": limit * 2,
+        }
+    }
+    if pre_filter:
+        vector_stage["$vectorSearch"]["filter"] = pre_filter
+
+    pipeline: list[dict] = [
+        vector_stage,
+        {"$addFields": {"_vector_score": {"$meta": "vectorSearchScore"}}},
+    ]
+    if exclude_linkedin_urls:
+        _excl = [u.rstrip("/").lower() for u in exclude_linkedin_urls if u]
+        if _excl:
+            pipeline.append({"$match": {"linkedin_url": {"$nin": _excl}}})
+
+    results: list[dict] = []
+    async for doc in companies_col.aggregate(pipeline):
+        if (doc.get("_vector_score") or 0) >= min_score:
+            results.append(doc)
+
+    results.sort(key=lambda d: d.get("_vector_score") or 0, reverse=True)
+    return results[:limit]

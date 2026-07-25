@@ -12,6 +12,7 @@ logger = logging.getLogger(__name__)
 from bson import ObjectId
 from fastapi import APIRouter, BackgroundTasks, Depends, HTTPException, Query
 from pydantic import BaseModel, Field
+from pymongo import ReturnDocument
 
 from auth import get_account_context
 from config import get_settings
@@ -26,7 +27,6 @@ from database import (
     prospects_collection,
 )
 from models.campaign import CampaignCreateRequest, CampaignUpdateRequest, SmartCampaignCreateRequest
-from services.campaign_day_enrichment_service import run_enrich_and_generate_for_day
 from utils.serialization import serialize_doc
 
 settings = get_settings()
@@ -88,17 +88,19 @@ def serialize_campaign(doc: dict) -> dict:
 
 
 async def _get_campaign_or_404(campaign_id: str, account_id: ObjectId) -> dict:
-    """Fetch a campaign by ID scoped to account_id, raise 404/403 appropriately."""
+    """Fetch a campaign by ID scoped to account_id, raise 404 if missing.
+
+    Cross-tenant access also returns 404 (not 403) so another tenant's
+    campaign IDs cannot be probed for existence — same semantics as the
+    prospects routes."""
     try:
         oid = ObjectId(campaign_id)
     except Exception:
         raise HTTPException(status_code=404, detail="Campaign not found")
 
     doc = await campaigns_collection.find_one({"_id": oid})
-    if doc is None:
+    if doc is None or doc.get("account_id") != account_id:
         raise HTTPException(status_code=404, detail="Campaign not found")
-    if doc.get("account_id") != account_id:
-        raise HTTPException(status_code=403, detail="Access denied")
     return doc
 
 
@@ -119,12 +121,41 @@ async def _canonicalize_campaign_icp(campaign_id: str) -> None:
         logger.warning(f"[campaigns] ICP canonicalization failed for {campaign_id}: {e}")
 
 
+async def _enqueue_discovery_or_fail(
+    campaign_id: str,
+    account_id: ObjectId,
+    generation: int,
+):
+    """Persist durable discovery work or make the campaign failure explicit."""
+    from services.enrichment_job_service import enqueue_campaign_discovery
+
+    try:
+        return await enqueue_campaign_discovery(
+            account_id=str(account_id),
+            campaign_id=campaign_id,
+            generation=int(generation),
+        )
+    except Exception as exc:
+        await campaigns_collection.update_one(
+            {"_id": ObjectId(campaign_id), "account_id": account_id},
+            {"$set": {
+                "discovery_status": "failed",
+                "discovery_error": "Could not queue discovery work",
+                "updated_at": datetime.utcnow(),
+            }},
+        )
+        logger.error("Could not queue discovery for campaign %s: %s", campaign_id, exc)
+        raise HTTPException(
+            status_code=503, detail="Could not queue campaign discovery"
+        ) from exc
+
+
 async def _recompute_day_totals(campaign_oid):
     """Recompute discovery_day_totals from current enrollment assignments."""
     pipeline = [
         {"$match": {
             "campaign_id": campaign_oid,
-            "status": {"$nin": ["archived", "skipped_no_channel"]},
+            "status": {"$nin": ["archived", "skipped_no_channel", "cascade_waiting"]},
             "smart_campaign_send_day": {"$ne": None},
         }},
         {"$group": {
@@ -152,11 +183,14 @@ async def _recompute_day_totals(campaign_oid):
 async def list_campaigns(
     status: Optional[str] = None,
     type: Optional[str] = None,
+    search: Optional[str] = None,
+    sort_by: str = "created_at",
+    sort_order: str = "desc",
     page: int = Query(1, ge=1),
     page_size: int = Query(20, ge=1, le=200),
     account_ctx: dict = Depends(get_account_context),
 ):
-    """List campaigns for the current account with optional filters."""
+    """List campaigns for the current account with search, sort, and pagination."""
     account_id = ObjectId(account_ctx["account"]["_id"])
 
     query: dict = {"account_id": account_id}
@@ -164,12 +198,21 @@ async def list_campaigns(
         query["status"] = status
     if type:
         query["type"] = type
+    if search:
+        query["$or"] = [
+            {"name": {"$regex": search, "$options": "i"}},
+            {"description": {"$regex": search, "$options": "i"}},
+        ]
+
+    sort_direction = -1 if sort_order == "desc" else 1
+    allowed_sorts = {"name", "created_at", "status"}
+    sort_field = sort_by if sort_by in allowed_sorts else "created_at"
 
     skip = (page - 1) * page_size
     total = await campaigns_collection.count_documents(query)
     cursor = (
         campaigns_collection.find(query)
-        .sort("created_at", -1)
+        .sort(sort_field, sort_direction)
         .skip(skip)
         .limit(page_size)
     )
@@ -178,6 +221,7 @@ async def list_campaigns(
     return {
         "campaigns": [serialize_campaign(d) for d in docs],
         "total": total,
+        "total_pages": (total + page_size - 1) // page_size,
         "page": page,
         "page_size": page_size,
     }
@@ -294,84 +338,15 @@ async def get_account_stats(
 
 
 # ---------------------------------------------------------------------------
-# Smart Campaign: generate / validate ICP params (must be before /{campaign_id})
+# Smart Campaign: validate ICP params (must be before /{campaign_id})
 # ---------------------------------------------------------------------------
-
-class GenerateParamsRequest(BaseModel):
-    naturalLanguageDescription: str
+# NOTE: POST /generate-params (natural language → ApifyParams) was removed with
+# the Apollo prospect actors. ICP capture now goes through /validate-target and
+# /prefill-from-prompt.
 
 
 class ValidateTargetRequest(BaseModel):
     conversation: list[dict]  # [{"role": "user"|"assistant", "content": str}]
-
-
-@router.post("/generate-params")
-async def generate_apify_params(
-    body: GenerateParamsRequest,
-    account_ctx: dict = Depends(get_account_context),
-):
-    """
-    Use AI to convert a natural language target-market description into
-    structured ApifyParams (camelCase, matching the frontend schema).
-    """
-    from services.openrouter_service import OpenRouterClient, get_free_model
-
-    description = body.naturalLanguageDescription.strip()
-    if not description:
-        raise HTTPException(status_code=422, detail="Description cannot be empty")
-
-    system_prompt = (
-        "You are an expert B2B sales targeting specialist. "
-        "Convert the user's natural language description of their ideal customer profile (ICP) "
-        "into a structured JSON object that will be used to query LinkedIn prospect databases.\n\n"
-        "Return ONLY valid JSON with this exact schema:\n"
-        "{\n"
-        '  "contactJobTitle": ["array of job title keywords to include"],\n'
-        '  "contactNotJobTitle": ["array of job title keywords to exclude (e.g. intern, student)"],\n'
-        '  "seniorityLevel": ["array from: Director, Manager, Owner, Partner, C-Suite, VP, Head, Senior"],\n'
-        '  "companyIndustry": ["array of industry names"],\n'
-        '  "companyKeywords": ["array of company keyword descriptors"],\n'
-        '  "regions": [\n'
-        '    {"name": "region name", "locations": ["country or city names"], "fetchCount": 100, "startPage": 0}\n'
-        "  ]\n"
-        "}\n\n"
-        "Rules:\n"
-        "- Only include fields that are clearly implied by the description\n"
-        "- contactJobTitle: specific job titles matching the ICP\n"
-        "- seniorityLevel: pick from the allowed values only\n"
-        "- regions: if no geography is mentioned, use [{\"name\": \"United States\", \"locations\": [\"united states\"], \"fetchCount\": 150, \"startPage\": 0}]\n"
-        "- companyKeywords: broad keywords describing the target company type\n"
-        "- Keep arrays focused — 3-8 values max per field\n"
-        "- Return ONLY the JSON object, no explanation or markdown"
-    )
-
-    client = OpenRouterClient()
-    try:
-        result = await client.chat_completion(
-            messages=[
-                {"role": "system", "content": system_prompt},
-                {"role": "user", "content": f"Target market description:\n{description}"},
-            ],
-            model=get_free_model(0),
-            temperature=0.3,
-            max_tokens=1000,
-            response_format={"type": "json_object"},
-        )
-    finally:
-        await client.close()
-
-    # Validate the response has at least one useful field
-    required_fields = {"contactJobTitle", "seniorityLevel", "companyIndustry", "regions"}
-    if not any(k in result for k in required_fields):
-        raise HTTPException(status_code=500, detail="AI returned an unexpected response format")
-
-    # Ensure regions always exists with at least a default
-    if not result.get("regions"):
-        result["regions"] = [
-            {"name": "United States", "locations": ["united states"], "fetchCount": 150, "startPage": 0}
-        ]
-
-    return result
 
 
 @router.post("/validate-target")
@@ -752,6 +727,15 @@ async def activate_campaign(
     """Activate a campaign (requires at least one step)."""
     account_id = ObjectId(account_ctx["account"]["_id"])
     doc = await _get_campaign_or_404(campaign_id, account_id)
+
+    from services.campaign_launch_service import (
+        SequenceLaunchValidationError,
+        ensure_sequence_ready_for_launch,
+    )
+    try:
+        ensure_sequence_ready_for_launch(doc)
+    except SequenceLaunchValidationError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
 
     if not doc.get("steps"):
         raise HTTPException(
@@ -1196,6 +1180,26 @@ async def create_smart_campaign(
         if not la:
             raise HTTPException(status_code=400, detail="The selected LinkedIn account is not connected.")
 
+    # ── Upload-a-Lead-List (BYOL): validate the attached batch ───────────────
+    is_upload = (body.discovery_mode or "").lower() == "upload"
+    if is_upload:
+        if not body.upload_batch_id or not ObjectId.is_valid(body.upload_batch_id):
+            raise HTTPException(
+                status_code=400,
+                detail="A confirmed lead upload is required for upload campaigns.",
+            )
+        upload_batch = await database.lead_upload_batches_collection.find_one(
+            {"_id": ObjectId(body.upload_batch_id), "account_id": str(account_id)},
+            {"status": 1, "mapping": 1},
+        )
+        if not upload_batch:
+            raise HTTPException(status_code=404, detail="Lead upload batch not found for this account.")
+        if upload_batch.get("status") != "ready" or not upload_batch.get("mapping"):
+            raise HTTPException(
+                status_code=400,
+                detail="The lead upload column mapping has not been confirmed yet.",
+            )
+
     doc = {
         "account_id": account_id,
         "created_by": user_id,
@@ -1235,7 +1239,9 @@ async def create_smart_campaign(
         "linkedin_replies": 0,
         # Smart Campaign fields
         "is_smart_campaign": True,
-        "prospect_count_target": body.prospect_count_target,
+        # Company-first: prospect target is DERIVED from the company count (~3/company),
+        # not a user input. Stored as a derived echo so the doc stays self-consistent.
+        "prospect_count_target": body.prospect_count_target or (body.curated_company_count_target * 3),
         "icp_industries": body.icp_industries,
         "icp_job_titles": body.icp_job_titles,
         "icp_seniority_levels": body.icp_seniority_levels,
@@ -1265,7 +1271,21 @@ async def create_smart_campaign(
         "curated_companies_sourced": 0,
         "curated_companies_approved": 0,
         "curated_companies_scraped": 0,
-        "discovery_status": "idle",
+        # BYOL / Upload-a-Lead-List fields
+        "discovery_source": "upload" if is_upload else "discovery",
+        "upload_batch_id": body.upload_batch_id if is_upload else None,
+        # BYOL enrolls all uploaded leads — never drop for a low fit score
+        # (score is display/sort only). Curated mode leaves this None (default 25).
+        "discovery_min_enroll_score": 0 if is_upload else None,
+        "upload_rows_total": 0,
+        "upload_rows_person": 0,
+        "upload_rows_company": 0,
+        "upload_rows_email_only": 0,
+        "upload_rows_unresolvable": 0,
+        "upload_unresolvable_rows": [],
+        "upload_skipped_rows": [],
+        "discovery_status": "queued",
+        "discovery_generation": 1,
         "discovery_started_at": None,
         "discovery_completed_at": None,
         "discovery_error": None,
@@ -1306,7 +1326,10 @@ async def create_smart_campaign(
         body.icp_countries,
         getattr(body, "icp_job_titles", None),
     ])
-    if not (body.curated_icp_prompt or has_any_icp):
+    # Upload campaigns bring their own leads, so no ICP is required. The ICP
+    # fields, when present, still drive per-row person-fit gating of scraped
+    # company employees.
+    if not is_upload and not (body.curated_icp_prompt or has_any_icp):
         raise HTTPException(
             status_code=422,
             detail="At least one ICP field (industries, keywords, seniority, countries, or a company description) must be provided.",
@@ -1339,12 +1362,25 @@ async def create_smart_campaign(
         raise HTTPException(status_code=422, detail={"follow_up_flow_errors": flow_errors})
     doc["follow_up_flow"] = follow_up_flow
 
+    # ── Branching sequence graph (new sequence campaigns only) ───────────────
+    # The frontend React Flow editor sends sequence_graph for multi-touch
+    # campaigns. Validate against the contract and persist; when absent the
+    # campaign uses the legacy single-touch / follow_up_flow path unchanged.
+    if body.sequence_graph is not None:
+        from services.sequence_service import validate_sequence_graph
+        seq_errors = validate_sequence_graph(body.sequence_graph)
+        if seq_errors:
+            raise HTTPException(status_code=400, detail={"sequence_graph_errors": seq_errors})
+        doc["sequence_graph"] = body.sequence_graph
+        doc["sequence_contract"] = "sequence_graph_v1"
+
     # ── Discovery tuning knobs + mock flag (None → absent → module default) ───
     _knob_fields = (
         "discovery_scrape_depth",
         "discovery_dropout_buffer",
         "discovery_enrollment_cap",
         "discovery_sourcing_concurrency",
+        "discovery_scrape_concurrency",
         "discovery_enable_company_research",
         "discovery_skip_message_gen",
     )
@@ -1359,9 +1395,6 @@ async def create_smart_campaign(
 
     result = await campaigns_collection.insert_one(doc)
     campaign_id = str(result.inserted_id)
-
-    # Canonicalize ICP into structured filters for DB-first discovery
-    asyncio.create_task(_canonicalize_campaign_icp(campaign_id))
 
     # Log user inputs as the very first entry in the campaign log
     try:
@@ -1398,12 +1431,73 @@ async def create_smart_campaign(
     except Exception as _log_err:
         logger.warning(f"[Campaign {campaign_id}] Failed to write user input log: {_log_err}")
 
-    # Immediately trigger discovery in background
-    from services.curated_discovery_service import run_fast_discovery
-    background_tasks.add_task(run_fast_discovery, campaign_id, str(account_id))
+    await _enqueue_discovery_or_fail(campaign_id, account_id, generation=1)
 
     created = await campaigns_collection.find_one({"_id": result.inserted_id})
     return {"campaign": serialize_campaign(created)}
+
+
+class SequencePutRequest(BaseModel):
+    """Body for PUT /api/campaigns/{id}/sequence."""
+    sequence_graph: dict
+
+
+@router.get("/{campaign_id}/sequence")
+async def get_campaign_sequence(
+    campaign_id: str,
+    account_ctx: dict = Depends(get_account_context),
+):
+    """Return the campaign's stored sequence graph.
+
+    When the campaign has no stored graph yet, returns the default aggressive
+    template with ``is_default: true`` so the editor can seed the canvas.
+    """
+    account_id = ObjectId(account_ctx["account"]["_id"])
+    campaign = await _get_campaign_or_404(campaign_id, account_id)
+
+    from services.sequence_service import build_default_sequence_graph
+
+    stored = campaign.get("sequence_graph")
+    if stored:
+        return {"sequence_graph": stored, "is_default": False}
+    return {"sequence_graph": build_default_sequence_graph(), "is_default": True}
+
+
+@router.put("/{campaign_id}/sequence")
+async def put_campaign_sequence(
+    campaign_id: str,
+    body: SequencePutRequest,
+    account_ctx: dict = Depends(get_account_context),
+):
+    """Validate and persist a sequence graph on the campaign.
+
+    Rejects edits while the campaign is active or completed (409). On validation
+    failure returns 400 with a per-error list.
+    """
+    account_id = ObjectId(account_ctx["account"]["_id"])
+    campaign = await _get_campaign_or_404(campaign_id, account_id)
+
+    if campaign.get("status") in ("active", "completed"):
+        raise HTTPException(
+            status_code=409,
+            detail="Cannot edit the sequence while the campaign is active or completed.",
+        )
+
+    from services.sequence_service import validate_sequence_graph
+
+    errors = validate_sequence_graph(body.sequence_graph)
+    if errors:
+        raise HTTPException(status_code=400, detail={"errors": errors})
+
+    await campaigns_collection.update_one(
+        {"_id": campaign["_id"]},
+        {"$set": {
+            "sequence_graph": body.sequence_graph,
+            "sequence_contract": "sequence_graph_v1",
+            "updated_at": datetime.utcnow(),
+        }},
+    )
+    return {"sequence_graph": body.sequence_graph, "is_default": False}
 
 
 @router.post("/{campaign_id}/discover-prospects")
@@ -1435,15 +1529,27 @@ async def trigger_prospect_discovery(
     if not has_icp and not doc.get("curated_icp_prompt"):
         raise HTTPException(status_code=400, detail="Campaign must have at least one ICP field set")
 
-    # Reset discovery state for re-triggers
-    await campaigns_collection.update_one(
-        {"_id": ObjectId(campaign_id)},
+    # Atomically advance the generation so each explicit retrigger gets a new
+    # deterministic job while concurrent requests cannot share mutable work.
+    queued_campaign = await campaigns_collection.find_one_and_update(
+        {
+            "_id": ObjectId(campaign_id),
+            "account_id": account_id,
+            "discovery_status": {"$nin": [
+                "queued", "searching_db", "scraping", "enriching", "scoring",
+                "sourcing_companies", "scraping_employees",
+            ]},
+        },
         {"$set": {
-            "discovery_status": "idle",
+            "discovery_status": "queued",
             "discovery_error": None,
             "message_gen_status": "idle",
-        }},
+            "updated_at": datetime.utcnow(),
+        }, "$inc": {"discovery_generation": 1}},
+        return_document=ReturnDocument.AFTER,
     )
+    if not queued_campaign:
+        raise HTTPException(status_code=409, detail="Discovery is already queued or running")
 
     try:
         from services.campaign_discovery_logger import CampaignDiscoveryLogger
@@ -1457,10 +1563,13 @@ async def trigger_prospect_discovery(
     except Exception as _log_err:
         logger.warning(f"[Campaign {campaign_id}] Failed to write retrigger log: {_log_err}")
 
-    from services.curated_discovery_service import run_fast_discovery
-    background_tasks.add_task(run_fast_discovery, campaign_id, str(account_id))
+    await _enqueue_discovery_or_fail(
+        campaign_id,
+        account_id,
+        generation=int(queued_campaign.get("discovery_generation") or 1),
+    )
 
-    return {"status": "running", "campaign_id": campaign_id}
+    return {"status": "queued", "campaign_id": campaign_id}
 
 
 @router.post("/{campaign_id}/scrape-more")
@@ -1508,7 +1617,7 @@ async def scrape_more_prospects(
 
     # Reset per-run counters so the UI reflects this run's deltas, not cumulative totals.
     updates.update({
-        "discovery_status": "idle",
+        "discovery_status": "queued",
         "discovery_error": None,
         "discovery_failure_reason": None,
         "discovery_prospects_found": 0,
@@ -1525,7 +1634,20 @@ async def scrape_more_prospects(
         "message_gen_prospects_done": 0,
     })
 
-    await campaigns_collection.update_one({"_id": ObjectId(campaign_id)}, {"$set": updates})
+    queued_campaign = await campaigns_collection.find_one_and_update(
+        {
+            "_id": ObjectId(campaign_id),
+            "account_id": account_id,
+            "discovery_status": {"$nin": [
+                "queued", "searching_db", "scraping", "enriching", "scoring",
+                "sourcing_companies", "scraping_employees",
+            ]},
+        },
+        {"$set": updates, "$inc": {"discovery_generation": 1}},
+        return_document=ReturnDocument.AFTER,
+    )
+    if not queued_campaign:
+        raise HTTPException(status_code=409, detail="Discovery is already queued or running")
 
     try:
         from services.campaign_discovery_logger import CampaignDiscoveryLogger
@@ -1540,10 +1662,13 @@ async def scrape_more_prospects(
     except Exception as _log_err:
         logger.warning(f"[Campaign {campaign_id}] Failed to write ICP update log: {_log_err}")
 
-    from services.curated_discovery_service import run_fast_discovery
-    background_tasks.add_task(run_fast_discovery, campaign_id, str(account_id))
+    await _enqueue_discovery_or_fail(
+        campaign_id,
+        account_id,
+        generation=int(queued_campaign.get("discovery_generation") or 1),
+    )
 
-    return {"status": "running", "campaign_id": campaign_id}
+    return {"status": "queued", "campaign_id": campaign_id}
 
 
 # ---------------------------------------------------------------------------
@@ -1628,6 +1753,165 @@ async def approve_sourced_companies(
     )
 
 
+class ApproveIndustriesRequest(BaseModel):
+    industry_ids: list[str]
+
+
+class BulkSourcedCompaniesRequest(BaseModel):
+    company_ids: list[str]
+    user_excluded: bool
+
+
+@router.post("/{campaign_id}/sourced-companies/bulk")
+async def bulk_patch_sourced_companies(
+    campaign_id: str,
+    body: BulkSourcedCompaniesRequest,
+    account_ctx: dict = Depends(get_account_context),
+):
+    """Bulk include/exclude sourced companies in one round-trip."""
+    account_id = ObjectId(account_ctx["account"]["_id"])
+    await _get_campaign_or_404(campaign_id, account_id)
+
+    oids = []
+    for cid in body.company_ids:
+        try:
+            oids.append(ObjectId(cid))
+        except Exception:
+            continue
+
+    if not oids:
+        raise HTTPException(status_code=400, detail="No valid company_ids provided")
+
+    result = await database.sourced_companies_collection.update_many(
+        {"_id": {"$in": oids}, "campaign_id": campaign_id},
+        {"$set": {"user_excluded": body.user_excluded, "updated_at": datetime.utcnow()}},
+    )
+
+    return {
+        "matched_count": result.matched_count,
+        "modified_count": result.modified_count,
+    }
+
+
+@router.post("/{campaign_id}/industries/approve")
+async def approve_industry_expansions(
+    campaign_id: str,
+    body: ApproveIndustriesRequest,
+    account_ctx: dict = Depends(get_account_context),
+):
+    """
+    Merge user-approved industry ids (previously surfaced as
+    `suggested_industry_ids` from a loose group expansion — see
+    services/industry_canonicalizer.suggest_industry_expansions) into the
+    campaign's strict `industry_ids`.
+
+    Approved ids are validated against the canonical industries_taxonomy
+    table before being merged, removed from `suggested_industry_ids`, and
+    the request is a no-op (not an error) for ids already present in either
+    list or not currently suggested.
+    """
+    from services.industry_canonicalizer import get_taxonomy_entry
+
+    account_id = ObjectId(account_ctx["account"]["_id"])
+    campaign = await _get_campaign_or_404(campaign_id, account_id)
+
+    requested_ids = [iid for iid in body.industry_ids if iid and iid.strip()]
+    if not requested_ids:
+        raise HTTPException(status_code=400, detail="industry_ids must not be empty")
+
+    # Validate each id against the canonical taxonomy: static list first,
+    # falling back to the DB collection for entries not in the static seed.
+    valid_ids: list[str] = []
+    unknown_ids: list[str] = []
+    for industry_id in requested_ids:
+        if get_taxonomy_entry(industry_id) is not None:
+            valid_ids.append(industry_id)
+            continue
+        db_entry = await database.industries_taxonomy_collection.find_one(
+            {"industry_id": industry_id}
+        )
+        if db_entry is not None:
+            valid_ids.append(industry_id)
+        else:
+            unknown_ids.append(industry_id)
+
+    if unknown_ids:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Unknown industry_id(s): {', '.join(unknown_ids)}",
+        )
+
+    existing_industry_ids: list[str] = list(campaign.get("industry_ids") or [])
+    existing_suggested: list[str] = list(campaign.get("suggested_industry_ids") or [])
+
+    merged_industry_ids = list(existing_industry_ids)
+    for industry_id in valid_ids:
+        if industry_id not in merged_industry_ids:
+            merged_industry_ids.append(industry_id)
+
+    remaining_suggested = [sid for sid in existing_suggested if sid not in valid_ids]
+
+    update_fields: dict = {
+        "industry_ids": merged_industry_ids,
+        "suggested_industry_ids": remaining_suggested,
+    }
+
+    # ── Supplemental discovery decision ─────────────────────────────────────
+    # Discovery runs exactly once, in run_fast_discovery(), at campaign creation.
+    # If that has already completed, merging new industry_ids alone changes
+    # nothing — no company sourcing/scraping/enrollment ever happens for the
+    # newly-approved industries unless we do something here.
+    #
+    # We do NOT re-invoke run_fast_discovery() to fill the gap. That function
+    # is a single monolithic, non-parameterized pass: it unconditionally wipes
+    # `sourced_companies` for the whole campaign (delete_many at its top),
+    # re-sources/re-scores/re-scrapes companies for the campaign's ENTIRE
+    # industry_ids list (old + new, not just the newly-approved ones), and —
+    # if any prospects end up assigned to send-day 1 — fires a background task
+    # that regenerates Day-1 messages for every day-1 "active" enrollment,
+    # including ones from the original run. `_upsert_curated_prospect` (upsert
+    # by linkedin/email) and `_pre_enroll_prospects` (skips prospect_ids
+    # already in `campaign_enrollments` for this campaign, see
+    # services/prospect_enrollment_service.py `already_enrolled`/
+    # `cross_enrolled` sets) do prevent duplicate prospect docs and duplicate
+    # *enrollment* documents. But re-running the full pipeline is not scoped
+    # to "the newly-approved industries only": it re-spends Apify/Gemini
+    # budget re-processing industries that were already handled, discards the
+    # sourced_companies audit trail for the whole campaign, and risks
+    # clobbering already-generated Day-1 message content for existing
+    # enrollees. That is not a safe additive rerun for this endpoint, so we
+    # do not take it.
+    #
+    # Instead: mark the campaign as needing a (future, properly-scoped)
+    # supplemental discovery pass and return that decision explicitly. Lazy
+    # canonicalization already covers the two cases where no extra action is
+    # needed: discovery hasn't completed yet (still running, or the campaign
+    # is a pre-discovery draft) — the in-flight/next run will naturally pick
+    # up the merged industry_ids — or the campaign is already active/completed,
+    # where kicking off new sourcing would be surprising and out of scope here.
+    discovery_status = campaign.get("discovery_status")
+    campaign_status = campaign.get("status")
+    rediscovery = "not_needed"
+    if discovery_status == "completed" and campaign_status not in ("active", "completed"):
+        existing_pending = list(campaign.get("pending_rediscovery_industry_ids") or [])
+        pending_ids = list(dict.fromkeys(existing_pending + valid_ids))
+        update_fields["pending_rediscovery"] = True
+        update_fields["pending_rediscovery_industry_ids"] = pending_ids
+        rediscovery = "deferred"
+
+    await campaigns_collection.update_one(
+        {"_id": campaign["_id"]},
+        {"$set": update_fields},
+    )
+
+    return {
+        "campaign_id": campaign_id,
+        "industry_ids": merged_industry_ids,
+        "suggested_industry_ids": remaining_suggested,
+        "rediscovery": rediscovery,
+    }
+
+
 @router.get("/{campaign_id}/discovery-status")
 async def get_discovery_status(
     campaign_id: str,
@@ -1680,6 +1964,14 @@ async def get_discovery_status(
         "discovery_prospects_found": doc.get("discovery_prospects_found", 0),
         "discovery_prospects_enrolled": doc.get("discovery_prospects_enrolled", 0),
         "discovery_companies_found": doc.get("discovery_companies_found", 0),
+        # DB-first visibility: companies matched from the shared pool (Stage A).
+        "discovery_companies_matched": doc.get("discovery_companies_matched", 0),
+        # Curated (company-first) counters the review UI reads directly.
+        "curated_companies_sourced": doc.get("curated_companies_sourced", 0),
+        "curated_companies_approved": doc.get("curated_companies_approved", 0),
+        "curated_companies_scraped": doc.get("curated_companies_scraped", 0),
+        # Why-0-enrolled visibility.
+        "discovery_skip_reasons": doc.get("discovery_skip_reasons") or {},
         "discovery_apify_triggered": doc.get("discovery_apify_triggered", False),
         "discovery_prospects_from_db": doc.get("discovery_prospects_from_db", 0),
         "discovery_prospects_from_apify": doc.get("discovery_prospects_from_apify", 0),
@@ -1688,6 +1980,10 @@ async def get_discovery_status(
         "message_gen_failed_count": message_gen_failed_count,
         "discovery_day1_enrolled": doc.get("discovery_day1_enrolled", 0),
         "total_enrolled": doc.get("total_enrolled", 0),
+        # Auto top-up: discovery re-runs itself when yield < target (see
+        # curated_discovery_service). Surfaces a "finding more prospects…" banner.
+        "discovery_topup_active": doc.get("discovery_topup_active", False),
+        "discovery_topup_message": doc.get("discovery_topup_message"),
         "prospect_count_target": doc.get("prospect_count_target", 0),
         "approval_status": doc.get("approval_status", "pending"),
         "auto_launch_status": doc.get("auto_launch_status", "idle"),
@@ -1710,6 +2006,16 @@ async def get_discovery_status(
         "day1_date": day1_date.isoformat() if day1_date else None,
         "day1_is_today": bool(day1_is_today),
         "timezone": doc.get("timezone", "America/New_York"),
+        # ── Upload-a-Lead-List (BYOL) counters + review arrays ──
+        "discovery_source": doc.get("discovery_source", "discovery"),
+        "upload_batch_id": str(doc["upload_batch_id"]) if doc.get("upload_batch_id") else None,
+        "upload_rows_total": doc.get("upload_rows_total", 0),
+        "upload_rows_person": doc.get("upload_rows_person", 0),
+        "upload_rows_company": doc.get("upload_rows_company", 0),
+        "upload_rows_email_only": doc.get("upload_rows_email_only", 0),
+        "upload_rows_unresolvable": doc.get("upload_rows_unresolvable", 0),
+        "upload_unresolvable_rows": doc.get("upload_unresolvable_rows") or [],
+        "upload_skipped_rows": doc.get("upload_skipped_rows") or [],
     }
 
 
@@ -1718,11 +2024,16 @@ async def list_enrolled_prospects(
     campaign_id: str,
     page: int = Query(1, ge=1),
     page_size: int = Query(20, ge=1, le=200),
-    sort: str = Query("score_desc", regex="^(score_desc|score_asc|enrolled_at|day_asc)$"),
+    sort: str = Query("score_desc", pattern="^(score_desc|score_asc|enrolled_at|day_asc)$"),
     channel_filter: Optional[str] = Query(
-        None, regex="^(email|linkedin_connection|linkedin_inmail|skipped|day_1|day_2_plus)?$"
+        None, pattern="^(email|linkedin_connection|linkedin_inmail|skipped|day_1|day_2_plus)?$"
     ),
     include_skipped: bool = Query(False),
+    status_filter: Optional[str] = None,
+    has_email: Optional[bool] = Query(None),
+    has_linkedin: Optional[bool] = Query(None),
+    enriched: Optional[bool] = Query(None),
+    company: Optional[str] = Query(None),
     account_ctx: dict = Depends(get_account_context),
 ):
     """
@@ -1736,6 +2047,8 @@ async def list_enrolled_prospects(
     include_skipped=True additionally surfaces prospects that were scraped for
     this campaign but filtered out as low-fit, letting users see who was
     excluded and why.
+
+    status_filter filters by enrollment status (e.g. active, replied, bounced, opted_out).
     """
     account_id = ObjectId(account_ctx["account"]["_id"])
     await _get_campaign_or_404(campaign_id, account_id)
@@ -1744,6 +2057,8 @@ async def list_enrolled_prospects(
     skip = (page - 1) * page_size
 
     match: dict = {"campaign_id": campaign_oid}
+    if status_filter:
+        match["status"] = status_filter
     if channel_filter == "email":
         match["smart_campaign_channel"] = "email"
     elif channel_filter == "linkedin_connection":
@@ -1766,9 +2081,58 @@ async def list_enrolled_prospects(
     else:
         sort_stage = {"enrolled_at": -1}
 
-    total = await campaign_enrollments_collection.count_documents(match)
+    # campaign_prospect_state join key: the enrollment stores account_id/prospect_id
+    # as ObjectId, so stringify them for the match; campaign_id is the string route
+    # param. Highest scoring_version wins (most recent scoring pass).
+    cps_lookup = {
+        "$lookup": {
+            "from": "campaign_prospect_state",
+            "let": {
+                "pid": {"$toString": "$prospect_id"},
+                "aid": {"$toString": "$account_id"},
+            },
+            "pipeline": [
+                {
+                    "$match": {
+                        "$expr": {
+                            "$and": [
+                                {"$eq": ["$prospect_id", "$$pid"]},
+                                {"$eq": ["$account_id", "$$aid"]},
+                                {"$eq": ["$campaign_id", campaign_id]},
+                            ]
+                        }
+                    }
+                },
+                {"$sort": {"scoring_version": -1}},
+                {"$limit": 1},
+            ],
+            "as": "cps_data",
+        }
+    }
 
-    pipeline = [
+    # Filters that depend on the joined docs (email/linkedin from the shared prospect
+    # doc, enriched from the cps overlay, company from either) must run AFTER the
+    # $lookups. Absent-truthiness: {$in: [None, ""]} matches null/missing/"".
+    post_lookup_match: dict = {}
+    if has_email is not None:
+        post_lookup_match["prospect_data.email"] = (
+            {"$nin": [None, ""]} if has_email else {"$in": [None, ""]}
+        )
+    if has_linkedin is not None:
+        post_lookup_match["prospect_data.linkedin"] = (
+            {"$nin": [None, ""]} if has_linkedin else {"$in": [None, ""]}
+        )
+    if enriched is not None:
+        post_lookup_match["cps_data.enrichment.state"] = (
+            "succeeded" if enriched else {"$ne": "succeeded"}
+        )
+    if company:
+        post_lookup_match["$or"] = [
+            {"prospect_data.company_id": company},
+            {"prospect_data.company_name": company},
+        ]
+
+    base_stages: list = [
         {"$match": match},
         {
             "$lookup": {
@@ -1803,21 +2167,25 @@ async def list_enrolled_prospects(
             }
         },
         {"$addFields": {"state_data": {"$arrayElemAt": ["$state_data", 0]}}},
+        cps_lookup,
+        {"$addFields": {"cps_data": {"$arrayElemAt": ["$cps_data", 0]}}},
         # Compute sort-friendly effective values so we can sort by score with
         # null coalescing (unscored → -1) instead of mongo's default null
-        # sorting behaviour which interleaves them with low scores.
+        # sorting behaviour which interleaves them with low scores. The campaign
+        # fit score (campaign_prospect_state.score.value) is the primary signal so
+        # the "Fit" column is populated for everyone; it coalesces to the
+        # enrollment rule score, then the tenant-scoped ai_score, then -1.
         {
             "$addFields": {
                 "ai_prospect_score_effective": {
                     "$ifNull": [
-                        "$state_data.ai_score",
-                        {"$ifNull": [
-                            "$prospect_data.ai_prospect_score",
-                            {"$ifNull": [
-                                "$prospect_data.last_campaign_rule_score",
-                                {"$ifNull": ["$campaign_rule_score", -1]}
-                            ]}
-                        ]}
+                        "$cps_data.score.value",
+                        {
+                            "$ifNull": [
+                                "$campaign_rule_score",
+                                {"$ifNull": ["$state_data.ai_score", -1]},
+                            ]
+                        },
                     ]
                 },
                 "smart_campaign_send_day_effective": {
@@ -1825,6 +2193,18 @@ async def list_enrolled_prospects(
                 },
             }
         },
+    ]
+    if post_lookup_match:
+        base_stages.append({"$match": post_lookup_match})
+
+    # total must reflect post-lookup filters, so count through the same base pipeline
+    # (a plain count_documents(match) would ignore email/linkedin/enriched/company).
+    count_res = await campaign_enrollments_collection.aggregate(
+        base_stages + [{"$count": "n"}]
+    ).to_list(length=1)
+    total = count_res[0]["n"] if count_res else 0
+
+    pipeline = base_stages + [
         {"$sort": sort_stage},
         {"$skip": skip},
         {"$limit": page_size},
@@ -1851,15 +2231,40 @@ async def list_enrolled_prospects(
                 "industry": "$prospect_data.industry",
                 "country": "$prospect_data.country",
                 "seniority_level": "$prospect_data.seniority_level",
-                "ai_prospect_score": {"$ifNull": ["$state_data.ai_score", {"$ifNull": ["$prospect_data.ai_prospect_score", 0]}]},
-                "priority_tier": {"$ifNull": ["$state_data.priority_tier", "$prospect_data.priority_tier"]},
-                "prospect_score": "$prospect_data.prospect_score",
+                # Score/tier: the campaign fit score (campaign_prospect_state overlay)
+                # is the authoritative per-campaign fit; ai_prospect_score (tenant
+                # prospect_state) and campaign_rule_score are also projected so the
+                # frontend can choose which to display. Tier prefers the cps overlay,
+                # falling back to the tenant prospect_state tier.
+                "ai_prospect_score": "$state_data.ai_score",
+                "campaign_fit_score": "$cps_data.score.value",
+                "priority_tier": {
+                    "$ifNull": [
+                        "$cps_data.score.priority_tier",
+                        "$state_data.priority_tier",
+                    ]
+                },
+                # campaign_rule_score lives on the enrollment (rule-based fit
+                # snapshot), not the shared pool — retained.
                 "campaign_rule_score": 1,
                 "linkedin": "$prospect_data.linkedin",
                 "email": "$prospect_data.email",
                 "has_email": {"$cond": [{"$ifNull": ["$prospect_data.email", False]}, True, False]},
                 "has_linkedin": {"$cond": [{"$ifNull": ["$prospect_data.linkedin", False]}, True, False]},
-                "enrichment_status": "$prospect_data.enrichment_status",
+                # Enrichment status reads the campaign_prospect_state overlay
+                # (enrichment.state) first — succeeded→"completed" — falling back to
+                # the shared prospect doc's enrichment_status only when the overlay
+                # has no state yet.
+                "enrichment_status": {
+                    "$cond": [
+                        {"$eq": ["$cps_data.enrichment.state", "succeeded"]},
+                        "completed",
+                        {"$ifNull": [
+                            "$cps_data.enrichment.state",
+                            "$prospect_data.enrichment_status",
+                        ]},
+                    ]
+                },
                 "enrichment_completed_at": "$prospect_data.enrichment_completed_at",
             }
         },
@@ -1905,31 +2310,52 @@ async def list_enrolled_prospects(
 
         if skipped_filter is not None:
             skipped_total = await prospects_collection.count_documents(skipped_filter)
-            skipped_cursor = (
-                prospects_collection.find(
-                    skipped_filter,
-                    {
-                        "_id": 1,
-                        "full_name": 1,
-                        "first_name": 1,
-                        "job_title": 1,
-                        "company_name": 1,
-                        "industry": 1,
-                        "country": 1,
-                        "seniority_level": 1,
-                        "ai_prospect_score": 1,
-                        "priority_tier": 1,
-                        "enrichment_status": 1,
-                        "enrichment_error": 1,
-                        "last_campaign_rule_score": 1,
-                    },
-                )
-                .sort([("ai_prospect_score", -1)])
-                .limit(50)
+            # Pull tenant-neutral canonical fields only from the shared pool.
+            skipped_prospects = await prospects_collection.find(
+                skipped_filter,
+                {
+                    "_id": 1,
+                    "full_name": 1,
+                    "first_name": 1,
+                    "job_title": 1,
+                    "company_name": 1,
+                    "industry": 1,
+                    "country": 1,
+                    "seniority_level": 1,
+                    "enrichment_status": 1,
+                    "enrichment_error": 1,
+                },
+            ).limit(200).to_list(length=200)
+
+            # Overlay campaign/tenant-scoped scores from prospect_state (the same
+            # collection the enrollment ranking trusts) instead of reading legacy
+            # shared-pool score copies.
+            account_id_str = str(account_ctx["account"]["_id"])
+            skipped_pids = [str(p["_id"]) for p in skipped_prospects]
+            score_by_pid: dict = {}
+            if skipped_pids:
+                async for st in database.prospect_state_collection.find(
+                    {"account_id": account_id_str, "prospect_id": {"$in": skipped_pids}},
+                    {"prospect_id": 1, "ai_score": 1, "priority_tier": 1},
+                ):
+                    score_by_pid[st["prospect_id"]] = st
+
+            def _skipped_score(pid: str):
+                return score_by_pid.get(pid, {}).get("ai_score")
+
+            # Highest-fit skipped prospects first; unscored (null) sort last.
+            skipped_prospects.sort(
+                key=lambda p: (
+                    _skipped_score(str(p["_id"])) is not None,
+                    _skipped_score(str(p["_id"])) if _skipped_score(str(p["_id"])) is not None else 0,
+                ),
+                reverse=True,
             )
-            async for p in skipped_cursor:
+            for p in skipped_prospects[:50]:
+                pid = str(p["_id"])
+                st = score_by_pid.get(pid, {})
                 skipped_rows.append({
-                    "prospect_id": str(p["_id"]),
+                    "prospect_id": pid,
                     "enrollment_id": None,
                     "status": "skipped_low_fit",
                     "smart_campaign_channel": None,
@@ -1941,11 +2367,11 @@ async def list_enrolled_prospects(
                     "industry": p.get("industry"),
                     "country": p.get("country"),
                     "seniority_level": p.get("seniority_level"),
-                    "ai_prospect_score": p.get("ai_prospect_score"),
-                    "priority_tier": p.get("priority_tier"),
+                    "ai_prospect_score": st.get("ai_score"),
+                    "priority_tier": st.get("priority_tier"),
                     "enrichment_status": p.get("enrichment_status"),
                     "enrichment_error": p.get("enrichment_error"),
-                    "prospect_score": p.get("last_campaign_rule_score"),
+                    "prospect_score": st.get("ai_score"),
                     "message_gen_status": None,
                     "has_generated_message": False,
                 })
@@ -1958,9 +2384,263 @@ async def list_enrolled_prospects(
         "pages": (total + page_size - 1) // page_size,
         "sort": sort,
         "channel_filter": channel_filter,
+        "status_filter": status_filter,
         "skipped_prospects": skipped_rows,
         "skipped_total": skipped_total,
     }
+
+
+@router.get("/{campaign_id}/enrolled-prospects/stats")
+async def enrolled_prospects_stats(
+    campaign_id: str,
+    account_ctx: dict = Depends(get_account_context),
+):
+    """
+    Aggregate stats over ALL campaign_enrollments for a campaign (not paginated).
+
+    Semantics match list_enrolled_prospects: every enrollment counts toward the
+    main totals regardless of enrollment status (scraped-but-skipped prospects
+    have no enrollment document at all, so — like the list's main result set —
+    they are excluded here; enrollment statuses are broken out in by_status).
+
+    Response contract (frontend builds against this exactly):
+      {
+        "total": int,
+        "with_email": int,       # prospect.email truthy (same as list's has_email)
+        "with_linkedin": int,    # prospect.linkedin truthy (same as list's has_linkedin)
+        "enriched": int,         # prospect.enrichment_status == "completed"
+        "messages_ready": int,   # enrollment.message_gen_status == "completed"
+        "by_status": {"active": n, "replied": n, "bounced": n, "opted_out": n, ...}
+      }
+    """
+    account_id = ObjectId(account_ctx["account"]["_id"])
+    await _get_campaign_or_404(campaign_id, account_id)
+
+    campaign_oid = ObjectId(campaign_id)
+
+    pipeline = [
+        {"$match": {"campaign_id": campaign_oid}},
+        {
+            "$facet": {
+                # Summary counts need the shared-pool prospect doc for
+                # email/linkedin/enrichment_status — same $lookup the list
+                # endpoint uses.
+                "summary": [
+                    {
+                        "$lookup": {
+                            "from": "prospects",
+                            "localField": "prospect_id",
+                            "foreignField": "_id",
+                            "as": "prospect_data",
+                        }
+                    },
+                    {
+                        "$unwind": {
+                            "path": "$prospect_data",
+                            "preserveNullAndEmptyArrays": True,
+                        }
+                    },
+                    # Join the campaign_prospect_state overlay so "enriched" reflects
+                    # the per-campaign enrichment.state (not the shared prospect doc's
+                    # enrichment_status). Same join key as the list endpoint.
+                    {
+                        "$lookup": {
+                            "from": "campaign_prospect_state",
+                            "let": {
+                                "pid": {"$toString": "$prospect_id"},
+                                "aid": {"$toString": "$account_id"},
+                            },
+                            "pipeline": [
+                                {
+                                    "$match": {
+                                        "$expr": {
+                                            "$and": [
+                                                {"$eq": ["$prospect_id", "$$pid"]},
+                                                {"$eq": ["$account_id", "$$aid"]},
+                                                {"$eq": ["$campaign_id", campaign_id]},
+                                            ]
+                                        }
+                                    }
+                                },
+                                {"$sort": {"scoring_version": -1}},
+                                {"$limit": 1},
+                            ],
+                            "as": "cps_data",
+                        }
+                    },
+                    {"$addFields": {"cps_data": {"$arrayElemAt": ["$cps_data", 0]}}},
+                    # Company grouping key: prefer the shared-pool company_id, fall
+                    # back to company_name so companies without a canonical id still
+                    # count distinctly.
+                    {
+                        "$addFields": {
+                            "company_key": {
+                                "$ifNull": [
+                                    "$prospect_data.company_id",
+                                    "$prospect_data.company_name",
+                                ]
+                            }
+                        }
+                    },
+                    {
+                        "$group": {
+                            "_id": None,
+                            "total": {"$sum": 1},
+                            # Truthiness mirrors the list endpoint's has_email /
+                            # has_linkedin projection ($ifNull inside $cond:
+                            # null/missing/"" all count as absent).
+                            "with_email": {
+                                "$sum": {
+                                    "$cond": [
+                                        {"$ifNull": ["$prospect_data.email", False]},
+                                        1,
+                                        0,
+                                    ]
+                                }
+                            },
+                            "with_linkedin": {
+                                "$sum": {
+                                    "$cond": [
+                                        {"$ifNull": ["$prospect_data.linkedin", False]},
+                                        1,
+                                        0,
+                                    ]
+                                }
+                            },
+                            "enriched": {
+                                "$sum": {
+                                    "$cond": [
+                                        {
+                                            "$eq": [
+                                                "$cps_data.enrichment.state",
+                                                "succeeded",
+                                            ]
+                                        },
+                                        1,
+                                        0,
+                                    ]
+                                }
+                            },
+                            "messages_ready": {
+                                "$sum": {
+                                    "$cond": [
+                                        {"$eq": ["$message_gen_status", "completed"]},
+                                        1,
+                                        0,
+                                    ]
+                                }
+                            },
+                            "companies_set": {"$addToSet": "$company_key"},
+                        }
+                    },
+                ],
+                # Enrollment-status breakdown (no prospect lookup needed).
+                "by_status": [
+                    {
+                        "$group": {
+                            "_id": {"$ifNull": ["$status", "unknown"]},
+                            "n": {"$sum": 1},
+                        }
+                    }
+                ],
+            }
+        },
+    ]
+
+    facets = await campaign_enrollments_collection.aggregate(pipeline).to_list(length=1)
+    summary_rows = (facets[0].get("summary") if facets else None) or []
+    summary = summary_rows[0] if summary_rows else {}
+    by_status_rows = (facets[0].get("by_status") if facets else None) or []
+
+    # Distinct company count over the enrolled prospects (null/empty keys dropped).
+    companies_count = len([c for c in (summary.get("companies_set") or []) if c])
+
+    return {
+        "total": summary.get("total", 0),
+        "with_email": summary.get("with_email", 0),
+        "with_linkedin": summary.get("with_linkedin", 0),
+        "enriched": summary.get("enriched", 0),
+        "messages_ready": summary.get("messages_ready", 0),
+        "companies": companies_count,
+        "by_status": {str(row["_id"]): row["n"] for row in by_status_rows},
+    }
+
+
+@router.get("/{campaign_id}/companies")
+async def list_campaign_companies(
+    campaign_id: str,
+    account_ctx: dict = Depends(get_account_context),
+):
+    """
+    Distinct companies represented among a campaign's enrolled prospects.
+
+    Groups every enrollment by the shared-pool company_id (falling back to
+    company_name) and returns per-company metadata + prospect_count plus a small
+    sample of enrolled prospects, sorted by prospect_count desc, so the review UI
+    can render a company-level rollup.
+    """
+    account_id = ObjectId(account_ctx["account"]["_id"])
+    await _get_campaign_or_404(campaign_id, account_id)
+
+    campaign_oid = ObjectId(campaign_id)
+
+    pipeline = [
+        {"$match": {"campaign_id": campaign_oid}},
+        {
+            "$lookup": {
+                "from": "prospects",
+                "localField": "prospect_id",
+                "foreignField": "_id",
+                "as": "prospect_data",
+            }
+        },
+        {"$unwind": {"path": "$prospect_data", "preserveNullAndEmptyArrays": True}},
+        {
+            "$group": {
+                "_id": {
+                    "$ifNull": [
+                        "$prospect_data.company_id",
+                        "$prospect_data.company_name",
+                    ]
+                },
+                "company_name": {"$first": "$prospect_data.company_name"},
+                "company_domain": {"$first": "$prospect_data.company_domain"},
+                "company_linkedin": {"$first": "$prospect_data.company_linkedin"},
+                "company_industry_group": {
+                    "$first": "$prospect_data.company_industry_group"
+                },
+                "prospect_count": {"$sum": 1},
+                "prospects": {
+                    "$push": {
+                        "prospect_id": {"$toString": "$prospect_id"},
+                        "full_name": "$prospect_data.full_name",
+                        "job_title": "$prospect_data.job_title",
+                    }
+                },
+            }
+        },
+        {"$sort": {"prospect_count": -1}},
+        {
+            "$project": {
+                "_id": 0,
+                "company_id": "$_id",
+                "company_name": 1,
+                "company_domain": 1,
+                "company_linkedin": 1,
+                "company_industry_group": 1,
+                "prospect_count": 1,
+                # Cap the sample so a huge company doesn't bloat the payload.
+                "prospects": {"$slice": ["$prospects", 10]},
+            }
+        },
+    ]
+
+    companies = await campaign_enrollments_collection.aggregate(pipeline).to_list(
+        length=2000
+    )
+    # Drop the null/empty company bucket (prospects with neither id nor name).
+    companies = [c for c in companies if c.get("company_id")]
+    return {"companies": companies, "total_companies": len(companies)}
 
 
 @router.get("/{campaign_id}/message-preview/{prospect_id}")
@@ -1988,7 +2668,7 @@ async def get_message_preview(
 
     prospect = await prospects_collection.find_one(
         {"_id": prospect_oid},
-        {"full_name": 1, "first_name": 1, "job_title": 1, "company_name": 1, "email": 1, "linkedin": 1, "ai_prospect_score": 1},
+        {"full_name": 1, "first_name": 1, "job_title": 1, "company_name": 1, "email": 1, "linkedin": 1},
     )
 
     def _str_id(doc):
@@ -2037,7 +2717,10 @@ async def approve_day_endpoint(
       the user can review the next day's drafts without waiting for sends to
       finish.
     """
-    from services.campaign_launch_service import approve_day
+    from services.campaign_launch_service import (
+        SequenceLaunchValidationError,
+        approve_day,
+    )
 
     account_id = ObjectId(account_ctx["account"]["_id"])
     campaign = await _get_campaign_or_404(campaign_id, account_id)
@@ -2050,6 +2733,8 @@ async def approve_day_endpoint(
 
     try:
         result = await approve_day(campaign, day_n)
+    except SequenceLaunchValidationError as e:
+        raise HTTPException(status_code=409, detail=str(e)) from e
     except ValueError as e:
         raise HTTPException(status_code=400, detail=str(e))
 
@@ -2057,13 +2742,27 @@ async def approve_day_endpoint(
     # drafts without waiting. This is idempotent — if day N+1 is already generated it's
     # a cheap no-op. Works for all days (unbounded); approve-day endpoint handles last day
     # by returning empty (count=0) from ensure_day_ready_then_generate.
-    from services.curated_discovery_service import ensure_day_ready_then_generate
-    background_tasks.add_task(
-        ensure_day_ready_then_generate,
-        campaign_id,
-        str(account_ctx["account"]["_id"]),
-        day_n + 1,
+    # Durable pre-fill: enqueue day N+1 message generation as a leased job so it
+    # survives a process restart instead of dying with an in-process task. The
+    # enqueue is fast, so the approval response still returns promptly. This is a
+    # best-effort pre-fill — a queue hiccup must not fail the approval the user
+    # just made, so failures are logged rather than surfaced.
+    from services.enrichment_job_service import (
+        MESSAGE_GEN_MODE_ENSURE_DAY,
+        enqueue_campaign_message_generation,
     )
+    try:
+        await enqueue_campaign_message_generation(
+            account_id=str(account_id),
+            campaign_id=campaign_id,
+            day=day_n + 1,
+            mode=MESSAGE_GEN_MODE_ENSURE_DAY,
+        )
+    except Exception as exc:
+        logger.warning(
+            f"[campaigns] failed to enqueue day {day_n + 1} pre-fill "
+            f"for campaign {campaign_id}: {exc}"
+        )
 
     # Return updated campaign for the frontend
     updated = await campaigns_collection.find_one({"_id": campaign["_id"]})
@@ -2081,8 +2780,6 @@ async def generate_messages_for_day(
     account_ctx: dict = Depends(get_account_context),
 ):
     """Manually trigger message generation for a specific campaign day."""
-    from services.campaign_message_generator_service import generate_messages_for_campaign
-
     account_id = ObjectId(account_ctx["account"]["_id"])
     campaign = await _get_campaign_or_404(campaign_id, account_id)
 
@@ -2094,16 +2791,37 @@ async def generate_messages_for_day(
         "campaign_id": campaign["_id"],
         "smart_campaign_send_day": day,
         "message_gen_status": {"$in": ["scheduled_later", "failed", "pending"]},
-        "status": {"$nin": ["archived", "skipped_no_channel"]},
+        "status": {"$nin": ["archived", "skipped_no_channel", "cascade_waiting"]},
     })
 
     if pending_count == 0:
         return {"status": "no_pending", "day": day, "enrollment_count": 0}
 
-    # Fire as background task so response returns immediately
-    background_tasks.add_task(generate_messages_for_campaign, campaign_id, str(account_id), send_day=day)
+    # Enqueue a durable, leased job so generation survives a process restart.
+    # The enqueue is fast, so the response still returns promptly. This endpoint
+    # exists to trigger generation, so fail closed if the work cannot be queued.
+    from services.enrichment_job_service import (
+        MESSAGE_GEN_MODE_GENERATE_DAY,
+        enqueue_campaign_message_generation,
+    )
+    try:
+        job = await enqueue_campaign_message_generation(
+            account_id=str(account_id),
+            campaign_id=campaign_id,
+            day=day,
+            mode=MESSAGE_GEN_MODE_GENERATE_DAY,
+        )
+    except Exception as exc:
+        raise HTTPException(
+            status_code=503, detail="Could not queue message generation"
+        ) from exc
 
-    return {"status": "started", "day": day, "enrollment_count": pending_count}
+    return {
+        "status": "queued",
+        "job_id": str(job.id),
+        "day": day,
+        "enrollment_count": pending_count,
+    }
 
 
 @router.patch("/{campaign_id}/enrollments/{enrollment_id}/schedule")
@@ -2457,27 +3175,60 @@ async def approve_draft(
     try:
         if channel == "linkedin":
             from services.unipile_service import UnipileClient
-            unipile = UnipileClient()
             linkedin_url = prospect.get("linkedin", "")
             if not linkedin_url:
                 raise HTTPException(status_code=400, detail="Prospect has no LinkedIn URL")
-            await unipile.send_linkedin_message(linkedin_url, draft_text)
+            account_values = [account_id, str(account_id)]
+            linked_query: dict = {
+                "account_id": {"$in": account_values},
+                "unipile_status": "OK",
+                "unipile_account_id": {"$exists": True, "$nin": [None, ""]},
+            }
+            if campaign.get("linkedin_account_id"):
+                try:
+                    linked_query["_id"] = ObjectId(str(campaign["linkedin_account_id"]))
+                except Exception:
+                    raise HTTPException(status_code=400, detail="Campaign has invalid LinkedIn sender")
+            linked_senders = await database.linkedin_accounts_collection.find(
+                linked_query,
+                {"unipile_account_id": 1},
+            ).limit(2).to_list(2)
+            if len(linked_senders) != 1:
+                raise HTTPException(
+                    status_code=400,
+                    detail="Campaign requires one explicit connected LinkedIn sender",
+                )
+            unipile = UnipileClient(
+                account_id=str(linked_senders[0]["unipile_account_id"])
+            )
+            await unipile.start_new_chat(linkedin_url, draft_text)
         elif channel in ("email", "cold_email", "followup_email"):
-            from services.email_sender_service import send_campaign_email
+            from services.email_delivery_service import send_email as delivery_send_email
             email_address = prospect.get("email", "")
             if not email_address:
                 raise HTTPException(status_code=400, detail="Prospect has no email address")
             subject = pending_draft.get("subject", "Following up")
-            email_account_id = str(campaign.get("email_account_id", ""))
-            await send_campaign_email(
-                email_account_id=email_account_id,
-                to_email=email_address,
-                subject=subject,
-                body=draft_text,
+            email_account_id = campaign.get("email_account_id")
+            if not email_account_id:
+                raise HTTPException(status_code=400, detail="Campaign has no connected email account")
+            email_account = await database.email_accounts_collection.find_one(
+                {
+                    "_id": ObjectId(str(email_account_id)),
+                    "account_id": {"$in": [account_id, str(account_id)]},
+                }
+            )
+            if not email_account:
+                raise HTTPException(status_code=400, detail="Connected email account not found")
+            send_result = await delivery_send_email(
+                email_account,
+                email_address,
+                subject,
+                draft_text,
                 prospect_id=str(prospect["_id"]),
                 campaign_id=campaign_id,
-                enrollment_id=enrollment_id,
             )
+            if not send_result:
+                raise HTTPException(status_code=502, detail="Email send failed — check provider credentials/logs")
         else:
             raise HTTPException(status_code=400, detail=f"Unsupported channel: {channel}")
     except HTTPException:
@@ -2729,30 +3480,6 @@ async def get_schedule_range(
     return {"days": days}
 
 
-@router.get("/{campaign_id}/schedules/{date}")
-async def get_schedule_for_date(
-    campaign_id: str,
-    date: str,
-    account_ctx: dict = Depends(get_account_context),
-):
-    """Return full schedule items for a specific date."""
-    account_id = ObjectId(account_ctx["account"]["_id"])
-    await _get_campaign_or_404(campaign_id, account_id)
-
-    sched = await database.db["campaign_schedules"].find_one({"campaign_id": str(campaign_id), "date": date})
-    if not sched:
-        return {"date": date, "status": "empty", "items": [], "total_items": 0, "sent_items": 0}
-    items = sched.get("items", [])
-    sent = sum(1 for i in items if i.get("status") in ("sent", "completed"))
-    return {
-        "date": date,
-        "status": sched.get("status", "empty"),
-        "items": serialize_doc(items),
-        "total_items": len(items),
-        "sent_items": sent,
-    }
-
-
 @router.get("/{campaign_id}/schedule")
 async def get_campaign_schedule(
     campaign_id: str,
@@ -2929,6 +3656,16 @@ async def get_campaign_schedule(
     prospect_ids = [e["prospect_id"] for e in enrollments if e.get("prospect_id")]
     prospects_map: dict = {}
     if prospect_ids:
+        # Canonical identity fields come from the tenant-neutral shared pool;
+        # score/tier come from the campaign/tenant-scoped prospect_state overlay.
+        pid_strs = [str(pid) for pid in prospect_ids]
+        state_by_pid: dict = {}
+        async for st in database.prospect_state_collection.find(
+            {"account_id": str(account_id), "prospect_id": {"$in": pid_strs}},
+            {"prospect_id": 1, "ai_score": 1, "priority_tier": 1},
+        ):
+            state_by_pid[st["prospect_id"]] = st
+
         plist = await database.prospects_collection.find(
             {"_id": {"$in": prospect_ids}},
             {
@@ -2938,18 +3675,17 @@ async def get_campaign_schedule(
                 "last_name": 1,
                 "company_name": 1,
                 "job_title": 1,
-                "ai_prospect_score": 1,
-                "priority_tier": 1,
             },
         ).to_list(length=len(prospect_ids))
         for p in plist:
             full_name = p.get("full_name") or f"{p.get('first_name', '')} {p.get('last_name', '')}".strip()
+            st = state_by_pid.get(str(p["_id"]), {})
             prospects_map[str(p["_id"])] = {
                 "name": full_name,
                 "company": p.get("company_name", ""),
                 "job_title": p.get("job_title", ""),
-                "ai_prospect_score": p.get("ai_prospect_score"),
-                "priority_tier": p.get("priority_tier"),
+                "ai_prospect_score": st.get("ai_score"),
+                "priority_tier": st.get("priority_tier"),
             }
 
     days_map: dict = {}
@@ -3210,15 +3946,6 @@ async def regenerate_schedule_item(
         prospect=prospect or {},
     )
 
-    # Update the schedule item with new draft
-    await database.db["campaign_schedules"].update_one(
-        {"campaign_id": str(campaign_id), "date": date, "items.enrollment_id": enrollment_id},
-        {"$set": {
-            "items.$.subject": draft.get("subject", ""),
-            "items.$.body": draft.get("body", ""),
-            "items.$.status": "pending_review",
-        }},
-    )
     return {"draft": draft}
 
 
@@ -3267,10 +3994,16 @@ async def _regenerate_messages_for_enrollments(
     from services.campaign_message_generator_service import (
         generate_messages_for_enrollment,
         generate_single_channel_message,
+        prepare_campaign_for_generation,
     )
 
     if not enrollments:
         return {"queued": 0, "succeeded": 0, "failed": 0}
+
+    # Stamp sender identity + company profile onto the in-memory campaign dict
+    # (same as generate_messages_for_campaign) so regenerated messages carry the
+    # seller's name/case studies instead of falling back to unsigned prompts.
+    await prepare_campaign_for_generation(campaign, campaign.get("account_id"))
 
     # Batch-fetch prospects
     prospect_ids = [e["prospect_id"] for e in enrollments]
@@ -3459,7 +4192,6 @@ async def enrich_and_generate_for_day_endpoint(
     campaign_id: str,
     day: int,
     body: EnrichAndGenerateRequest,
-    background_tasks: BackgroundTasks,
     account_ctx=Depends(get_account_context),
 ):
     """Run full enrichment on day-N prospects (idempotent) then regenerate messages per-channel."""
@@ -3472,12 +4204,17 @@ async def enrich_and_generate_for_day_endpoint(
         raise HTTPException(status_code=400, detail="Only smart campaigns support enrich-and-generate")
 
     # Reject if already running
-    if campaign.get("message_gen_status") == "running":
+    if campaign.get("message_gen_status") in {"queued", "running"}:
         raise HTTPException(status_code=409, detail="Message generation already in progress for this campaign")
 
     # Count scope
     all_enrollments = await campaign_enrollments_collection.find(
-        {"campaign_id": ObjectId(campaign_id), "smart_campaign_send_day": day, "status": {"$nin": ["archived", "skipped_no_channel"]}},
+        {
+            "account_id": {"$in": [account_id, str(account_id)]},
+            "campaign_id": {"$in": [ObjectId(campaign_id), campaign_id]},
+            "smart_campaign_send_day": day,
+            "status": {"$nin": ["archived", "skipped_no_channel", "cascade_waiting"]},
+        },
         {"_id": 1, "smart_campaign_channel": 1}
     ).to_list(length=5000)
 
@@ -3496,21 +4233,42 @@ async def enrich_and_generate_for_day_endpoint(
 
     # Persist per-channel instructions + toggle on campaign
     now = datetime.utcnow()
-    await campaigns_collection.update_one(
-        {"_id": ObjectId(campaign_id)},
-        {"$set": {
+    updated_campaign = await campaigns_collection.find_one_and_update(
+        {
+            "_id": ObjectId(campaign_id), "account_id": account_id,
+            "message_gen_status": {"$nin": ["queued", "running"]},
+        },
+        {
+            "$set": {
             "per_channel_message_instructions": body.instructions.model_dump(),
             "send_empty_connection_request": body.send_empty_connection_request,
-            "message_gen_status": "running",
+            "message_gen_status": "queued",
             "message_gen_started_at": now,
             "message_gen_completed_at": None,
-        }}
+            },
+            "$inc": {"message_gen_generation": 1},
+        },
+        return_document=ReturnDocument.AFTER,
     )
-
-    background_tasks.add_task(run_enrich_and_generate_for_day, campaign_id, str(account_id), day, body)
+    if updated_campaign is None:
+        raise HTTPException(status_code=409, detail="Campaign changed before work could be queued")
+    from services.enrichment_job_service import enqueue_campaign_day_run
+    try:
+        job = await enqueue_campaign_day_run(
+            account_id=str(account_id), campaign_id=campaign_id, day=day,
+            generation=int(updated_campaign.get("message_gen_generation", 1)),
+            request=body.model_dump(mode="json"),
+        )
+    except Exception:
+        await campaigns_collection.update_one(
+            {"_id": ObjectId(campaign_id), "account_id": account_id},
+            {"$set": {"message_gen_status": "failed", "message_gen_completed_at": datetime.utcnow()}},
+        )
+        raise HTTPException(status_code=503, detail="Could not queue campaign work")
 
     return {
-        "status": "started",
+        "status": "queued",
+        "job_id": str(job.id),
         "day": day,
         "scope": scope,
         "total_prospects": len(all_enrollments),

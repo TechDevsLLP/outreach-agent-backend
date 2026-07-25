@@ -1,7 +1,13 @@
 """
 Conversations Routes - Authenticated inbox API endpoints.
+
+Classification field: the canonical field is `classification` (snake_case) on the
+conversation object. Values: POSITIVE | QUESTION | SOFT_OBJECTION | HARD_OBJECTION
+| OOO | UNSUBSCRIBE. The deprecated `reply_classification` and
+`last_reply_classification` fields should not be relied upon.
 """
 
+import asyncio
 import logging
 from typing import Optional
 from fastapi import APIRouter, HTTPException, Depends, Query
@@ -39,7 +45,7 @@ async def list_conversations(
     )
 
     # Enrich LinkedIn conversations with connection_accepted flag
-    from database import prospects_collection
+    from database import prospect_state_collection
     from bson import ObjectId
     linkedin_convs = [c for c in result.get("conversations", []) if c.get("channel") == "linkedin"]
     if linkedin_convs:
@@ -49,12 +55,17 @@ async def list_conversations(
         except Exception:
             oids = []
         if oids:
+            account_values = [str(account_id), ObjectId(str(account_id))]
             accepted_map = {}
-            async for p in prospects_collection.find(
-                {"_id": {"$in": oids}, "connection_accepted_at": {"$ne": None}},
-                {"connection_accepted_at": 1, "connection_followup_sent_at": 1},
+            async for p in prospect_state_collection.find(
+                {
+                    "account_id": {"$in": account_values},
+                    "prospect_id": {"$in": prospect_ids + oids},
+                    "connection_accepted_at": {"$ne": None},
+                },
+                {"prospect_id": 1, "connection_accepted_at": 1, "connection_followup_sent_at": 1},
             ):
-                accepted_map[str(p["_id"])] = {
+                accepted_map[str(p["prospect_id"])] = {
                     "connection_accepted": True,
                     "followup_sent": p.get("connection_followup_sent_at") is not None,
                 }
@@ -98,18 +109,34 @@ async def get_inbox_stats(account_ctx: dict = Depends(get_account_context)):
     return stats.model_dump()
 
 
+@router.get("/attention-count")
+async def attention_count(account_ctx: dict = Depends(get_account_context)):
+    """Return unread and awaiting-human counts for the bell badge."""
+    account_id = account_ctx["account"]["_id"]
+    from database import conversations_collection
+    account_filter = conversation_service._account_filter(account_id)
+
+    awaiting_human, unread = await asyncio.gather(
+        conversations_collection.count_documents(
+            {**account_filter, "status": "awaiting_human"}
+        ),
+        conversations_collection.count_documents(
+            {**account_filter, "is_read": False}
+        ),
+    )
+    return {"awaiting_human": awaiting_human, "unread": unread}
+
+
 @router.get("/prospect/{prospect_id}")
 async def get_prospect_conversations(
     prospect_id: str,
     account_ctx=Depends(get_account_context),
 ):
     """Get all conversations for a specific prospect."""
-    from database import conversations_collection
-    from bson import ObjectId
     account_id = account_ctx["account"]["_id"]
-    conversations = await conversation_service.get_conversations_for_prospect(prospect_id)
-    # Filter to only conversations belonging to this account
-    conversations = [c for c in conversations if not c.get("account_id") or c.get("account_id") == account_id]
+    conversations = await conversation_service.get_conversations_for_prospect(
+        prospect_id, account_id=account_id
+    )
     return {"conversations": conversations}
 
 
@@ -120,37 +147,43 @@ async def get_conversation(
 ):
     """Get a single conversation with all messages, enriched with prospect connection status."""
     account_id = account_ctx["account"]["_id"]
-    conversation = await conversation_service.get_conversation(conversation_id)
+    conversation = await conversation_service.get_conversation(
+        conversation_id, account_id=account_id
+    )
     if not conversation:
         raise HTTPException(status_code=404, detail="Conversation not found")
-
-    # Verify ownership — allow legacy conversations with no account_id
-    conv_account = conversation.get("account_id")
-    if conv_account and conv_account != account_id:
-        raise HTTPException(status_code=403, detail="Not authorized")
 
     # Enrich with connection status for LinkedIn conversations
     prospect_id = conversation.get("prospect_id")
     if prospect_id and conversation.get("channel") == "linkedin":
-        from database import prospects_collection
-        from bson import ObjectId
-        prospect = await prospects_collection.find_one(
-            {"_id": ObjectId(prospect_id)},
-            {
-                "connection_accepted_at": 1,
-                "connection_followup_sent_at": 1,
-                "connection_request_sent_at": 1,
-            },
+        from services.prospect_activity_state_service import get_prospect_activity
+        prospect = await get_prospect_activity(
+            account_id=account_id, prospect_id=prospect_id,
         )
         if prospect:
             conversation["connection_accepted_at"] = prospect.get("connection_accepted_at")
             conversation["connection_followup_sent_at"] = prospect.get("connection_followup_sent_at")
             conversation["connection_request_sent_at"] = prospect.get("connection_request_sent_at")
-            # Include pre-built followup message if accepted but not yet sent
+            # Accepted but no follow-up sent yet: surface an editable draft of the
+            # next queued touch so the user can review/edit the exact copy the
+            # campaign is about to send. Fail-soft — a draft is a nice-to-have and
+            # must never take down the conversation view.
             if prospect.get("connection_accepted_at") and not prospect.get("connection_followup_sent_at"):
-                from services.connection_tracker_service import _build_followup_message
-                first_name = conversation.get("prospect_name", "there").split()[0]
-                conversation["suggested_followup"] = _build_followup_message(first_name)
+                try:
+                    from services.campaign_message_generator_service import (
+                        get_pending_followup_draft,
+                    )
+                    draft = await get_pending_followup_draft(
+                        account_id=account_id, prospect_id=prospect_id
+                    )
+                    if draft:
+                        conversation["suggested_followup"] = draft.get("body") or ""
+                        conversation["suggested_followup_draft"] = draft
+                except Exception as e:
+                    logger.warning(
+                        "Failed to build follow-up draft for conversation %s: %s",
+                        conversation_id, e,
+                    )
 
     return conversation
 
@@ -162,15 +195,9 @@ async def mark_conversation_read(
 ):
     """Mark a conversation as read."""
     account_id = account_ctx["account"]["_id"]
-    # Verify ownership before marking read
-    from database import conversations_collection
-    from bson import ObjectId
-    conv = await conversations_collection.find_one(
-        {"_id": ObjectId(conversation_id)}, {"account_id": 1}
+    success = await conversation_service.mark_conversation_read(
+        conversation_id, account_id=account_id
     )
-    if conv and conv.get("account_id") and conv["account_id"] != account_id:
-        raise HTTPException(status_code=403, detail="Not authorized")
-    success = await conversation_service.mark_conversation_read(conversation_id)
     if not success:
         raise HTTPException(status_code=404, detail="Conversation not found")
     return {"status": "ok"}
@@ -183,20 +210,13 @@ async def reply_to_conversation(
 ):
     """Send a reply in an existing conversation (dispatches to email or LinkedIn)."""
     account_id = account_ctx["account"]["_id"]
-    # Verify ownership before sending reply
-    from database import conversations_collection
-    from bson import ObjectId
-    conv = await conversations_collection.find_one(
-        {"_id": ObjectId(payload.conversation_id)}, {"account_id": 1}
-    )
-    if conv and conv.get("account_id") and conv["account_id"] != account_id:
-        raise HTTPException(status_code=403, detail="Not authorized")
     try:
         result = await conversation_service.send_reply(
             conversation_id=payload.conversation_id,
             content_text=payload.content_text,
             content_html=payload.content_html,
             subject=payload.subject,
+            account_id=account_id,
         )
         return result
     except ValueError as e:
@@ -230,6 +250,76 @@ async def compose_new_message(
         raise HTTPException(status_code=500, detail=f"Failed to compose message: {str(e)}")
 
 
+class MailboxDraftRequest(BaseModel):
+    content_text: str
+    content_html: Optional[str] = None
+    subject: Optional[str] = None
+
+
+@router.post("/{conversation_id}/mailbox-draft")
+async def create_conversation_mailbox_draft(
+    conversation_id: str,
+    payload: MailboxDraftRequest,
+    account_ctx: dict = Depends(get_account_context),
+):
+    """
+    Create a native mailbox draft (Gmail/Zoho/IMAP Drafts folder), threaded to
+    this conversation. This writes directly into the connected mailbox — distinct
+    from the in-app AI draft (ai_draft_reply) below.
+    """
+    account_id = account_ctx["account"]["_id"]
+    from database import prospects_collection
+    from bson import ObjectId
+
+    conversation = await conversation_service.get_conversation(
+        conversation_id, account_id=account_id
+    )
+    if not conversation:
+        raise HTTPException(status_code=404, detail="Conversation not found")
+    if conversation.get("channel") != "email":
+        raise HTTPException(status_code=400, detail="Mailbox drafts are only supported for email conversations")
+
+    to_email = conversation.get("prospect_email")
+    if not to_email:
+        prospect_id = conversation.get("prospect_id")
+        if prospect_id:
+            try:
+                prospect = await prospects_collection.find_one({"_id": ObjectId(prospect_id)})
+            except Exception:
+                prospect = None
+            to_email = (prospect or {}).get("email")
+    if not to_email:
+        raise HTTPException(status_code=400, detail="No email address for this conversation")
+
+    subject = payload.subject or conversation.get("email_thread_subject", "Re: Following up")
+    if not subject.startswith("Re:"):
+        subject = f"Re: {subject}"
+
+    in_reply_to = None
+    for m in reversed(conversation.get("messages", [])):
+        if m.get("email_message_id"):
+            in_reply_to = m["email_message_id"]
+            break
+
+    from services.email_delivery_service import create_mailbox_draft, resolve_email_thread_context
+    thread_ctx = await resolve_email_thread_context(conversation)
+    email_account = thread_ctx["email_account"]
+    if not email_account:
+        raise HTTPException(status_code=400, detail="No connected email account available to draft from")
+
+    result = await create_mailbox_draft(
+        email_account,
+        to_email,
+        subject,
+        payload.content_html or payload.content_text,
+        in_reply_to=in_reply_to or thread_ctx.get("provider_message_id"),
+        thread_ref=thread_ctx.get("thread_ref"),
+    )
+    if result is None:
+        raise HTTPException(status_code=502, detail="Draft creation failed — check provider credentials/logs")
+    return {"success": True, "draft_id": result.get("draft_id"), "provider": result.get("provider")}
+
+
 from services.ai_reply_service import (
     regenerate_reply_draft,
     approve_draft,
@@ -248,16 +338,11 @@ async def get_ai_draft(
 ):
     """Get the current AI draft reply for a conversation."""
     account_id = account_ctx["account"]["_id"]
-    from database import conversations_collection
-    from bson import ObjectId
-    conversation = await conversations_collection.find_one(
-        {"_id": ObjectId(conversation_id)},
-        {"ai_draft_reply": 1, "account_id": 1},
+    conversation = await conversation_service.get_conversation(
+        conversation_id, account_id=account_id
     )
     if not conversation:
         raise HTTPException(status_code=404, detail="Conversation not found")
-    if conversation.get("account_id") and conversation["account_id"] != account_id:
-        raise HTTPException(status_code=403, detail="Not authorized")
     return {"draft": conversation.get("ai_draft_reply")}
 
 
@@ -267,8 +352,11 @@ async def regenerate_draft_endpoint(
     account_ctx: dict = Depends(get_account_context),
 ):
     """Regenerate the AI draft reply."""
+    account_id = account_ctx["account"]["_id"]
+    if not await conversation_service.get_conversation(conversation_id, account_id=account_id):
+        raise HTTPException(status_code=404, detail="Conversation not found")
     try:
-        draft = await regenerate_reply_draft(conversation_id)
+        draft = await regenerate_reply_draft(conversation_id, account_id)
         return {"draft": draft}
     except ValueError as e:
         raise HTTPException(status_code=400, detail=str(e))
@@ -281,8 +369,15 @@ async def approve_draft_endpoint(
     account_ctx: dict = Depends(get_account_context),
 ):
     """Approve (and optionally edit) the AI draft, then send it."""
+    account_id = account_ctx["account"]["_id"]
+    if not await conversation_service.get_conversation(conversation_id, account_id=account_id):
+        raise HTTPException(status_code=404, detail="Conversation not found")
     try:
-        result = await approve_draft(conversation_id, request.edited_text)
+        result = await approve_draft(
+            conversation_id,
+            request.edited_text,
+            account_id=account_id,
+        )
         return result
     except ValueError as e:
         raise HTTPException(status_code=400, detail=str(e))
@@ -294,7 +389,8 @@ async def reject_draft_endpoint(
     account_ctx: dict = Depends(get_account_context),
 ):
     """Reject the AI draft."""
-    result = await reject_draft(conversation_id)
+    account_id = account_ctx["account"]["_id"]
+    if not await conversation_service.get_conversation(conversation_id, account_id=account_id):
+        raise HTTPException(status_code=404, detail="Conversation not found")
+    result = await reject_draft(conversation_id, account_id)
     return result
-
-
