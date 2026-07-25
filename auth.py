@@ -91,6 +91,34 @@ def _cookie_max_age(ttl_minutes: int | None = None) -> int:
     return int(60 * (ttl_minutes or settings.jwt_expiry_minutes))
 
 
+def _cookie_samesite() -> str:
+    """SameSite policy for the session cookies.
+
+    "lax" is right when the browser app and the API share a site. When they do
+    not — an Amplify frontend calling an API on a different domain, say — a Lax
+    cookie is silently dropped by the browser on cross-site XHR, so login
+    appears to succeed and every subsequent request 401s. Those deployments set
+    COOKIE_SAMESITE=none.
+
+    "none" is only honoured alongside Secure, which browsers require and which
+    production already enforces; CSRF protection then rests on the double-submit
+    token and the CORS origin allowlist rather than on SameSite.
+    """
+    value = (getattr(settings, "cookie_samesite", "lax") or "lax").strip().lower()
+    if value not in {"lax", "strict", "none"}:
+        return "lax"
+    if value == "none" and not _cookie_secure():
+        # Browsers reject SameSite=None without Secure. Fail closed rather than
+        # emit a cookie the browser will discard.
+        return "lax"
+    return value
+
+
+def _admin_cookie_samesite() -> str:
+    """Admin cookie policy: Strict normally, relaxed only when cross-site."""
+    return "none" if _cookie_samesite() == "none" else "strict"
+
+
 def set_session_cookies(
     response: Response,
     token: str,
@@ -104,6 +132,7 @@ def set_session_cookies(
     JavaScript-readable cookie and is not an authentication credential.
     """
     secure = _cookie_secure()
+    samesite = _cookie_samesite()
     max_age = _cookie_max_age(ttl_minutes)
     response.set_cookie(
         SESSION_COOKIE_NAME,
@@ -111,7 +140,7 @@ def set_session_cookies(
         max_age=max_age,
         httponly=True,
         secure=secure,
-        samesite="lax",
+        samesite=samesite,
         path="/",
     )
     if admin_token is not None:
@@ -121,7 +150,7 @@ def set_session_cookies(
             max_age=max_age,
             httponly=True,
             secure=secure,
-            samesite="strict",
+            samesite=_admin_cookie_samesite(),
             path="/",
         )
     csrf_token = secrets.token_urlsafe(32)
@@ -131,7 +160,7 @@ def set_session_cookies(
         max_age=max_age,
         httponly=False,
         secure=secure,
-        samesite="lax",
+        samesite=samesite,
         path="/",
     )
     return csrf_token
@@ -140,9 +169,9 @@ def set_session_cookies(
 def clear_session_cookies(response: Response) -> None:
     secure = _cookie_secure()
     for name, httponly, samesite in (
-        (SESSION_COOKIE_NAME, True, "lax"),
-        (ADMIN_SESSION_COOKIE_NAME, True, "strict"),
-        (CSRF_COOKIE_NAME, False, "lax"),
+        (SESSION_COOKIE_NAME, True, _cookie_samesite()),
+        (ADMIN_SESSION_COOKIE_NAME, True, _admin_cookie_samesite()),
+        (CSRF_COOKIE_NAME, False, _cookie_samesite()),
     ):
         response.delete_cookie(
             name,
@@ -159,7 +188,7 @@ def clear_admin_session_cookie(response: Response) -> None:
         path="/",
         secure=_cookie_secure(),
         httponly=True,
-        samesite="strict",
+        samesite=_admin_cookie_samesite(),
     )
 
 

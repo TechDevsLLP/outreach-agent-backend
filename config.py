@@ -101,6 +101,12 @@ class Settings(BaseSettings):
     # Local HTTP development keeps this false. Production forces Secure in
     # auth._cookie_secure regardless of this override.
     session_cookie_secure: bool = False
+    # SameSite policy for the session cookies: "lax" | "strict" | "none".
+    # Deployments where the browser app and the API are on different sites
+    # (an Amplify frontend calling an API on another domain) must use "none",
+    # or the browser drops the cookie on cross-site XHR and every authenticated
+    # request 401s. Only honoured with Secure cookies; see auth._cookie_samesite.
+    cookie_samesite: str = "lax"
     # Super admin (platform-level) — single email allowlist
     super_admin_email: str | None = None  # set SUPER_ADMIN_EMAIL in .env
 
