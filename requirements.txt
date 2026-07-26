@@ -34,3 +34,4 @@ aiosmtplib==5.1.2
 cryptography==46.0.3
 slowapi==0.1.9
 json-repair==0.61.2
+google-genai==1.55.0
