@@ -443,7 +443,12 @@ async def send_reply(
                 content_html or content_text,
                 thread_ref=thread_ctx.get("thread_ref"),
                 provider_message_id=thread_ctx.get("provider_message_id"),
-                in_reply_to=in_reply_to or thread_ctx.get("provider_message_id"),
+                # Only ever an RFC Message-ID. thread_ctx.provider_message_id is
+                # the provider's own id (Gmail's "19f9..."), which is not a valid
+                # In-Reply-To value; sending it produces a malformed header that
+                # no client can thread on. Gmail threads via threadId anyway, and
+                # for other providers omitting the header beats corrupting it.
+                in_reply_to=in_reply_to,
                 prospect_id=prospect_id,
             )
             if not result:

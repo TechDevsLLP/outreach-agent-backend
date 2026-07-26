@@ -17,6 +17,24 @@ from services.conversation_service import _account_filter
 from services.email_providers import get_provider
 from utils.email_html import build_email_bodies
 
+
+def _id_variants(value) -> list:
+    """Both id representations, for collections that disagree on the type.
+
+    campaign_messages stores prospect_id as an ObjectId while conversations
+    store it as a string, so an exact-type match silently finds nothing.
+    """
+    if value is None:
+        return []
+    variants: list = [str(value)]
+    try:
+        oid = value if isinstance(value, ObjectId) else ObjectId(str(value))
+        if oid not in variants:
+            variants.append(oid)
+    except Exception:
+        pass
+    return variants
+
 logger = logging.getLogger(__name__)
 
 
@@ -178,11 +196,40 @@ async def resolve_email_thread_context(conversation: dict) -> dict:
     account_id = conversation.get("account_id")
     result = {"email_account": None, "thread_ref": None, "provider_message_id": None}
 
-    if prospect_id:
+    # The conversation is the durable record of the thread. Prefer it over
+    # campaign_messages, which is scoped to a campaign and deleted along with
+    # it — losing the thread handle there made every later reply start a brand
+    # new email thread with the prospect.
+    conv_thread_ref = conversation.get("provider_thread_id") or conversation.get("gmail_thread_id")
+    if conv_thread_ref:
+        result["thread_ref"] = str(conv_thread_ref)
+
+    # Reply to the newest message actually in the thread, whichever side sent
+    # it, so the In-Reply-To target is the message we are responding to.
+    for msg in reversed(conversation.get("messages") or []):
+        provider_msg_id = msg.get("provider_message_id") or msg.get("email_message_id")
+        if provider_msg_id:
+            result["provider_message_id"] = str(provider_msg_id)
+            break
+
+    conv_provider_account = conversation.get("provider_account_id")
+    if conv_provider_account:
+        try:
+            acct = await database.email_accounts_collection.find_one(
+                {"_id": ObjectId(str(conv_provider_account))}
+            )
+            if acct:
+                result["email_account"] = acct
+        except Exception:
+            pass
+
+    if prospect_id and not (result["thread_ref"] and result["email_account"]):
         last_msg = await database.campaign_messages_collection.find_one(
             {
                 **_account_filter(account_id),
-                "prospect_id": str(prospect_id),
+                # prospect_id is written as an ObjectId by campaign_engine but
+                # arrives here as a string from the conversation, so match both.
+                "prospect_id": {"$in": _id_variants(prospect_id)},
                 "channel": "email",
                 "direction": "outbound",
                 "email_account_id": {"$ne": None},
@@ -190,10 +237,16 @@ async def resolve_email_thread_context(conversation: dict) -> dict:
             sort=[("sent_at", -1)],
         )
         if last_msg:
-            result["thread_ref"] = last_msg.get("provider_thread_id") or last_msg.get("gmail_thread_id")
-            result["provider_message_id"] = last_msg.get("provider_message_id")
+            # Fill only what the conversation could not supply; never overwrite
+            # the thread handle the conversation already established.
+            if not result["thread_ref"]:
+                result["thread_ref"] = (
+                    last_msg.get("provider_thread_id") or last_msg.get("gmail_thread_id")
+                )
+            if not result["provider_message_id"]:
+                result["provider_message_id"] = last_msg.get("provider_message_id")
             raw_id = last_msg.get("email_account_id")
-            if raw_id:
+            if raw_id and result["email_account"] is None:
                 try:
                     oid = raw_id if isinstance(raw_id, ObjectId) else ObjectId(str(raw_id))
                     acct = await database.email_accounts_collection.find_one({"_id": oid})
