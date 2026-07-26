@@ -1151,15 +1151,60 @@ async def run_fast_discovery(campaign_id: str, account_id: str, generation: int 
             logger.info(f"[fast:{campaign_id}] Stage B: sourcing ~{_want} companies (gap={_gap})")
 
             # Structured hard-requirement hints from canonical ICP → tighter Gemini results.
+            # ALWAYS derive these when possible — previously this block only fired off
+            # the campaign's canonical icp_industries/icp_country_codes/size fields, so
+            # a campaign with only a free-text icp_prompt (no canonical fields) sourced
+            # with zero hard industry/size/geo filters and let wrong-fit companies in.
             _hint_lines: list[str] = []
-            if campaign.get("icp_industries"):
-                _hint_lines.append(f"- Industry must be one of: {', '.join(campaign['icp_industries'][:8])}")
+
+            _industry_labels = list(campaign.get("icp_industries") or [])
+            if not _industry_labels and campaign.get("industry_ids"):
+                # Fall back to the canonical industry_ids resolved by _canonicalize_icp
+                # above (from icp_industry / other campaign fields) and translate them
+                # back to human-readable labels for the sourcing prompt.
+                try:
+                    from services.industry_canonicalizer import get_taxonomy_entry
+                    for _iid in campaign["industry_ids"][:8]:
+                        _entry = get_taxonomy_entry(_iid)
+                        _label = (_entry or {}).get("label") if _entry else None
+                        if _label:
+                            _industry_labels.append(_label)
+                except Exception as _il_e:
+                    logger.warning(f"[fast:{campaign_id}] industry label lookup for hints failed: {_il_e}")
+            if _industry_labels:
+                _hint_lines.append(f"- Industry must be one of: {', '.join(_industry_labels[:8])}")
+
+            # _icp_country_codes already reflects the lazily-canonicalized
+            # campaign["country_codes"] (derived above from icp_countries /
+            # icp_locations / free text when canonical fields were missing).
             if _icp_country_codes:
                 _hint_lines.append(f"- Headquarters country code must be one of: {', '.join(_icp_country_codes[:8])}")
-            if campaign.get("icp_company_size_min") or campaign.get("icp_company_size_max"):
+
+            _size_min = campaign.get("icp_company_size_min")
+            _size_max = campaign.get("icp_company_size_max")
+            if not _size_min and not _size_max and campaign.get("employee_bands"):
+                # Fall back to the canonical employee_bands derived above (e.g. from
+                # free-text company-size phrases) and translate the widest span into
+                # an approximate min/max headcount for the prompt.
+                _BAND_RANGES = {
+                    "1-10": (1, 10), "11-50": (11, 50), "51-200": (51, 200),
+                    "201-1000": (201, 1000), "1000+": (1000, None),
+                }
+                _bands = [_BAND_RANGES[b] for b in campaign["employee_bands"] if b in _BAND_RANGES]
+                if _bands:
+                    _size_min = min(b[0] for b in _bands)
+                    _maxes = [b[1] for b in _bands]
+                    _size_max = None if any(m is None for m in _maxes) else max(_maxes)
+            if _size_min or _size_max:
                 _hint_lines.append(
-                    f"- Employee count between {campaign.get('icp_company_size_min') or 1} "
-                    f"and {campaign.get('icp_company_size_max') or '10000+'}"
+                    f"- Employee count between {_size_min or 1} and {_size_max or '10000+'}"
+                )
+
+            if not _hint_lines:
+                logger.warning(
+                    f"[fast:{campaign_id}] Stage B sourcing: no structured industry/geo/size "
+                    f"hints could be derived (canonical + free-text fields both empty) — "
+                    f"running with free-text icp_prompt only, no hard filters"
                 )
             _structured_hints = "\n".join(_hint_lines) or None
 
@@ -2826,20 +2871,41 @@ def _gate_and_select(
     # wrong function is a hard no; only title/seniority ambiguity may relax.
     _RELAXABLE = {"no_title_or_seniority_match"}
 
+    # Whether the campaign actually specifies title/seniority criteria for
+    # the deterministic gate to match against. When it doesn't (title gate
+    # effectively disabled / no targets), person_fit_gate's title-or-
+    # seniority sub-gate trivially passes everyone — that's NOT a real
+    # "title gate passed" and must not bypass the score floor below.
+    _has_title_criteria = bool(
+        [x for x in (campaign.get("icp_job_titles") or []) if x and str(x).strip()]
+    ) or bool(campaign.get("icp_seniority_levels") or campaign.get("seniorities"))
+
     for t, sc in candidates:
         if not (t.get("linkedin") or t.get("email")):
             stats["no_contact"] += 1
             continue
-        if (t.get("fit_score") or 0) < _EMPLOYEE_SCORE_THRESHOLD:
-            stats["below_score"] += 1
-            continue
         ok, reason = person_fit_gate(t, campaign)
-        if ok:
-            kept.append((t, sc))
-        else:
+        if not ok:
             stats[reason] = stats.get(reason, 0) + 1
             if reason in _RELAXABLE:
                 relaxable_rejects.append((t, sc))
+            continue
+        # title_gate_passed: this prospect matched the campaign's title/
+        # seniority/function targets deterministically (and its company
+        # already passed company_gate_service upstream, since `sc` only
+        # exists for approved companies). Stamped on the prospect dict so
+        # it survives the upsert into prospects_collection and can be read
+        # later by campaign_launch_service.plan_channel_assignments — a
+        # title-gate pass must not be silently dropped by the score floor,
+        # even though scoring still runs for ranking/prioritization. When
+        # the campaign has no title/seniority criteria, the gate isn't
+        # really "passed" in this sense, so the floor still applies.
+        title_gate_passed = ok and _has_title_criteria
+        t["title_gate_passed"] = title_gate_passed
+        if not title_gate_passed and (t.get("fit_score") or 0) < _EMPLOYEE_SCORE_THRESHOLD:
+            stats["below_score"] += 1
+            continue
+        kept.append((t, sc))
 
     stats["kept_strict"] = len(kept)
 

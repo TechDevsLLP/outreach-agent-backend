@@ -180,10 +180,9 @@ def plan_channel_assignments(
 
     # Channel-planning enrollment floor. When a caller doesn't pass min_score,
     # use the same per-campaign override + 25 default that finalize_channel_plan
-    # applies — NOT settings.min_score_to_enroll (55), which is the discovery
-    # *pool* floor, a different concept. Keeping them separate stops callers that
-    # omit min_score (e.g. replan_channels_on_sender_add) from silently dropping
-    # every prospect scoring 25–54.
+    # applies. Keeping this explicit stops callers that omit min_score (e.g.
+    # replan_channels_on_sender_add) from silently dropping every prospect
+    # scoring below the campaign's own floor.
     _min_enroll = (
         min_score if min_score is not None
         else float(campaign.get("discovery_min_enroll_score") or 25)
@@ -226,7 +225,12 @@ def plan_channel_assignments(
             skip_reasons["terminal_status"] = skip_reasons.get("terminal_status", 0) + 1
             continue
         p_fit = prospect.get("ai_prospect_score") or prospect.get("fit_score") or get_score(enrollment)
-        if p_fit < _min_enroll:
+        # A prospect that passed the deterministic title/seniority gate
+        # during curated discovery (stamped as `title_gate_passed` on the
+        # prospect doc — see curated_discovery_service._gate_and_select)
+        # must not be dropped merely for scoring below the floor. Scoring
+        # still runs and still drives ranking/channel priority above.
+        if p_fit < _min_enroll and not prospect.get("title_gate_passed"):
             skip_reasons["below_min_score"] = skip_reasons.get("below_min_score", 0) + 1
             continue
         has_email = bool(prospect.get("email")) and has_email_account

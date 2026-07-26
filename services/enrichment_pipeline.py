@@ -1387,95 +1387,140 @@ async def _phase_competitors(prospects: list[dict], stats: dict) -> tuple[list[d
     semaphore = asyncio.Semaphore(3)
     shared_client = OpenRouterClient()
 
+    # In-run per-company memo: the companies_collection "claim" below already
+    # prevents duplicate Perplexity/Gemini calls across processes/runs, but a
+    # losing prospect just re-reads whatever is on the doc at that instant and
+    # bails — if the winning prospect for the same company hasn't finished yet
+    # (likely with up to 2 prospects/company scheduled concurrently), the loser
+    # gets nothing. A per-company asyncio.Lock scoped to THIS run's prospect
+    # list closes that gap: only the first prospect for a company does any
+    # DB/API work at all; every other same-company prospect in this run waits
+    # on the lock and then reuses the in-memory result, guaranteeing at most
+    # one research call per company per run and no missed data for losers.
+    company_locks: dict[str, asyncio.Lock] = {}
+    company_result_cache: dict[str, list[dict]] = {}
+
+    def _company_key(prospect: dict) -> str | None:
+        company_linkedin = prospect.get("company_linkedin")
+        if company_linkedin:
+            return f"li:{company_linkedin}"
+        company_name = (prospect.get("company_name") or "").strip().lower()
+        return f"name:{company_name}" if company_name else None
+
     try:
         async def _research_one(prospect: dict):
-            async with semaphore:
-                comp_doc = None
-                claimed_id = None
-                try:
-                    company_name = prospect.get("company_name")
-                    industry = prospect.get("industry")
+            company_name = prospect.get("company_name")
+            if not company_name:
+                return
 
-                    if not company_name:
-                        return
+            key = _company_key(prospect)
+            lock = company_locks.setdefault(key, asyncio.Lock()) if key else None
 
-                    # Resolve the company doc for dedup check + storage
-                    company_linkedin = prospect.get("company_linkedin")
-                    if company_linkedin:
-                        comp_doc = await companies_collection.find_one({"linkedin_url": company_linkedin})
+            async def _do_research():
+                async with semaphore:
+                    comp_doc = None
+                    claimed_id = None
+                    try:
+                        industry = prospect.get("industry")
 
-                    # Reuse fresh competitors from company doc if available (< 30 days old)
-                    if comp_doc and comp_doc.get("competitors"):
-                        fetched_at = comp_doc.get("competitors_last_fetched")
-                        if fetched_at and (datetime.utcnow() - fetched_at).days < 30:
-                            prospect["competitors"] = comp_doc["competitors"]
-                            logger.info(f"Reusing cached competitors for {company_name} from company doc")
-                            return
+                        # Resolve the company doc for dedup check + storage
+                        company_linkedin = prospect.get("company_linkedin")
+                        if company_linkedin:
+                            comp_doc = await companies_collection.find_one({"linkedin_url": company_linkedin})
 
-                    # Atomic claim: multiple prospects at the same company would
-                    # otherwise all pass the freshness check above concurrently
-                    # and each pay for a Perplexity call. Only the claim winner
-                    # calls out; everyone else waits for its result.
-                    if comp_doc:
-                        claim_now = datetime.utcnow()
-                        claim = await companies_collection.find_one_and_update(
-                            {
-                                "_id": comp_doc["_id"],
-                                "$or": [
-                                    {"competitors_fetching_at": {"$exists": False}},
-                                    {"competitors_fetching_at": {"$lt": claim_now - _CLAIM_STALE_AFTER}},
-                                ],
-                            },
-                            {"$set": {"competitors_fetching_at": claim_now}},
-                        )
-                        if claim is None:
-                            latest = await companies_collection.find_one(
-                                {"_id": comp_doc["_id"]}, {"competitors": 1}
+                        # Reuse fresh competitors from company doc if available (< 30 days old)
+                        if comp_doc and comp_doc.get("competitors"):
+                            fetched_at = comp_doc.get("competitors_last_fetched")
+                            if fetched_at and (datetime.utcnow() - fetched_at).days < 30:
+                                prospect["competitors"] = comp_doc["competitors"]
+                                logger.info(f"Reusing cached competitors for {company_name} from company doc")
+                                return comp_doc["competitors"]
+
+                        # Atomic claim (cross-run/cross-process safety net): multiple
+                        # prospects at the same company would otherwise all pass the
+                        # freshness check above concurrently and each pay for a call.
+                        # Only the claim winner calls out; everyone else waits for its
+                        # result. Within THIS run the per-company lock above already
+                        # guarantees only one prospect ever reaches this point per
+                        # company, so this mainly guards against other concurrent
+                        # enrichment runs / worker restarts.
+                        if comp_doc:
+                            claim_now = datetime.utcnow()
+                            claim = await companies_collection.find_one_and_update(
+                                {
+                                    "_id": comp_doc["_id"],
+                                    "$or": [
+                                        {"competitors_fetching_at": {"$exists": False}},
+                                        {"competitors_fetching_at": {"$lt": claim_now - _CLAIM_STALE_AFTER}},
+                                    ],
+                                },
+                                {"$set": {"competitors_fetching_at": claim_now}},
                             )
-                            if latest and latest.get("competitors"):
-                                prospect["competitors"] = latest["competitors"]
-                            return
-                        claimed_id = comp_doc["_id"]
+                            if claim is None:
+                                latest = await companies_collection.find_one(
+                                    {"_id": comp_doc["_id"]}, {"competitors": 1}
+                                )
+                                if latest and latest.get("competitors"):
+                                    prospect["competitors"] = latest["competitors"]
+                                    return latest["competitors"]
+                                return []
+                            claimed_id = comp_doc["_id"]
 
-                    # Website fallback chain: prospect.company_website → company_domain → company doc
-                    website = (
-                        prospect.get("company_website")
-                        or prospect.get("company_domain")
-                    )
-                    if not website and comp_doc:
-                        website = comp_doc.get("website") or comp_doc.get("domain")
+                        # Website fallback chain: prospect.company_website → company_domain → company doc
+                        website = (
+                            prospect.get("company_website")
+                            or prospect.get("company_domain")
+                        )
+                        if not website and comp_doc:
+                            website = comp_doc.get("website") or comp_doc.get("domain")
 
-                    competitors = await research_competitors(
-                        company_name, website, industry, limit=3, client=shared_client
-                    )
-
-                    # Store competitors on the company doc (one Perplexity call per company)
-                    if comp_doc and competitors:
-                        await companies_collection.update_one(
-                            {"_id": comp_doc["_id"]},
-                            {"$set": {
-                                "competitors": competitors,
-                                "competitors_last_fetched": datetime.utcnow(),
-                            }}
+                        competitors = await research_competitors(
+                            company_name, website, industry, limit=3, client=shared_client
                         )
 
-                    prospect["competitors"] = competitors
-
-                    if competitors:
-                        stats["competitors_researched"] += 1
-
-                    logger.info(f"Competitor research completed for {company_name}: {len(competitors)} competitors")
-
-                except Exception as e:
-                    logger.error(f"Competitor research failed for prospect {prospect.get('email')}: {e}", exc_info=True)
-                finally:
-                    if claimed_id is not None:
-                        try:
+                        # Store competitors on the company doc (one call per company)
+                        if comp_doc and competitors:
                             await companies_collection.update_one(
-                                {"_id": claimed_id}, {"$unset": {"competitors_fetching_at": ""}}
+                                {"_id": comp_doc["_id"]},
+                                {"$set": {
+                                    "competitors": competitors,
+                                    "competitors_last_fetched": datetime.utcnow(),
+                                }}
                             )
-                        except Exception:
-                            pass
+
+                        prospect["competitors"] = competitors
+
+                        if competitors:
+                            stats["competitors_researched"] += 1
+
+                        logger.info(f"Competitor research completed for {company_name}: {len(competitors)} competitors")
+                        return competitors
+
+                    except Exception as e:
+                        logger.error(f"Competitor research failed for prospect {prospect.get('email')}: {e}", exc_info=True)
+                        return []
+                    finally:
+                        if claimed_id is not None:
+                            try:
+                                await companies_collection.update_one(
+                                    {"_id": claimed_id}, {"$unset": {"competitors_fetching_at": ""}}
+                                )
+                            except Exception:
+                                pass
+
+            if lock is None:
+                await _do_research()
+                return
+
+            async with lock:
+                if key in company_result_cache:
+                    cached = company_result_cache[key]
+                    if cached:
+                        prospect["competitors"] = cached
+                        logger.info(f"Reusing in-run competitors for {company_name} (already researched this run)")
+                    return
+                result = await _do_research()
+                company_result_cache[key] = result or []
 
         await asyncio.gather(*[_research_one(p) for p in prospects])
     finally:
@@ -1500,94 +1545,129 @@ async def _phase_news(prospects: list[dict], stats: dict) -> tuple[list[dict], d
     semaphore = asyncio.Semaphore(3)
     shared_client = OpenRouterClient()
 
+    # In-run per-company memo — same rationale as _phase_competitors: the
+    # companies_collection claim below only prevents duplicate calls, it
+    # doesn't make a losing prospect WAIT for the winner's result within this
+    # run (it just re-reads whatever's on the doc right then, which may still
+    # be empty). A per-company asyncio.Lock scoped to this run's prospect list
+    # ensures only the first prospect per company does the DB/API work, and
+    # every other same-company prospect reuses that in-memory result — at most
+    # one news call per company per run, with correct data for every prospect.
+    company_locks: dict[str, asyncio.Lock] = {}
+    company_result_cache: dict[str, list[dict]] = {}
+
+    def _company_key(prospect: dict) -> str | None:
+        company_linkedin = prospect.get("company_linkedin")
+        if company_linkedin:
+            return f"li:{company_linkedin}"
+        company_name = (prospect.get("company_name") or "").strip().lower()
+        return f"name:{company_name}" if company_name else None
+
+    async def _mirror_news_to_prospect(prospect: dict, news: list[dict], fetched_at: datetime) -> None:
+        prospect["company_news"] = news
+        await prospects_collection.update_one(
+            {"_id": prospect["_id"]},
+            {"$set": {"company_news": news, "news_last_fetched": fetched_at}},
+        )
+
     try:
         async def _research_one(prospect: dict):
-            async with semaphore:
-                comp_doc = None
-                claimed_id = None
-                try:
-                    company_name = prospect.get("company_name")
-                    if not company_name:
-                        return
+            company_name = prospect.get("company_name")
+            if not company_name:
+                return
 
-                    company_linkedin = prospect.get("company_linkedin")
-                    if company_linkedin:
-                        comp_doc = await companies_collection.find_one({"linkedin_url": company_linkedin})
+            key = _company_key(prospect)
+            lock = company_locks.setdefault(key, asyncio.Lock()) if key else None
 
-                    now = datetime.utcnow()
+            async def _do_research():
+                async with semaphore:
+                    comp_doc = None
+                    claimed_id = None
+                    try:
+                        company_linkedin = prospect.get("company_linkedin")
+                        if company_linkedin:
+                            comp_doc = await companies_collection.find_one({"linkedin_url": company_linkedin})
 
-                    # Reuse fresh news from the company doc if available (< 14 days old)
-                    if comp_doc and comp_doc.get("news"):
-                        fetched_at = comp_doc.get("news_last_fetched")
-                        if fetched_at and (now - fetched_at).days < 14:
-                            prospect["company_news"] = comp_doc["news"]
-                            await prospects_collection.update_one(
-                                {"_id": prospect["_id"]},
-                                {"$set": {"company_news": comp_doc["news"], "news_last_fetched": fetched_at}},
-                            )
-                            logger.info(f"Reusing cached news for {company_name} from company doc")
-                            return
+                        now = datetime.utcnow()
 
-                    # Atomic claim: multiple prospects at the same company would
-                    # otherwise all pass the freshness check above concurrently
-                    # and each pay for a Perplexity call.
-                    if comp_doc:
-                        claim = await companies_collection.find_one_and_update(
-                            {
-                                "_id": comp_doc["_id"],
-                                "$or": [
-                                    {"news_fetching_at": {"$exists": False}},
-                                    {"news_fetching_at": {"$lt": now - _CLAIM_STALE_AFTER}},
-                                ],
-                            },
-                            {"$set": {"news_fetching_at": now}},
-                        )
-                        if claim is None:
-                            latest = await companies_collection.find_one(
-                                {"_id": comp_doc["_id"]}, {"news": 1}
-                            )
-                            if latest and latest.get("news"):
-                                prospect["company_news"] = latest["news"]
-                                await prospects_collection.update_one(
-                                    {"_id": prospect["_id"]},
-                                    {"$set": {"company_news": latest["news"], "news_last_fetched": now}},
-                                )
-                            return
-                        claimed_id = comp_doc["_id"]
+                        # Reuse fresh news from the company doc if available (< 14 days old)
+                        if comp_doc and comp_doc.get("news"):
+                            fetched_at = comp_doc.get("news_last_fetched")
+                            if fetched_at and (now - fetched_at).days < 14:
+                                await _mirror_news_to_prospect(prospect, comp_doc["news"], fetched_at)
+                                logger.info(f"Reusing cached news for {company_name} from company doc")
+                                return comp_doc["news"]
 
-                    news = await research_company_news(company_name, limit=5, days_back=90, client=shared_client)
-
-                    if news:
-                        fetched_now = datetime.utcnow()
-                        prospect["company_news"] = news
-                        await prospects_collection.update_one(
-                            {"_id": prospect["_id"]},
-                            {"$set": {
-                                "company_news": news,
-                                "news_last_fetched": fetched_now,
-                            }}
-                        )
+                        # Atomic claim (cross-run/cross-process safety net — within
+                        # THIS run the per-company lock above already guarantees only
+                        # one prospect reaches this point per company).
                         if comp_doc:
-                            await companies_collection.update_one(
-                                {"_id": comp_doc["_id"]},
-                                {"$set": {
-                                    "news": news,
-                                    "news_last_fetched": fetched_now,
-                                }}
+                            claim = await companies_collection.find_one_and_update(
+                                {
+                                    "_id": comp_doc["_id"],
+                                    "$or": [
+                                        {"news_fetching_at": {"$exists": False}},
+                                        {"news_fetching_at": {"$lt": now - _CLAIM_STALE_AFTER}},
+                                    ],
+                                },
+                                {"$set": {"news_fetching_at": now}},
                             )
-                        stats["news_researched"] += 1
-                        logger.info(f"News research: {len(news)} items for {company_name}")
+                            if claim is None:
+                                latest = await companies_collection.find_one(
+                                    {"_id": comp_doc["_id"]}, {"news": 1}
+                                )
+                                if latest and latest.get("news"):
+                                    await _mirror_news_to_prospect(prospect, latest["news"], now)
+                                    return latest["news"]
+                                return []
+                            claimed_id = comp_doc["_id"]
 
-                except Exception as e:
-                    logger.error(f"News research failed for {prospect.get('email')}: {e}", exc_info=True)
-                finally:
-                    if claimed_id is not None:
+                        news = await research_company_news(company_name, limit=5, days_back=90, client=shared_client)
+
+                        if news:
+                            fetched_now = datetime.utcnow()
+                            await _mirror_news_to_prospect(prospect, news, fetched_now)
+                            if comp_doc:
+                                await companies_collection.update_one(
+                                    {"_id": comp_doc["_id"]},
+                                    {"$set": {
+                                        "news": news,
+                                        "news_last_fetched": fetched_now,
+                                    }}
+                                )
+                            stats["news_researched"] += 1
+                            logger.info(f"News research: {len(news)} items for {company_name}")
+
+                        return news
+
+                    except Exception as e:
+                        logger.error(f"News research failed for {prospect.get('email')}: {e}", exc_info=True)
+                        return []
+                    finally:
+                        if claimed_id is not None:
+                            try:
+                                await companies_collection.update_one(
+                                    {"_id": claimed_id}, {"$unset": {"news_fetching_at": ""}}
+                                )
+                            except Exception:
+                                pass
+
+            if lock is None:
+                await _do_research()
+                return
+
+            async with lock:
+                if key in company_result_cache:
+                    cached = company_result_cache[key]
+                    if cached:
                         try:
-                            await companies_collection.update_one(
-                                {"_id": claimed_id}, {"$unset": {"news_fetching_at": ""}}
-                            )
-                        except Exception:
-                            pass
+                            await _mirror_news_to_prospect(prospect, cached, datetime.utcnow())
+                            logger.info(f"Reusing in-run news for {company_name} (already researched this run)")
+                        except Exception as e:
+                            logger.error(f"Failed to mirror in-run cached news for {prospect.get('email')}: {e}", exc_info=True)
+                    return
+                result = await _do_research()
+                company_result_cache[key] = result or []
 
         await asyncio.gather(*[_research_one(p) for p in prospects])
     finally:

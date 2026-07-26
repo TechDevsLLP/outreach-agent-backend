@@ -81,7 +81,7 @@ Production runs two containers: `Dockerfile` (uvicorn on 8008, `/health` healthc
 | `API_BASE_URL` | Public API URL (calendar webhook registration) |
 | `GEO_SQLITE_PATH` | Override path to the geo gazetteer SQLite (defaults to `data/geo_places.sqlite`) |
 | `DAILY_EMAIL_QUOTA`, `DAILY_LINKEDIN_CONNECTION_QUOTA`, `DAILY_LINKEDIN_INMAIL_QUOTA` | Default daily send quotas |
-| `MIN_SCORE_TO_ENROLL`, `ENROLLED_TARGET_FIRST_CAMPAIGN`, `ENROLLED_TARGET_FLOOR`, `MAX_PROSPECTS_PER_COMPANY` | Discovery/enrollment tuning |
+| `ENROLLED_TARGET_FIRST_CAMPAIGN`, `ENROLLED_TARGET_FLOOR`, `MAX_PROSPECTS_PER_COMPANY` | Discovery/enrollment tuning |
 | `QUALITY_GATES_ENABLED`, `TITLE_GATE_ENABLED`, `PREFILTER_GATE_ENABLED`, `PREFILTER_*` | Quality gates + AI prefilter tuning |
 | `INDUSTRY_CONCURRENCY_LIMIT`, `APIFY_ACTOR_CONCURRENCY_LIMIT`, `AI_CONCURRENCY_LIMIT`, `AI_ASSESSMENT_CONCURRENCY_LIMIT`, `ENRICHMENT_BATCH_SIZE` | Concurrency/batching knobs |
 | `AUTO_ENRICH_*`, `AUTO_DISCOVER_CONTACTS_*`, `CONTACT_DISCOVERY_*`, `PRE_ENRICHMENT_*`, `SCHEDULE_DM_TRIAGE_ENABLED` | Pipeline feature gates/thresholds |

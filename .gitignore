@@ -30,3 +30,6 @@ backups/
 
 # personal scratch notes (may contain stray tokens/codes)
 isssues.txt
+
+# Generated geo gazetteer (built by scripts/build_geo_sqlite.py)
+data/geo_places.sqlite

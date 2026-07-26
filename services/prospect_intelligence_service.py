@@ -73,14 +73,33 @@ Each intelligence object must have these exact keys:
 - writing_voice: 1-sentence description of their communication style (length, tone, format, vocabulary)
 - top_topics: array of 2-4 topics they post/care about most
 - pain_signals: array of 1-3 specific pains evident from their content or role
-- best_hook: ONE specific post excerpt or signal to open outreach with (quote it directly if possible)
+- best_hook: ONE specific signal to open outreach with (quote a post directly if posts exist)
 - competitors: array of competitor names mentioned or implied in their posts/profile (empty array if none)
 - dont_pitch: array of topics/angles to avoid (e.g. if they're clearly anti-cold-email, list that)
 - engagement_style: brief description of how they engage (lurker, commenter, poster, debater, etc.)
 
 Note: pitch_angle and why_they_need_us are NOT included here — they are generated separately per seller.
 
-If no posts are available, infer what you can from profile/company data and mark writing_voice as "unknown — no posts"."""
+CRITICAL — ALWAYS return a fully-populated object for EVERY prospect. Never return an
+empty object, null, or empty strings for writing_voice / best_hook / top_topics /
+pain_signals / engagement_style. Posts are ONE input, not a requirement.
+
+When a prospect has NO posts ("Recent Posts: none available"), build every field from
+the remaining signals — job title, seniority, headline, About text, industry, company
+description/specialties, and the injected company research (recent news, competitors,
+best-performing competitor, buying signals, funding, hiring signals, company posts):
+- best_hook: derive from the strongest available non-post signal — their exact
+  title/role and its mandate, a recent company news item or buying signal, a funding
+  round, a hiring push, or their headline. Reference a concrete fact, never generic.
+- top_topics: infer from title, function, headline/About, and company focus.
+- pain_signals: infer from the role's typical mandate + company situation (e.g. a
+  "Digital Optimization Manager" at a large enterprise → driving digital transformation
+  across complex legacy processes).
+- writing_voice: infer a plausible professional tone from headline/About wording; if
+  there is genuinely nothing to infer from, use "Professional — inferred from profile
+  (no posts available)". Do NOT leave it blank.
+- engagement_style: if no posts, use "No recent posts — profile-based inference".
+Only competitors and dont_pitch may be empty arrays when there is truly no signal."""
 
 _PITCH_SYSTEM_PROMPT = """You are a B2B outreach strategist.
 

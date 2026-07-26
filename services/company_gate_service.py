@@ -8,9 +8,20 @@ classification from a D2C consumer brand — this gate asks Gemini to judge
 actual business-model fit against the campaign ICP (e.g. Chevron, bp, Whole
 Foods, Best Buy all carry "retail" industry tags but are NOT D2C brands).
 
-FAIL-OPEN by design: any infrastructure failure defaults the affected company
-to {"match": True, "reason": "gate_unavailable"} — discovery must never stall
-on gate infrastructure. Only confident semantic rejections drop companies.
+FAIL-OPEN by design for whole-batch/infra failures: a network error, total
+Gemini outage, or a timeout with zero usable response always defaults the
+affected companies to {"match": True, "reason": "gate_unavailable"} —
+discovery must never stall, and a transient outage must never silently
+zero-out an entire campaign's companies. This whole-batch behavior is NOT
+configurable.
+
+Per-company ambiguity (a company comes back in an otherwise-successful batch
+but its verdict is unparseable or missing) is configurable via
+`settings.company_gate_fail_closed` (env `COMPANY_GATE_FAIL_CLOSED`,
+default False): when False (default) these ambiguous rows fail open exactly
+as before; when True they fail CLOSED — dropped with reason
+"gate_ambiguous_failclosed". Only confident semantic rejections, or
+ambiguous rows under the fail-closed flag, drop companies.
 
 Gemini conventions mirror services/title_gate_service.py (which mirrors
 company_sourcing_service.py). Helpers duplicated to stay self-contained.
@@ -33,10 +44,15 @@ _GEMINI_COMPANY_GATE_RATE = (150, 60)  # ~150 req/min shared window
 _GEMINI_RATE_LIMITER_KEY = f"gemini-company-gate:{_GEMINI_MODEL}"
 
 _FAIL_OPEN_REASON = "gate_unavailable"
+_AMBIGUOUS_FAIL_CLOSED_REASON = "gate_ambiguous_failclosed"
 
 
 def _fail_open() -> dict:
     return {"match": True, "reason": _FAIL_OPEN_REASON}
+
+
+def _fail_closed_ambiguous() -> dict:
+    return {"match": False, "reason": _AMBIGUOUS_FAIL_CLOSED_REASON}
 
 
 def normalize_company_name(name: str | None) -> str:
@@ -178,7 +194,12 @@ def _parse_rows(raw_content: str) -> list[dict]:
     return [r for r in parsed if isinstance(r, dict)]
 
 
-async def _judge_batch(gemini_client, batch: list[dict], icp_prompt: str, batch_num: int) -> dict[int, dict]:
+async def _judge_batch(
+    gemini_client, batch: list[dict], icp_prompt: str, batch_num: int, fail_closed_ambiguous: bool = False
+) -> dict[int, dict]:
+    # WHOLE-BATCH / infra failure path (below, on exception): always fail-open,
+    # regardless of `fail_closed_ambiguous` — a transient Gemini outage must never
+    # silently zero out an entire campaign's companies.
     verdicts: dict[int, dict] = {c["index"]: _fail_open() for c in batch}
     batch_indices = set(verdicts.keys())
 
@@ -207,12 +228,23 @@ async def _judge_batch(gemini_client, batch: list[dict], icp_prompt: str, batch_
         except (KeyError, TypeError, ValueError):
             continue
 
-    kept = sum(1 for v in verdicts.values() if v["match"] and v["reason"] != _FAIL_OPEN_REASON)
+    # PER-COMPANY ambiguity: rows that came back in this otherwise-successful batch
+    # but couldn't be parsed into a verdict (missing/malformed) are still sitting at
+    # the fail-open default here. Under the configurable flag, fail these CLOSED
+    # instead — this is deliberately scoped to per-company gaps only, never applied
+    # to the whole-batch exception path above.
+    if fail_closed_ambiguous:
+        for idx in batch_indices:
+            if verdicts[idx]["reason"] == _FAIL_OPEN_REASON:
+                verdicts[idx] = _fail_closed_ambiguous()
+
+    kept = sum(1 for v in verdicts.values() if v["match"] and v["reason"] not in (_FAIL_OPEN_REASON,))
     rejected = sum(1 for v in verdicts.values() if not v["match"])
     unavailable = sum(1 for v in verdicts.values() if v["reason"] == _FAIL_OPEN_REASON)
+    ambiguous_closed = sum(1 for v in verdicts.values() if v["reason"] == _AMBIGUOUS_FAIL_CLOSED_REASON)
     logger.info(
         f"[company-gate] batch {batch_num}: {len(batch)} judged — kept {kept}, "
-        f"rejected {rejected}, fail-open {unavailable}"
+        f"rejected {rejected}, fail-open {unavailable}, ambiguous-fail-closed {ambiguous_closed}"
     )
     return verdicts
 
@@ -262,15 +294,21 @@ async def ai_company_gate(companies: list[dict], icp_prompt: str) -> dict[int, d
         settings = get_settings()
         gemini_client = genai.Client(api_key=settings.gemini_api_key)
     except Exception as e:
+        # Whole-batch / infra failure (client unavailable entirely) — always fail-open.
         logger.warning(f"[company-gate] Gemini client unavailable, fail-open for all {len(valid)}: {e}")
         return results
+
+    fail_closed_ambiguous = bool(getattr(settings, "company_gate_fail_closed", False))
 
     for batch_num, start in enumerate(range(0, len(valid), _BATCH_SIZE), start=1):
         batch = valid[start:start + _BATCH_SIZE]
         try:
-            verdicts = await _judge_batch(gemini_client, batch, icp_prompt or "", batch_num)
+            verdicts = await _judge_batch(
+                gemini_client, batch, icp_prompt or "", batch_num, fail_closed_ambiguous
+            )
             results.update(verdicts)
         except Exception as e:
+            # Whole-batch / infra failure (unexpected crash) — always fail-open.
             logger.warning(f"[company-gate] batch {batch_num} crashed (fail-open): {e}")
 
     return results

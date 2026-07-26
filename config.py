@@ -140,9 +140,24 @@ class Settings(BaseSettings):
     quality_gates_enabled: bool = True
     title_gate_enabled: bool = True
     prefilter_gate_enabled: bool = True
+    # Company gate (services/company_gate_service.py) per-company ambiguity handling:
+    # when False (default), a company whose verdict is unparseable/missing inside an
+    # otherwise-successful Gemini batch defaults to match=True (fail-open, current
+    # behavior). When True, such companies are dropped (fail-closed). This flag does
+    # NOT affect whole-batch/infra failures (network error, timeout, total outage) —
+    # those always stay fail-open regardless of this setting, to avoid a transient
+    # Gemini outage silently zeroing out an entire campaign's companies.
+    company_gate_fail_closed: bool = False
+
+    # Grounded web research provider for company news + competitor research
+    # (services/news_research_service.py, services/competitor_research_service.py).
+    # "gemini" (default) = Gemini + Google Search grounding, ~$0.075/$0.30 per 1M
+    # tokens (see gemini-3.1-flash-lite in openrouter_price_map) — far cheaper than
+    # "perplexity" (perplexity/sonar-pro via OpenRouter, $3/$15 per 1M tokens, the
+    # single largest per-campaign LLM cost). Output shape is identical either way.
+    research_provider: str = "gemini"
 
     # Internal campaign scorer (replaces per-prospect AI calls during discovery)
-    min_score_to_enroll: int = 55             # prospects below this fit_score are not enrolled
     score_raw_pool_multiplier: float = 3.0    # top-up: scrape up to target × this before giving up
     score_topup_max_iterations: int = 5       # top-up: max Apify retry rounds
 

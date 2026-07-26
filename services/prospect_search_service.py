@@ -47,6 +47,13 @@ logger = logging.getLogger(__name__)
 # Statuses that exclude a prospect from outreach regardless of tenant
 _HARD_EXCLUDE_STATUSES = {"opted_out", "bounced", "disqualified", "unsubscribed"}
 
+# A prospect is only "owned" (blocked from reuse) by campaigns that are live or
+# still in setup — i.e. that actually intend to send. Paused, archived,
+# completed, failed, or hard-deleted campaigns release their never-sent
+# prospects back into the reusable pool. Already-messaged prospects are still
+# protected separately by the send-guard (messages_sent > 0) below.
+_OCCUPYING_CAMPAIGN_STATUSES = {"active", "draft", "awaiting_approval"}
+
 # Stages that are ready for outreach (already enriched)
 _CONTACTABLE_STAGES = {"assessed", "contactable", "company_enriched", "profile_enriched"}
 
@@ -63,8 +70,14 @@ async def build_exclusion_set(
     Pre-fetch the set of prospect_ids this account/user should NOT contact.
 
     Excludes prospects where:
-      - used_by contains an entry for this user (ownership exclusion)
-      - used_by contains any entry enrolled within cooldown_days (global cooldown per account)
+      - used_by contains an entry for this user tied to a still-OCCUPYING
+        campaign (active / draft / awaiting_approval). Paused, archived,
+        completed, failed, or deleted campaigns do NOT block reuse — their
+        never-sent prospects are free to enroll into a new campaign.
+      - the prospect was actually messaged (messages_sent > 0) within
+        cooldown_days in ANY campaign (send-guard — prevents double-contact
+        even after the owning campaign is paused/archived/deleted)
+      - used_by contains a completed entry within cooldown_days (per-user cooldown)
       - state.status is in _HARD_EXCLUDE_STATUSES
 
     Also excludes prospects already enrolled in campaign_id (if provided)
@@ -75,6 +88,23 @@ async def build_exclusion_set(
     cutoff = datetime.utcnow() - timedelta(days=cooldown_days)
     prospect_state_col = db["prospect_state"]
     campaign_enrollments_col = db["campaign_enrollments"]
+    campaigns_col = db["campaigns"]
+
+    # Resolve which of this account's campaigns still "occupy" their prospects.
+    # used_by[].campaign_id is stored as a string (str(campaign_oid)), so match
+    # occupying ids as strings.
+    occupying_campaign_ids: list[str] = []
+    try:
+        async for _c in campaigns_col.find(
+            {
+                "account_id": {"$in": [str(account_id), account_id]},
+                "status": {"$in": list(_OCCUPYING_CAMPAIGN_STATUSES)},
+            },
+            {"_id": 1},
+        ):
+            occupying_campaign_ids.append(str(_c["_id"]))
+    except Exception as _e:
+        logger.warning("build_exclusion_set: occupying-campaign lookup failed: %s", _e)
 
     try:
         account_oid = ObjectId(account_id) if not isinstance(account_id, ObjectId) else account_id
@@ -92,9 +122,19 @@ async def build_exclusion_set(
     # Hard-exclude by status
     or_clauses.append({"status": {"$in": list(_HARD_EXCLUDE_STATUSES)}})
 
-    # Owned by this user
-    if user_id:
-        or_clauses.append({"used_by.user_id": str(user_id)})
+    # Owned by this user — but ONLY when the owning campaign is still occupying
+    # (active / draft / awaiting_approval). A never-sent prospect whose only
+    # owning campaign is paused, archived, completed, failed, or deleted is
+    # released for reuse (its campaign_id won't be in occupying_campaign_ids).
+    if user_id and occupying_campaign_ids:
+        or_clauses.append({
+            "used_by": {
+                "$elemMatch": {
+                    "user_id": str(user_id),
+                    "campaign_id": {"$in": occupying_campaign_ids},
+                }
+            }
+        })
 
     # 90-day cooldown: blocks re-contact after sequence COMPLETION for this user
     if user_id:
@@ -117,6 +157,26 @@ async def build_exclusion_set(
         pid = doc.get("prospect_id")
         if pid:
             excluded.add(str(pid))
+
+    # Send-guard: a prospect that was ACTUALLY messaged (messages_sent > 0)
+    # within cooldown_days stays excluded regardless of the owning campaign's
+    # status — so releasing never-sent prospects (above) never causes a
+    # double-contact of someone we already reached, even if that campaign was
+    # later paused, archived, or deleted.
+    try:
+        async for doc in campaign_enrollments_col.find(
+            {
+                "account_id": {"$in": [str(account_oid), account_oid]},
+                "messages_sent": {"$gt": 0},
+                "last_sent_at": {"$gte": cutoff},
+            },
+            {"prospect_id": 1},
+        ):
+            pid = doc.get("prospect_id")
+            if pid:
+                excluded.add(str(pid))
+    except Exception as _e:
+        logger.warning("build_exclusion_set: send-guard lookup failed: %s", _e)
 
     # Also exclude from active campaign_enrollments (belt-and-suspenders)
     if campaign_id:
