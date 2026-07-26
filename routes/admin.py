@@ -25,6 +25,7 @@ from auth import (
     get_super_admin,
     hash_password,
     is_browser_session_request,
+    rotate_user_access_token,
     set_session_cookies,
 )
 from services.admin_audit_service import log_admin_action
@@ -430,15 +431,31 @@ async def stop_impersonating(
     if not current_user.get("_is_impersonating"):
         raise HTTPException(status_code=409, detail="No active impersonation session")
 
+    impersonated_by = current_user.get("_impersonated_by")
     admin_token = request.cookies.get(ADMIN_SESSION_COOKIE_NAME)
-    if not admin_token:
-        raise HTTPException(status_code=401, detail="Original admin session is unavailable")
+
+    if admin_token:
+        # Browser session: the original admin JWT was parked in a cookie, so
+        # restore it verbatim. Reusing it means stopping an impersonation can
+        # never extend the admin's own session past its original expiry.
+        try:
+            payload = decode_access_token(admin_token)
+            admin_id = payload.get("sub")
+            if not admin_id or admin_id != impersonated_by:
+                raise ValueError("impersonation session mismatch")
+        except Exception:
+            raise HTTPException(status_code=401, detail="Original admin session is invalid")
+    else:
+        # Bearer client: there is no cookie to restore from, because the API is
+        # on a different domain to the app. The impersonation JWT we issued and
+        # signed carries impersonated_by, so the original identity is still
+        # ours to trust; it is re-verified against the superadmin allowlist
+        # below before any new session is minted.
+        admin_id = impersonated_by
+        if not admin_id:
+            raise HTTPException(status_code=401, detail="Original admin session is unavailable")
 
     try:
-        payload = decode_access_token(admin_token)
-        admin_id = payload.get("sub")
-        if not admin_id or admin_id != current_user.get("_impersonated_by"):
-            raise ValueError("impersonation session mismatch")
         admin = await database.users_collection.find_one({"_id": ObjectId(admin_id)})
     except Exception:
         raise HTTPException(status_code=401, detail="Original admin session is invalid")
@@ -447,16 +464,27 @@ async def stop_impersonating(
     if not admin or not configured_admin or admin.get("email", "").lower() != configured_admin:
         raise HTTPException(status_code=403, detail="Original admin access is no longer valid")
 
-    set_session_cookies(response, admin_token)
-    clear_admin_session_cookie(response)
-    response.headers["Cache-Control"] = "no-store"
     await log_admin_action(
         admin["email"],
         "user.impersonation.stop",
         "user",
         current_user["_id"],
     )
-    return {"impersonating": False}
+
+    if admin_token:
+        set_session_cookies(response, admin_token)
+        clear_admin_session_cookie(response)
+        response.headers["Cache-Control"] = "no-store"
+        return {"impersonating": False}
+
+    # Bearer: hand back a fresh admin session. Unlike the cookie path this
+    # starts a new expiry window, which is equivalent to the admin signing in
+    # again and is the only option once the original JWT is not recoverable.
+    restored = rotate_user_access_token(
+        admin, str(admin.get("current_account_id") or "")
+    )
+    response.headers["Cache-Control"] = "no-store"
+    return {"impersonating": False, "access_token": restored, "token_type": "bearer"}
 
 
 # ---------------------------------------------------------------------------
