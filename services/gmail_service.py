@@ -287,7 +287,13 @@ async def get_thread_messages(
             resp = await client.get(
                 f"{GMAIL_API_BASE}/threads/{thread_id}",
                 headers={"Authorization": f"Bearer {access_token}"},
-                params={"format": "metadata", "metadataHeaders": ["From", "Subject", "Date"]},
+                params={
+                    "format": "metadata",
+                    # Message-ID is the RFC id of the prospect's own message.
+                    # Without it a reply cannot set In-Reply-To/References to
+                    # what it is actually replying to.
+                    "metadataHeaders": ["From", "Subject", "Date", "Message-ID"],
+                },
             )
 
         if resp.status_code == 404:
@@ -320,6 +326,7 @@ async def get_thread_messages(
                 "date": headers.get("date", ""),
                 "subject": headers.get("subject", ""),
                 "snippet": m.get("snippet", ""),
+                "rfc_message_id": headers.get("message-id", ""),
                 "is_reply": from_email.lower() != sender_lower,
             })
 

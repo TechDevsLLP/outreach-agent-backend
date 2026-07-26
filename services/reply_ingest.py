@@ -207,6 +207,7 @@ async def process_reply(
             provider_account_id=str(provider_account_id),
             provider_thread_id=str(provider_thread_id),
             provider_message_id=reply_meta.provider_message_id,
+            rfc_message_id=reply_meta.rfc_message_id,
             now=now,
         )
     except Exception as e:
@@ -252,6 +253,7 @@ async def _record_reply_in_conversation(
     provider_thread_id: str,
     provider_message_id: str,
     now: datetime,
+    rfc_message_id: str | None = None,
 ):
     """Create or update a conversation document in the inbox with the reply."""
     if not prospect_id:
@@ -294,6 +296,10 @@ async def _record_reply_in_conversation(
         status="received",
         provider=provider,
         provider_message_id=provider_message_id,
+        # The prospect's own RFC Message-ID. Recording it lets a later reply
+        # set In-Reply-To/References to the message being answered instead of
+        # to our previous outbound one.
+        email_message_id=rfc_message_id,
     )
 
     import random

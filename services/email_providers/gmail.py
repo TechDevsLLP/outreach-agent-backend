@@ -81,6 +81,7 @@ class GmailProvider(EmailProvider):
                 snippet=m.get("snippet", ""),
                 date=m.get("date", ""),
                 thread_ref=thread_ref,
+                rfc_message_id=m.get("rfc_message_id") or None,
             )
             for m in messages
             if m.get("is_reply")

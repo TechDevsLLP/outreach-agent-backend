@@ -324,6 +324,9 @@ class SmtpImapProvider(EmailProvider):
                 snippet=r["snippet"],
                 date=r["date"],
                 thread_ref=thread_ref,
+                # For IMAP the provider id already IS the RFC Message-ID
+                # (parsed from the header above), so reuse it.
+                rfc_message_id=r["message_id"] or None,
             )
             for r in raw
         ]

@@ -38,6 +38,10 @@ class ReplyMeta:
     snippet: str = ""
     date: str = ""
     thread_ref: Optional[str] = None
+    # RFC 2822 Message-ID of the inbound message. Stored on the conversation so
+    # a later reply can point In-Reply-To/References at the prospect's own
+    # message rather than at our previous outbound one.
+    rfc_message_id: Optional[str] = None
 
 
 class EmailProvider(ABC):
