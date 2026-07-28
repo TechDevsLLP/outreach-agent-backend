@@ -52,6 +52,11 @@ class EmailAccountBase(BaseModel):
 
     # ── Send limits & warm-up ──
     daily_send_limit: int = 50
+    # User-confirmed warm-up. Defaults to False: a freshly connected mailbox is
+    # never allowed to send cold outreach until the user says it is ready.
+    # services/email_warmup_gate.py is the only interpreter of this field.
+    warmup_complete: bool = False
+    warmup_completed_at: Optional[datetime] = None
     warmup_enabled: bool = True
     warmup_status: Optional[str] = "warming"  # warming/active/paused
     warmup_day: int = 0
@@ -104,6 +109,8 @@ class EmailAccountResponse(BaseModel):
     error_message: Optional[str] = None
     last_health_check: Optional[datetime] = None
     daily_send_limit: int = 50
+    warmup_complete: bool = False
+    warmup_completed_at: Optional[datetime] = None
     warmup_enabled: bool = True
     warmup_status: Optional[str] = "warming"
     warmup_day: int = 0

@@ -98,6 +98,11 @@ _SKIP_REASON_MESSAGES = {
         "email or LinkedIn account in Settings and they'll be scheduled "
         "automatically. No need to re-run discovery."
     ),
+    "email_not_warmed": (
+        "Email sending is paused until your mailbox is marked as warmed up. "
+        "Turn on “Mailbox is warmed up” in Settings → Email Accounts once your "
+        "warm-up is complete. LinkedIn steps continue to run in the meantime."
+    ),
     "no_contact_info": (
         "No email or LinkedIn contact could be found for the scraped prospects. "
         "Try broadening the ICP (seniority/titles) so contactable people are found."
@@ -276,12 +281,12 @@ async def finalize_channel_plan(campaign_id: str, account_id: str) -> dict:
     if not campaign:
         return {"assigned": 0, "skip_reasons": {}, "day_totals": {}}
 
-    # Auto-pick sender accounts if not already set
+    # Auto-pick sender accounts if not already set. Email is only picked from
+    # mailboxes the user has marked as warmed up — see email_warmup_gate.
     auto_set: dict = {}
     if not campaign.get("email_account_id"):
-        email_acc = await database.email_accounts_collection.find_one(
-            {"account_id": account_id_filter, "status": {"$in": ["connected", "active"]}}
-        )
+        from services.email_warmup_gate import get_warmed_email_account
+        email_acc = await get_warmed_email_account(str(account_oid))
         if email_acc:
             auto_set["email_account_id"] = email_acc["_id"]
             campaign["email_account_id"] = email_acc["_id"]
@@ -292,6 +297,23 @@ async def finalize_channel_plan(campaign_id: str, account_id: str) -> dict:
         if li_acc:
             auto_set["linkedin_account_id"] = li_acc["_id"]
             campaign["linkedin_account_id"] = li_acc["_id"]
+    # A mailbox exists but is not cleared for sending: record it on the campaign
+    # so the planner drops email from the channel mix and the campaign page can
+    # say plainly why. Recomputed on every finalize, so flipping the toggle and
+    # re-planning clears it.
+    from services.email_warmup_gate import account_has_warmed_email
+    email_warmup_blocked = False
+    if not campaign.get("email_account_id"):
+        any_mailbox = await database.email_accounts_collection.find_one(
+            {"account_id": account_id_filter, "status": {"$in": ["connected", "active"]}},
+            {"_id": 1},
+        )
+        email_warmup_blocked = bool(any_mailbox)
+    elif not await account_has_warmed_email(str(account_oid)):
+        email_warmup_blocked = True
+    auto_set["email_warmup_blocked"] = email_warmup_blocked
+    campaign["email_warmup_blocked"] = email_warmup_blocked
+
     if auto_set:
         await database.campaigns_collection.update_one({"_id": campaign_oid}, {"$set": auto_set})
         logger.info(f"[finalize_plan:{campaign_id}] auto-picked senders: { {k: str(v) for k, v in auto_set.items()} }")

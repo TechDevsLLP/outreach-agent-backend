@@ -192,6 +192,38 @@ async def list_email_accounts(
 
 
 # ---------------------------------------------------------------------------
+# GET /api/email-accounts/warmup-status
+# ---------------------------------------------------------------------------
+
+@router.get("/warmup-status")
+async def get_warmup_status(account_ctx: dict = Depends(get_account_context)):
+    """Whether this tenant may send email at all.
+
+    One place for both Settings and the campaign page to ask "is email on?", so
+    the campaign warning can never drift from the gate that actually blocks the
+    send. Declared before /{email_account_id} so the literal path wins.
+    """
+    from services.email_warmup_gate import (
+        WARMUP_REQUIRED_MESSAGE,
+        get_warmed_email_account,
+    )
+
+    account_id = account_ctx["account"]["_id"]
+    connected = await database.email_accounts_collection.count_documents({
+        "account_id": {"$in": [str(account_id), account_id]},
+        "status": {"$in": ["connected", "active"]},
+    })
+    warmed = await get_warmed_email_account(str(account_id))
+
+    return {
+        "has_email_account": connected > 0,
+        "email_sending_enabled": warmed is not None,
+        "warmed_account_email": (warmed or {}).get("email"),
+        "message": None if warmed else WARMUP_REQUIRED_MESSAGE,
+    }
+
+
+# ---------------------------------------------------------------------------
 # POST /api/email-accounts/oauth/google/url
 # ---------------------------------------------------------------------------
 
@@ -638,6 +670,7 @@ async def get_email_account(
 class EmailAccountUpdateRequest(BaseModel):
     display_name: Optional[str] = None
     daily_send_limit: Optional[int] = Field(default=None, ge=1, le=500)
+    warmup_complete: Optional[bool] = None
     warmup_enabled: Optional[bool] = None
     warmup_status: Optional[Literal["warming", "active", "paused"]] = None
 
@@ -646,6 +679,7 @@ class EmailAccountUpdateRequest(BaseModel):
 async def update_email_account(
     email_account_id: str,
     body: EmailAccountUpdateRequest,
+    background_tasks: BackgroundTasks,
     account_ctx: dict = Depends(get_account_context),
 ):
     """Update mutable fields on an email account."""
@@ -657,6 +691,13 @@ async def update_email_account(
         update_fields["display_name"] = body.display_name
     if body.daily_send_limit is not None:
         update_fields["daily_send_limit"] = body.daily_send_limit
+    if body.warmup_complete is not None:
+        # The gate for every outbound email on this mailbox — see
+        # services/email_warmup_gate.py. Nothing infers it; the user asserts it.
+        update_fields["warmup_complete"] = body.warmup_complete
+        update_fields["warmup_completed_at"] = (
+            datetime.now(timezone.utc) if body.warmup_complete else None
+        )
     if body.warmup_enabled is not None:
         update_fields["warmup_enabled"] = body.warmup_enabled
         if body.warmup_enabled and not doc.get("warmup_started_at"):
@@ -673,6 +714,18 @@ async def update_email_account(
         {"_id": doc["_id"]},
         {"$set": update_fields},
     )
+
+    # Confirming warm-up turns the email channel on for this tenant. Campaigns
+    # planned while it was off have prospects parked as skipped_no_channel;
+    # re-plan them the same way connecting a brand-new sender does.
+    if body.warmup_complete and not doc.get("warmup_complete"):
+        await database.campaigns_collection.update_many(
+            {"account_id": {"$in": [str(account_id), account_id]}},
+            {"$set": {"email_warmup_blocked": False}},
+        )
+        from services.campaign_launch_service import replan_channels_on_sender_add
+        background_tasks.add_task(replan_channels_on_sender_add, str(account_id), "email")
+
     updated = await database.email_accounts_collection.find_one({"_id": doc["_id"]})
     return _serialize_email_account(updated)
 

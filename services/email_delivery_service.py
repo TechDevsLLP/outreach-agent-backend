@@ -38,6 +38,27 @@ def _id_variants(value) -> list:
 logger = logging.getLogger(__name__)
 
 
+def _warmup_ok(email_account: dict) -> bool:
+    """Last line before a provider call: never send from an unwarmed mailbox.
+
+    The planner already keeps email out of campaigns whose mailbox is not
+    warmed, but a message planned while it was warmed can still fire after the
+    user turns the flag back off — so the check lives here too, not only
+    upstream. Draft creation is deliberately not gated: a draft only becomes an
+    email when a human presses send.
+    """
+    from services.email_warmup_gate import is_warmed_up
+
+    if is_warmed_up(email_account):
+        return True
+    logger.warning(
+        "[warmup-gate] Blocked send from mailbox %s (%s): not marked as warmed up",
+        email_account.get("_id"),
+        email_account.get("email"),
+    )
+    return False
+
+
 async def _maybe_rewrite_clicks(
     html_body: str,
     email_account: dict,
@@ -75,6 +96,9 @@ async def send_email(
     The returned dict echoes the exact `content_text` / `content_html` that went
     on the wire so callers can persist what was actually sent.
     """
+    if not _warmup_ok(email_account):
+        return None
+
     provider = get_provider(email_account)
     if not provider:
         logger.error(f"No email provider available for account {email_account.get('_id')}")
@@ -117,6 +141,9 @@ async def send_reply(
     proposals arrive here as plain text with bulleted time slots, which is
     exactly the shape that collapsed when it was sent as HTML unconverted.
     """
+    if not _warmup_ok(email_account):
+        return None
+
     provider = get_provider(email_account)
     if not provider:
         logger.error(f"No email provider available for account {email_account.get('_id')}")

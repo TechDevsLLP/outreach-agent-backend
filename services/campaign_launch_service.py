@@ -160,7 +160,10 @@ def plan_channel_assignments(
 
     Returns: ([(enrollment_dict, channel, send_day), ...], skip_reasons_dict)
     """
-    has_email_account = bool(campaign.get("email_account_id"))
+    # An unwarmed mailbox is treated as no mailbox at all: the campaign plans
+    # and runs on LinkedIn only until the user confirms warm-up in Settings.
+    email_warmup_blocked = bool(campaign.get("email_warmup_blocked"))
+    has_email_account = bool(campaign.get("email_account_id")) and not email_warmup_blocked
     has_linkedin_account = bool(campaign.get("linkedin_account_id"))
 
     caps = campaign.get("daily_caps") or DEFAULT_DAILY_CAPS
@@ -244,7 +247,8 @@ def plan_channel_assignments(
             skip_reasons["no_contact_info"] = skip_reasons.get("no_contact_info", 0) + 1
             continue
         if not has_email_account and not has_linkedin_account:
-            skip_reasons["no_sending_account"] = skip_reasons.get("no_sending_account", 0) + 1
+            reason = "email_not_warmed" if email_warmup_blocked else "no_sending_account"
+            skip_reasons[reason] = skip_reasons.get(reason, 0) + 1
             continue
         has_email = prospect_has_email and has_email_account
         has_linkedin = prospect_has_linkedin and has_linkedin_account
