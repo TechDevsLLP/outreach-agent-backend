@@ -19,8 +19,7 @@ prospect, or retry an unknown provider outcome.
 | AI generation/research | OpenRouter + direct Gemini | supported after failure/cost proof | Structured outputs, bounded concurrency/retry and usage tags; no secrets or full provider payloads in logs. |
 | Calendar | Google Calendar | not a send channel | Watch verification, renewal, polling fallback and meeting idempotency must pass before automatic booking. |
 
-“Supported after staging proof” is not production approval. The exact proof is
-listed in [the deploy runbook](../deploy/README.md).
+“Supported after staging proof” is not production approval.
 
 ## OAuth and credential boundary
 

@@ -2,7 +2,7 @@
 
 This document describes the launch architecture implemented in the repository.
 It distinguishes durable foundations from work that still requires staging
-proof. See [the deployment runbook](../deploy/README.md) for release gates.
+proof. See [the deployment runbook](../deploy/README.md) for what runs where.
 
 ## Product and tenancy contract
 
@@ -168,4 +168,4 @@ double-dispatch.
 - OAuth/provider credentials are Fernet-encrypted at rest.
 - Microsoft OAuth connect/exchange/refresh is launch-disabled (`410 Gone`).
 
-These controls do not replace the no-go gates in the deployment runbook.
+These controls are the security floor, not a release checklist.
