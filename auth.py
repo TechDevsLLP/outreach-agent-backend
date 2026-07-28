@@ -357,6 +357,85 @@ async def get_account_context(user: dict = Depends(get_current_user)) -> dict:
     return {"user": user, "account": account}
 
 
+# ── SSE stream tickets ────────────────────────────────────────────────────────
+#
+# `EventSource` cannot set an Authorization header, and the API is on a
+# different origin to the app, so its session cookie is third-party and blocked.
+# Streams therefore authenticate with a short-lived ticket in the query string:
+# the client exchanges its bearer token for one, then opens the stream with it.
+#
+# The ticket is opaque and useless outside its ~2 minute window, which is what
+# makes putting it in a URL acceptable where putting the JWT there would not be.
+# It is deliberately reusable until it expires rather than single-use: the
+# browser reconnects an SSE stream on its own, reusing the same URL, and a
+# consumed ticket would break every one of those reconnects.
+
+STREAM_TICKET_TTL_SECONDS = 120
+
+
+async def create_stream_ticket(user_id: str, account_id: str) -> tuple[str, int]:
+    """Mint a short-lived ticket for SSE authentication. Returns (ticket, ttl)."""
+    import database
+
+    ticket = secrets.token_urlsafe(32)
+    now = datetime.now(timezone.utc)
+    await database.stream_tickets_collection.insert_one({
+        "_id": ticket,
+        "user_id": str(user_id),
+        "account_id": str(account_id),
+        "created_at": now,
+        "expires_at": now + timedelta(seconds=STREAM_TICKET_TTL_SECONDS),
+    })
+    return ticket, STREAM_TICKET_TTL_SECONDS
+
+
+async def _account_context_from_ticket(ticket: str) -> dict:
+    """Resolve a stream ticket into the same context shape as normal auth."""
+    import database
+
+    credentials_exception = HTTPException(
+        status_code=status.HTTP_401_UNAUTHORIZED,
+        detail="Invalid or expired stream ticket",
+    )
+    # Match on expires_at as well: the TTL monitor only sweeps once a minute, so
+    # an expired document can still be present.
+    row = await database.stream_tickets_collection.find_one({
+        "_id": ticket,
+        "expires_at": {"$gt": datetime.now(timezone.utc)},
+    })
+    if not row:
+        raise credentials_exception
+
+    try:
+        user = await database.users_collection.find_one({"_id": ObjectId(row["user_id"])})
+    except Exception:
+        raise credentials_exception
+    if user is None:
+        raise credentials_exception
+    user["_id"] = str(user["_id"])
+
+    # Re-derive the account through the normal path so membership, plan gating
+    # and trial expiry are enforced exactly as they are for a bearer request.
+    return await get_account_context(user)
+
+
+async def get_account_context_sse(
+    request: Request,
+    ticket: str | None = None,
+    bearer_token: str | None = Depends(oauth2_scheme),
+) -> dict:
+    """Account context for SSE endpoints: `?ticket=` first, else normal auth.
+
+    Drop-in replacement for `get_account_context` on streaming routes. Non-SSE
+    routes must keep using `get_account_context` — tickets are only a
+    workaround for EventSource's inability to send headers.
+    """
+    if ticket:
+        return await _account_context_from_ticket(ticket)
+    user = await get_current_user(request, bearer_token)
+    return await get_account_context(user)
+
+
 def create_impersonation_token(
     target_user_id: str,
     target_account_id: str,

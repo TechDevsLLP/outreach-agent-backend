@@ -1,1436 +1,2351 @@
 {
-  "generated_at": "2026-07-28T08:12:44.222316+00:00",
+  "generated_at": "2026-07-28T09:04:51.576220+00:00",
   "exit_status": 0,
-  "total_tests": 528,
-  "total_duration_ms": 714.51,
+  "total_tests": 531,
+  "total_duration_ms": 4726.02,
   "tests": [
-    {
-      "test": "tests/unit/test_rate_limiter.py::test_blocks_until_window_slides",
-      "outcome": "passed",
-      "duration_ms": 235.76
-    },
-    {
-      "test": "tests/unit/test_apify_service.py::test_global_semaphore_bounds_concurrency",
-      "outcome": "passed",
-      "duration_ms": 157.75
-    },
     {
       "test": "tests/unit/test_daily_cap_service.py::test_reserve_slot_preserves_campaign_cap_enforcement",
       "outcome": "passed",
-      "duration_ms": 47.72
-    },
-    {
-      "test": "tests/unit/test_company_sourcing_retry.py::test_exhausts_retries_and_batch_returns_empty",
-      "outcome": "passed",
-      "duration_ms": 40.8
-    },
-    {
-      "test": "tests/unit/test_growthtoolkit_service.py::test_429_retries_exhausted_raises",
-      "outcome": "passed",
-      "duration_ms": 36.34
+      "duration_ms": 1957.31
     },
     {
       "test": "tests/unit/test_geo_resolver.py::test_resolve_bulk_speed",
       "outcome": "passed",
-      "duration_ms": 31.13
+      "duration_ms": 505.16
     },
     {
-      "test": "tests/unit/test_growthtoolkit_service.py::test_429_retry_then_success",
+      "test": "tests/unit/test_rate_limiter.py::test_blocks_until_window_slides",
       "outcome": "passed",
-      "duration_ms": 24.39
+      "duration_ms": 239.26
     },
     {
-      "test": "tests/unit/test_growthtoolkit_service.py::test_5xx_retry_then_success",
+      "test": "tests/unit/test_growthtoolkit_service.py::test_429_retries_exhausted_raises",
       "outcome": "passed",
-      "duration_ms": 12.18
-    },
-    {
-      "test": "tests/unit/test_unipile_retry.py::test_request_honors_retry_after_header",
-      "outcome": "passed",
-      "duration_ms": 12.18
-    },
-    {
-      "test": "tests/unit/test_geo_resolver.py::test_resolve_city_via_sqlite",
-      "outcome": "passed",
-      "duration_ms": 9.93
-    },
-    {
-      "test": "tests/unit/test_crypto.py::test_encrypt_decrypt_round_trip",
-      "outcome": "passed",
-      "duration_ms": 6.53
-    },
-    {
-      "test": "tests/unit/test_unipile_retry.py::test_request_exhausts_retries_and_raises",
-      "outcome": "passed",
-      "duration_ms": 4.07
-    },
-    {
-      "test": "tests/unit/test_unipile_retry.py::test_request_retries_429_then_succeeds",
-      "outcome": "passed",
-      "duration_ms": 2.75
-    },
-    {
-      "test": "tests/unit/test_shared_pool_migration.py::test_bundle_hash_tampering_fails_closed",
-      "outcome": "passed",
-      "duration_ms": 2.26
-    },
-    {
-      "test": "tests/unit/test_geo_resolver.py::test_resolve_with_country_hint",
-      "outcome": "passed",
-      "duration_ms": 2.11
-    },
-    {
-      "test": "tests/unit/test_enrollment_ranking_no_legacy.py::test_ranking_source_has_no_legacy_shared_pool_fallbacks",
-      "outcome": "passed",
-      "duration_ms": 2.1
-    },
-    {
-      "test": "tests/unit/test_company_sourcing_retry.py::test_retries_on_429_then_succeeds",
-      "outcome": "passed",
-      "duration_ms": 1.67
-    },
-    {
-      "test": "tests/unit/test_apify_service.py::test_retries_on_network_error_then_succeeds",
-      "outcome": "passed",
-      "duration_ms": 1.58
-    },
-    {
-      "test": "tests/unit/test_apify_service.py::test_retries_on_failed_run_status_then_succeeds",
-      "outcome": "passed",
-      "duration_ms": 1.57
-    },
-    {
-      "test": "tests/unit/test_shared_pool_migration.py::test_restore_preview_validates_bundle_without_credentials",
-      "outcome": "passed",
-      "duration_ms": 1.57
-    },
-    {
-      "test": "tests/unit/test_apify_service.py::test_returns_last_failed_run_when_retries_exhausted",
-      "outcome": "passed",
-      "duration_ms": 1.55
-    },
-    {
-      "test": "tests/unit/test_apify_service.py::test_network_error_exhausted_raises",
-      "outcome": "passed",
-      "duration_ms": 1.51
-    },
-    {
-      "test": "tests/unit/test_unipile_retry.py::test_request_form_retries_5xx_then_succeeds",
-      "outcome": "passed",
-      "duration_ms": 1.43
-    },
-    {
-      "test": "tests/unit/test_unipile_retry.py::test_request_retries_5xx_then_succeeds",
-      "outcome": "passed",
-      "duration_ms": 1.38
-    },
-    {
-      "test": "tests/unit/test_geo_resolver.py::test_resolve_cache_hit_is_fast",
-      "outcome": "passed",
-      "duration_ms": 1.18
-    },
-    {
-      "test": "tests/unit/test_inbound_message_id_capture.py::test_gmail_requests_the_message_id_header",
-      "outcome": "passed",
-      "duration_ms": 1.12
-    },
-    {
-      "test": "tests/unit/test_inbound_message_id_capture.py::test_ingest_stores_the_inbound_message_id",
-      "outcome": "passed",
-      "duration_ms": 1.1
-    },
-    {
-      "test": "tests/unit/test_calendar_reconciliation.py::test_get_event_uses_exact_mailbox_calendar_and_normalizes_not_found",
-      "outcome": "passed",
-      "duration_ms": 1.06
-    },
-    {
-      "test": "tests/unit/test_calendar_reconciliation.py::test_cancelled_event_is_exactly_bound_claimed_and_idempotent",
-      "outcome": "passed",
-      "duration_ms": 1.0
-    },
-    {
-      "test": "tests/unit/test_connected_system_isolation.py::test_signed_provider_identity_selects_only_its_tenant_conversation",
-      "outcome": "passed",
-      "duration_ms": 0.98
-    },
-    {
-      "test": "tests/unit/test_daily_cap_service.py::test_scheduled_smart_email_reaches_sender_cap_with_string_campaign_id",
-      "outcome": "passed",
-      "duration_ms": 0.97
-    },
-    {
-      "test": "tests/unit/test_send_attempt_service.py::test_not_sent_reconciliation_releases_caps_exactly_once",
-      "outcome": "passed",
-      "duration_ms": 0.97
-    },
-    {
-      "test": "tests/unit/test_canonicalizers.py::test_seniority_free_text_to_tokens",
-      "outcome": "passed",
-      "duration_ms": 0.89
-    },
-    {
-      "test": "tests/unit/test_daily_cap_service.py::test_scheduled_sequence_linkedin_reaches_sender_cap_with_string_campaign_id",
-      "outcome": "passed",
-      "duration_ms": 0.88
-    },
-    {
-      "test": "tests/unit/test_sequence_service.py::test_edge_to_unknown_node_is_rejected",
-      "outcome": "passed",
-      "duration_ms": 0.82
-    },
-    {
-      "test": "tests/unit/test_calendar_reconciliation.py::test_attendee_decline_cancels_and_provider_error_only_schedules_retry",
-      "outcome": "passed",
-      "duration_ms": 0.8
-    },
-    {
-      "test": "tests/unit/test_daily_cap_service.py::test_reserve_slot_fails_safely_when_campaign_does_not_exist",
-      "outcome": "passed",
-      "duration_ms": 0.8
-    },
-    {
-      "test": "tests/unit/test_employee_selection_isolation.py::test_other_tenant_employee_id_cannot_trigger_lookup_or_mutation",
-      "outcome": "passed",
-      "duration_ms": 0.8
-    },
-    {
-      "test": "tests/unit/test_provider_security_meetings_calendar.py::test_meeting_proposal_creation_and_reply_are_idempotent",
-      "outcome": "passed",
-      "duration_ms": 0.79
-    },
-    {
-      "test": "tests/unit/test_calendar_reconciliation.py::test_calendar_credential_without_binding_fails_closed_when_ambiguous",
-      "outcome": "passed",
-      "duration_ms": 0.74
-    },
-    {
-      "test": "tests/unit/test_calendar_reconciliation.py::test_reschedule_and_attendee_acceptance_are_projected",
-      "outcome": "passed",
-      "duration_ms": 0.74
-    },
-    {
-      "test": "tests/unit/test_provider_security_meetings_calendar.py::test_meeting_confirmation_is_tenant_scoped_and_provider_idempotent",
-      "outcome": "passed",
-      "duration_ms": 0.72
-    },
-    {
-      "test": "tests/unit/test_provider_security_meetings_calendar.py::test_meeting_proposal_defaults_to_draft_and_never_sends",
-      "outcome": "passed",
-      "duration_ms": 0.7
-    },
-    {
-      "test": "tests/unit/test_calendar_reconciliation.py::test_calendar_credential_exactly_matches_tenant_google_account",
-      "outcome": "passed",
-      "duration_ms": 0.69
-    },
-    {
-      "test": "tests/unit/test_provider_security_meetings_calendar.py::test_google_webhook_rejects_body_and_resource_mismatch_before_sync",
-      "outcome": "passed",
-      "duration_ms": 0.64
-    },
-    {
-      "test": "tests/unit/test_shared_pool_authorization.py::test_prospect_read_and_patch_are_tenant_scoped_and_overlay_only",
-      "outcome": "passed",
-      "duration_ms": 0.64
-    },
-    {
-      "test": "tests/unit/test_provider_security_meetings_calendar.py::test_apify_dataset_clients_are_lazy_and_thread_safe[services.employee_scraper_service]",
-      "outcome": "passed",
-      "duration_ms": 0.62
-    },
-    {
-      "test": "tests/unit/test_apify_retry_wiring.py::test_scrape_linkedin_posts_bulk_handles_actor_failure",
-      "outcome": "passed",
-      "duration_ms": 0.59
-    },
-    {
-      "test": "tests/unit/test_send_attempt_service.py::test_two_workers_same_send_key_cross_provider_boundary_once",
-      "outcome": "passed",
-      "duration_ms": 0.58
-    },
-    {
-      "test": "tests/unit/test_employee_selection_isolation.py::test_new_prospect_is_canonical_and_private_state_is_overlay_only",
-      "outcome": "passed",
-      "duration_ms": 0.57
-    },
-    {
-      "test": "tests/unit/test_provider_security_meetings_calendar.py::test_apify_dataset_clients_are_lazy_and_thread_safe[services.linkedin_post_scraper_service]",
-      "outcome": "passed",
-      "duration_ms": 0.57
-    },
-    {
-      "test": "tests/unit/test_send_attempt_service.py::test_failure_after_provider_boundary_is_ambiguous_and_never_blind_retried",
-      "outcome": "passed",
-      "duration_ms": 0.56
-    },
-    {
-      "test": "tests/unit/test_send_attempt_service.py::test_provider_reconciliation_sent_closes_attempt_without_resend",
-      "outcome": "passed",
-      "duration_ms": 0.56
-    },
-    {
-      "test": "tests/unit/test_enrichment_durability.py::test_worker_rejects_message_gen_job_for_foreign_tenant",
-      "outcome": "passed",
-      "duration_ms": 0.51
-    },
-    {
-      "test": "tests/unit/test_campaign_prospect_query_contract.py::test_campaign_list_uses_membership_then_canonical_score_page",
-      "outcome": "passed",
-      "duration_ms": 0.5
-    },
-    {
-      "test": "tests/unit/test_calendar_reconciliation.py::test_scheduler_bounds_groups_and_passes_exact_provider_binding",
-      "outcome": "passed",
-      "duration_ms": 0.48
-    },
-    {
-      "test": "tests/unit/test_daily_cap_service.py::test_reserve_slot_finds_object_id_campaign_from_safe_representations[<lambda>]",
-      "outcome": "passed",
-      "duration_ms": 0.47
-    },
-    {
-      "test": "tests/unit/test_shared_pool_migration.py::test_nonempty_output_directory_fails_before_writing",
-      "outcome": "passed",
-      "duration_ms": 0.46
-    },
-    {
-      "test": "tests/unit/test_daily_cap_service.py::test_reserve_slot_preserves_account_override_clamp",
-      "outcome": "passed",
-      "duration_ms": 0.43
-    },
-    {
-      "test": "tests/unit/test_send_attempt_service.py::test_failure_before_provider_is_retryable_without_calling_provider",
-      "outcome": "passed",
-      "duration_ms": 0.41
-    },
-    {
-      "test": "tests/unit/test_daily_cap_service.py::test_reserve_slot_finds_object_id_campaign_from_safe_representations[str]",
-      "outcome": "passed",
-      "duration_ms": 0.4
-    },
-    {
-      "test": "tests/unit/test_employee_selection_isolation.py::test_existing_shared_prospect_requires_and_receives_tenant_overlay",
-      "outcome": "passed",
-      "duration_ms": 0.4
-    },
-    {
-      "test": "tests/unit/test_job_queue_service.py::test_heartbeat_checkpoint_completion_and_cancellation_are_durable",
-      "outcome": "passed",
-      "duration_ms": 0.4
-    },
-    {
-      "test": "tests/unit/test_conversation_isolation.py::test_same_shared_prospect_and_chat_are_isolated_by_tenant_and_provider",
-      "outcome": "passed",
-      "duration_ms": 0.39
-    },
-    {
-      "test": "tests/unit/test_daily_cap_service.py::test_reserve_slot_rejects_malformed_campaign_ids_without_db_access[None]",
-      "outcome": "passed",
-      "duration_ms": 0.39
-    },
-    {
-      "test": "tests/unit/test_geo_resolver.py::test_resolve_unresolvable_returns_none_and_caches",
-      "outcome": "passed",
-      "duration_ms": 0.38
-    },
-    {
-      "test": "tests/unit/test_daily_cap_service.py::test_release_and_usage_use_the_same_object_id_boundary",
-      "outcome": "passed",
-      "duration_ms": 0.37
-    },
-    {
-      "test": "tests/unit/test_provider_security_meetings_calendar.py::test_google_webhook_requires_exact_channel_secret_resource_and_tenant_provider",
-      "outcome": "passed",
-      "duration_ms": 0.37
-    },
-    {
-      "test": "tests/unit/test_send_attempt_service.py::test_two_workers_racing_one_due_enrollment_get_one_lease",
-      "outcome": "passed",
-      "duration_ms": 0.37
-    },
-    {
-      "test": "tests/unit/test_shared_pool_authorization.py::test_bulk_and_single_enrollment_require_prospect_overlay_access",
-      "outcome": "passed",
-      "duration_ms": 0.36
-    },
-    {
-      "test": "tests/unit/test_daily_cap_service.py::test_reserve_slot_rejects_malformed_campaign_ids_without_db_access[not-an-object-id]",
-      "outcome": "passed",
-      "duration_ms": 0.35
-    },
-    {
-      "test": "tests/unit/test_campaign_prospect_state.py::test_enrichment_transitions_started_completed_and_failed_are_atomic",
-      "outcome": "passed",
-      "duration_ms": 0.33
-    },
-    {
-      "test": "tests/unit/test_sequence_endpoints.py::test_put_sequence_persists_valid_graph",
-      "outcome": "passed",
-      "duration_ms": 0.33
-    },
-    {
-      "test": "tests/unit/test_website_scraper_service.py::test_fetch_website_data_structured",
-      "outcome": "passed",
-      "duration_ms": 0.33
-    },
-    {
-      "test": "tests/unit/test_campaign_prospect_state.py::test_cohort_selection_persists_explicit_ids_without_source_tags",
-      "outcome": "passed",
-      "duration_ms": 0.32
-    },
-    {
-      "test": "tests/unit/test_job_queue_service.py::test_two_workers_racing_one_job_yield_one_lease_owner",
-      "outcome": "passed",
-      "duration_ms": 0.32
-    },
-    {
-      "test": "tests/unit/test_provider_security_meetings_calendar.py::test_public_booking_binds_invite_to_known_prospect_email",
-      "outcome": "passed",
-      "duration_ms": 0.32
-    },
-    {
-      "test": "tests/unit/test_job_queue_service.py::test_failure_retries_then_dead_letters_on_final_attempt",
-      "outcome": "passed",
-      "duration_ms": 0.31
-    },
-    {
-      "test": "tests/unit/test_daily_cap_service.py::test_reserve_slot_rejects_malformed_campaign_ids_without_db_access[]",
-      "outcome": "passed",
-      "duration_ms": 0.3
-    },
-    {
-      "test": "tests/unit/test_daily_cap_service.py::test_reserve_slot_rejects_malformed_campaign_ids_without_db_access[123]",
-      "outcome": "passed",
-      "duration_ms": 0.29
-    },
-    {
-      "test": "tests/unit/test_apify_retry_wiring.py::test_run_one_employee_scrape_uses_call_actor_with_retry",
-      "outcome": "passed",
-      "duration_ms": 0.28
-    },
-    {
-      "test": "tests/unit/test_shared_pool_migration.py::test_tenant_fields_move_to_overlay_and_campaign_history_is_quarantined",
-      "outcome": "passed",
-      "duration_ms": 0.28
-    },
-    {
-      "test": "tests/unit/test_canonicalizers.py::test_canonicalize_icp_local_paths",
-      "outcome": "passed",
-      "duration_ms": 0.27
-    },
-    {
-      "test": "tests/unit/test_company_sourcing_retry.py::test_source_companies_succeeds_first_try",
-      "outcome": "passed",
-      "duration_ms": 0.27
-    },
-    {
-      "test": "tests/unit/test_notification_isolation.py::test_create_notification_requires_tenant_before_database_access",
-      "outcome": "passed",
-      "duration_ms": 0.27
-    },
-    {
-      "test": "tests/unit/test_conversation_isolation.py::test_provider_message_replay_appends_only_once",
-      "outcome": "passed",
-      "duration_ms": 0.26
-    },
-    {
-      "test": "tests/unit/test_growthtoolkit_service.py::test_find_emails_no_warning_for_non_credit_error",
-      "outcome": "passed",
-      "duration_ms": 0.26
-    },
-    {
-      "test": "tests/unit/test_notification_isolation.py::test_notification_mutations_are_tenant_scoped",
-      "outcome": "passed",
-      "duration_ms": 0.26
-    },
-    {
-      "test": "tests/unit/test_session_security.py::test_explicit_bearer_client_does_not_require_csrf",
-      "outcome": "passed",
-      "duration_ms": 0.26
-    },
-    {
-      "test": "tests/unit/test_job_queue_service.py::test_expired_lease_is_reclaimed_and_stale_worker_loses_ownership",
-      "outcome": "passed",
-      "duration_ms": 0.25
-    },
-    {
-      "test": "tests/unit/test_job_queue_service.py::test_every_read_and_mutation_is_tenant_scoped",
-      "outcome": "passed",
-      "duration_ms": 0.25
-    },
-    {
-      "test": "tests/unit/test_prompt_tenant_isolation.py::test_prompt_cache_and_lookup_are_partitioned_by_tenant",
-      "outcome": "passed",
-      "duration_ms": 0.25
-    },
-    {
-      "test": "tests/unit/test_daily_cap_service.py::test_valid_campaign_id_preserves_unknown_channel_bypass",
-      "outcome": "passed",
-      "duration_ms": 0.24
-    },
-    {
-      "test": "tests/unit/test_website_scraper_service.py::test_fetch_website_data_bounds_about_text",
-      "outcome": "passed",
-      "duration_ms": 0.24
-    },
-    {
-      "test": "tests/unit/test_provider_security_meetings_calendar.py::test_calendar_watch_stores_only_token_hash_and_binds_provider",
-      "outcome": "passed",
-      "duration_ms": 0.23
-    },
-    {
-      "test": "tests/unit/test_wave_a_security_containment.py::test_oauth_state_is_bound_and_one_time",
-      "outcome": "passed",
-      "duration_ms": 0.23
-    },
-    {
-      "test": "tests/unit/test_wave_a_security_containment.py::test_onboarding_uses_shared_signed_state_contract",
-      "outcome": "passed",
-      "duration_ms": 0.23
-    },
-    {
-      "test": "tests/unit/test_apify_service.py::test_invalid_input_error_is_not_retried",
-      "outcome": "passed",
-      "duration_ms": 0.22
-    },
-    {
-      "test": "tests/unit/test_auth_membership_boundary.py::test_account_context_accepts_object_id_membership",
-      "outcome": "passed",
-      "duration_ms": 0.22
-    },
-    {
-      "test": "tests/unit/test_job_queue_service.py::test_deterministic_key_is_idempotent_within_tenant_and_job_type",
-      "outcome": "passed",
-      "duration_ms": 0.22
-    },
-    {
-      "test": "tests/unit/test_rate_limiter.py::test_get_rate_limiter_returns_same_instance_for_same_key",
-      "outcome": "passed",
-      "duration_ms": 0.22
-    },
-    {
-      "test": "tests/unit/test_company_sourcing_retry.py::test_honors_retry_delay_from_gemini_error",
-      "outcome": "passed",
-      "duration_ms": 0.21
-    },
-    {
-      "test": "tests/unit/test_growthtoolkit_service.py::test_find_emails_surfaces_credit_warning",
-      "outcome": "passed",
-      "duration_ms": 0.21
-    },
-    {
-      "test": "tests/unit/test_shared_pool_authorization.py::test_cross_tenant_enrollment_read_and_delete_fail_closed",
-      "outcome": "passed",
-      "duration_ms": 0.21
-    },
-    {
-      "test": "tests/unit/test_enrichment_durability.py::test_worker_dispatches_message_gen_ensure_day_to_service",
-      "outcome": "passed",
-      "duration_ms": 0.2
-    },
-    {
-      "test": "tests/unit/test_prompt_tenant_isolation.py::test_prompt_without_tenant_uses_registry_and_never_queries_override",
-      "outcome": "passed",
-      "duration_ms": 0.2
-    },
-    {
-      "test": "tests/unit/test_provider_security_meetings_calendar.py::test_public_booking_requires_valid_email_when_no_known_email",
-      "outcome": "passed",
-      "duration_ms": 0.2
-    },
-    {
-      "test": "tests/unit/test_provider_security_meetings_calendar.py::test_meeting_confirmation_rejects_cross_tenant_before_provider",
-      "outcome": "passed",
-      "duration_ms": 0.2
-    },
-    {
-      "test": "tests/unit/test_sequence_service.py::test_plan_route_first_touch_days_fills_quota_per_day",
-      "outcome": "passed",
-      "duration_ms": 0.2
-    },
-    {
-      "test": "tests/unit/test_apify_service.py::test_call_actor_with_retry_succeeds_first_try",
-      "outcome": "passed",
-      "duration_ms": 0.19
-    },
-    {
-      "test": "tests/unit/test_canonicalizers.py::test_cosine_similarity_basics",
-      "outcome": "passed",
-      "duration_ms": 0.19
-    },
-    {
-      "test": "tests/unit/test_connected_system_isolation.py::test_webhook_missing_or_conflicting_provider_identity_fails_closed",
-      "outcome": "passed",
-      "duration_ms": 0.19
-    },
-    {
-      "test": "tests/unit/test_daily_cap_service.py::test_sender_reservation_enforces_runtime_spacing_and_effective_cap",
-      "outcome": "passed",
-      "duration_ms": 0.19
-    },
-    {
-      "test": "tests/unit/test_website_scraper_service.py::test_fetch_website_data_missing_content_type_parsed",
-      "outcome": "passed",
-      "duration_ms": 0.19
-    },
-    {
-      "test": "tests/unit/test_conversation_isolation.py::test_reply_fanout_claim_is_idempotent_within_tenant_provider",
-      "outcome": "passed",
-      "duration_ms": 0.18
-    },
-    {
-      "test": "tests/unit/test_conversation_isolation.py::test_missing_tenant_context_fails_before_database_access",
-      "outcome": "passed",
-      "duration_ms": 0.18
-    },
-    {
-      "test": "tests/unit/test_email_thread_context.py::test_falls_back_to_campaign_messages_when_conversation_has_no_thread",
-      "outcome": "passed",
-      "duration_ms": 0.18
-    },
-    {
-      "test": "tests/unit/test_enrichment_durability.py::test_missing_overlay_logs_warning_and_does_not_abort_pipeline",
-      "outcome": "passed",
-      "duration_ms": 0.18
-    },
-    {
-      "test": "tests/unit/test_enrichment_durability.py::test_worker_dispatches_message_gen_generate_day_to_service",
-      "outcome": "passed",
-      "duration_ms": 0.18
-    },
-    {
-      "test": "tests/unit/test_enrichment_durability.py::test_worker_dispatches_remaining_days_to_service",
-      "outcome": "passed",
-      "duration_ms": 0.18
-    },
-    {
-      "test": "tests/unit/test_growthtoolkit_service.py::test_find_emails_credit_warning_checks_error_code_not_subclass",
-      "outcome": "passed",
-      "duration_ms": 0.18
-    },
-    {
-      "test": "tests/unit/test_notification_isolation.py::test_create_notification_persists_one_canonical_schema",
-      "outcome": "passed",
-      "duration_ms": 0.18
-    },
-    {
-      "test": "tests/unit/test_website_scraper_service.py::test_fetch_website_data_http_error_returns_none",
-      "outcome": "passed",
-      "duration_ms": 0.18
-    },
-    {
-      "test": "tests/unit/test_email_thread_context.py::test_thread_ref_comes_from_conversation_when_campaign_messages_empty",
-      "outcome": "passed",
-      "duration_ms": 0.17
-    },
-    {
-      "test": "tests/unit/test_email_thread_context.py::test_conversation_thread_ref_wins_over_campaign_messages",
-      "outcome": "passed",
-      "duration_ms": 0.17
-    },
-    {
-      "test": "tests/unit/test_growthtoolkit_service.py::test_find_emails_batch_shapes",
-      "outcome": "passed",
-      "duration_ms": 0.17
-    },
-    {
-      "test": "tests/unit/test_website_scraper_service.py::test_scrape_website_text_dump",
-      "outcome": "passed",
-      "duration_ms": 0.17
-    },
-    {
-      "test": "tests/unit/test_apify_retry_wiring.py::test_scrape_company_pages_uses_call_actor_with_retry",
-      "outcome": "passed",
-      "duration_ms": 0.16
-    },
-    {
-      "test": "tests/unit/test_provider_security_meetings_calendar.py::test_calendar_watch_rejects_arbitrary_callback_before_credentials",
-      "outcome": "passed",
-      "duration_ms": 0.16
-    },
-    {
-      "test": "tests/unit/test_shared_pool_authorization.py::test_enrollment_badges_are_scoped_to_requesting_account",
-      "outcome": "passed",
-      "duration_ms": 0.16
-    },
-    {
-      "test": "tests/unit/test_shared_pool_migration.py::test_nonconflicting_duplicates_merge_and_company_reference_is_remapped",
-      "outcome": "passed",
-      "duration_ms": 0.16
-    },
-    {
-      "test": "tests/unit/test_activity_feed_isolation.py::test_activity_feed_requires_and_applies_tenant_to_every_pipeline",
-      "outcome": "passed",
-      "duration_ms": 0.15
-    },
-    {
-      "test": "tests/unit/test_company_sourcing_retry.py::test_extract_retry_delay_from_structured_details",
-      "outcome": "passed",
-      "duration_ms": 0.15
-    },
-    {
-      "test": "tests/unit/test_connected_system_isolation.py::test_ai_draft_lookup_rejects_missing_tenant_before_database",
-      "outcome": "passed",
-      "duration_ms": 0.15
-    },
-    {
-      "test": "tests/unit/test_growthtoolkit_service.py::test_facade_never_raises_on_provider_error",
-      "outcome": "passed",
-      "duration_ms": 0.15
-    },
-    {
-      "test": "tests/unit/test_prospect_activity_isolation.py::test_campaign_activity_updates_only_matching_tenant_enrollment",
-      "outcome": "passed",
-      "duration_ms": 0.15
-    },
-    {
-      "test": "tests/unit/test_sequence_endpoints.py::test_get_sequence_returns_default_when_none_stored",
-      "outcome": "passed",
-      "duration_ms": 0.15
-    },
-    {
-      "test": "tests/unit/test_sequence_endpoints.py::test_put_sequence_rejects_invalid_graph_with_400",
-      "outcome": "passed",
-      "duration_ms": 0.15
-    },
-    {
-      "test": "tests/unit/test_wave_a_security_containment.py::test_zoho_exchange_rejects_ssrf_before_provider_http",
-      "outcome": "passed",
-      "duration_ms": 0.15
-    },
-    {
-      "test": "tests/unit/test_wave_a_security_containment.py::test_oauth_state_rejects_cross_tenant_binding",
-      "outcome": "passed",
-      "duration_ms": 0.15
-    },
-    {
-      "test": "tests/unit/test_activity_feed_isolation.py::test_activity_feed_fails_closed_without_tenant",
-      "outcome": "passed",
-      "duration_ms": 0.14
-    },
-    {
-      "test": "tests/unit/test_apify_retry_wiring.py::test_scrape_linkedin_posts_bulk_uses_call_actor_with_retry",
-      "outcome": "passed",
-      "duration_ms": 0.14
-    },
-    {
-      "test": "tests/unit/test_apify_service.py::test_timeout_secs_forwarded_to_call",
-      "outcome": "passed",
-      "duration_ms": 0.14
-    },
-    {
-      "test": "tests/unit/test_auth_membership_boundary.py::test_id_representations_supports_canonical_and_legacy_memberships",
-      "outcome": "passed",
-      "duration_ms": 0.14
-    },
-    {
-      "test": "tests/unit/test_canonicalizers.py::test_canonicalize_icp_ecommerce_strict_no_group_bleed",
-      "outcome": "passed",
-      "duration_ms": 0.14
-    },
-    {
-      "test": "tests/unit/test_enrichment_durability.py::test_message_gen_enqueue_uses_deterministic_key_and_coalesces",
-      "outcome": "passed",
-      "duration_ms": 0.14
-    },
-    {
-      "test": "tests/unit/test_provider_security_meetings_calendar.py::test_calendar_status_uses_stored_google_provider_value",
-      "outcome": "passed",
-      "duration_ms": 0.14
-    },
-    {
-      "test": "tests/unit/test_rate_limiter.py::test_get_rate_limiter_returns_different_instances_for_different_keys",
-      "outcome": "passed",
-      "duration_ms": 0.14
-    },
-    {
-      "test": "tests/unit/test_send_attempt_service.py::test_tenant_sender_lookup_rejects_other_tenants_sender",
-      "outcome": "passed",
-      "duration_ms": 0.14
-    },
-    {
-      "test": "tests/unit/test_sequence_service.py::test_full_accepted_path_walk",
-      "outcome": "passed",
-      "duration_ms": 0.14
-    },
-    {
-      "test": "tests/unit/test_shared_pool_migration.py::test_conflicting_duplicate_identity_and_dependent_prospect_are_quarantined",
-      "outcome": "passed",
-      "duration_ms": 0.14
-    },
-    {
-      "test": "tests/unit/test_unset_legacy_campaign_scores.py::test_refuses_any_collection_other_than_prospects",
-      "outcome": "passed",
-      "duration_ms": 0.14
-    },
-    {
-      "test": "tests/unit/test_campaign_engine_sequence.py::test_routes_to_sequence_when_graph_and_state_present",
-      "outcome": "passed",
-      "duration_ms": 0.13
-    },
-    {
-      "test": "tests/unit/test_curated_discovery_maps.py::test_seniority_director_maps_to_220",
-      "outcome": "passed",
-      "duration_ms": 0.13
-    },
-    {
-      "test": "tests/unit/test_production_config.py::test_valid_production_configuration_passes",
-      "outcome": "passed",
-      "duration_ms": 0.13
-    },
-    {
-      "test": "tests/unit/test_production_config.py::test_unsafe_production_configuration_is_rejected[overrides0-JWT_SECRET_KEY]",
-      "outcome": "passed",
-      "duration_ms": 0.13
-    },
-    {
-      "test": "tests/unit/test_prospect_activity_isolation.py::test_same_shared_prospect_has_isolated_tenant_activity",
-      "outcome": "passed",
-      "duration_ms": 0.13
-    },
-    {
-      "test": "tests/unit/test_sequence_endpoints.py::test_put_sequence_locked_when_active_or_completed[active]",
-      "outcome": "passed",
-      "duration_ms": 0.13
-    },
-    {
-      "test": "tests/unit/test_sequence_endpoints.py::test_put_sequence_locked_when_active_or_completed[completed]",
-      "outcome": "passed",
-      "duration_ms": 0.13
-    },
-    {
-      "test": "tests/unit/test_session_security.py::test_browser_auth_response_sets_httponly_session_without_returning_jwt",
-      "outcome": "passed",
-      "duration_ms": 0.13
-    },
-    {
-      "test": "tests/unit/test_session_security.py::test_token_rotation_preserves_impersonation_binding_and_deadline",
-      "outcome": "passed",
-      "duration_ms": 0.13
-    },
-    {
-      "test": "tests/unit/test_system_settings_and_audit.py::test_db_error_falls_back_to_default",
-      "outcome": "passed",
-      "duration_ms": 0.13
-    },
-    {
-      "test": "tests/unit/test_campaign_engine_sequence.py::test_legacy_smart_campaign_never_enters_sequence_path",
-      "outcome": "passed",
-      "duration_ms": 0.12
-    },
-    {
-      "test": "tests/unit/test_campaign_engine_sequence.py::test_enrollment_without_sequence_state_does_not_enter_sequence_path",
-      "outcome": "passed",
-      "duration_ms": 0.12
-    },
-    {
-      "test": "tests/unit/test_campaign_sequence_launch_guard.py::test_declared_sequence_without_persisted_graph_is_rejected",
-      "outcome": "passed",
-      "duration_ms": 0.12
-    },
-    {
-      "test": "tests/unit/test_campaign_sequence_launch_guard.py::test_approve_day_rejects_missing_graph_before_database_work",
-      "outcome": "passed",
-      "duration_ms": 0.12
-    },
-    {
-      "test": "tests/unit/test_canonicalizers.py::test_suggest_industry_expansions_surfaces_group_siblings",
-      "outcome": "passed",
-      "duration_ms": 0.12
-    },
-    {
-      "test": "tests/unit/test_crypto.py::test_decrypt_with_no_key_configured_returns_none",
-      "outcome": "passed",
-      "duration_ms": 0.12
-    },
-    {
-      "test": "tests/unit/test_email_provider_factory.py::test_get_provider_google_returns_gmail_provider",
-      "outcome": "passed",
-      "duration_ms": 0.12
-    },
-    {
-      "test": "tests/unit/test_enrichment_durability.py::test_user_supplied_prospect_id_requires_tenant_state_or_enrollment",
-      "outcome": "passed",
-      "duration_ms": 0.12
-    },
-    {
-      "test": "tests/unit/test_enrichment_durability.py::test_campaign_day_endpoint_is_queue_only_and_tenant_scoped",
-      "outcome": "passed",
-      "duration_ms": 0.12
-    },
-    {
-      "test": "tests/unit/test_enrichment_durability.py::test_campaign_day_worker_reads_campaign_and_enrollments_inside_tenant",
-      "outcome": "passed",
-      "duration_ms": 0.12
-    },
-    {
-      "test": "tests/unit/test_growthtoolkit_service.py::test_missing_api_key_raises_auth_error",
-      "outcome": "passed",
-      "duration_ms": 0.12
-    },
-    {
-      "test": "tests/unit/test_growthtoolkit_service.py::test_enrich_linkedin_task_polling",
-      "outcome": "passed",
-      "duration_ms": 0.12
-    },
-    {
-      "test": "tests/unit/test_growthtoolkit_service.py::test_enrich_linkedin_task_failure",
-      "outcome": "passed",
-      "duration_ms": 0.12
-    },
-    {
-      "test": "tests/unit/test_production_config.py::test_unsafe_production_configuration_is_rejected[overrides1-ENCRYPTION_KEY]",
-      "outcome": "passed",
-      "duration_ms": 0.12
-    },
-    {
-      "test": "tests/unit/test_prospect_activity_isolation.py::test_arbitrary_prospect_id_cannot_create_activity_ownership",
-      "outcome": "passed",
-      "duration_ms": 0.12
-    },
-    {
-      "test": "tests/unit/test_scoring.py::test_decision_maker_rules[prospect5-False]",
-      "outcome": "passed",
-      "duration_ms": 0.12
-    },
-    {
-      "test": "tests/unit/test_sequence_endpoints.py::test_get_sequence_returns_stored_graph",
-      "outcome": "passed",
-      "duration_ms": 0.12
-    },
-    {
-      "test": "tests/unit/test_shared_pool_authorization.py::test_manual_admin_prospect_creation_never_writes_tenant_private_fields",
-      "outcome": "passed",
-      "duration_ms": 0.12
-    },
-    {
-      "test": "tests/unit/test_unipile_retry.py::test_request_does_not_retry_4xx_other_than_429",
-      "outcome": "passed",
-      "duration_ms": 0.12
-    },
-    {
-      "test": "tests/unit/test_wave_a_security_containment.py::test_zoho_refresh_rejects_legacy_malicious_origin_before_http",
-      "outcome": "passed",
-      "duration_ms": 0.12
-    },
-    {
-      "test": "tests/unit/test_campaign_prospect_state.py::test_same_pool_prospect_has_independent_campaign_score_keys",
-      "outcome": "passed",
-      "duration_ms": 0.11
-    },
-    {
-      "test": "tests/unit/test_campaign_sequence_launch_guard.py::test_legacy_auto_launch_rejects_missing_graph_before_database_work",
-      "outcome": "passed",
-      "duration_ms": 0.11
-    },
-    {
-      "test": "tests/unit/test_canonicalizers.py::test_industry_alias_substring",
-      "outcome": "passed",
-      "duration_ms": 0.11
-    },
-    {
-      "test": "tests/unit/test_canonicalizers.py::test_industry_unresolvable_returns_none",
-      "outcome": "passed",
-      "duration_ms": 0.11
-    },
-    {
-      "test": "tests/unit/test_canonicalizers.py::test_expand_icp_to_industry_ids_dedupes",
-      "outcome": "passed",
-      "duration_ms": 0.11
-    },
-    {
-      "test": "tests/unit/test_canonicalizers.py::test_expand_icp_to_industry_ids_strict_no_group_expansion",
-      "outcome": "passed",
-      "duration_ms": 0.11
-    },
-    {
-      "test": "tests/unit/test_canonicalizers.py::test_suggest_industry_expansions_empty_for_non_group_terms",
-      "outcome": "passed",
-      "duration_ms": 0.11
-    },
-    {
-      "test": "tests/unit/test_companies_prospect_count_live.py::test_list_companies_uses_live_lookup_no_stored_field",
-      "outcome": "passed",
-      "duration_ms": 0.11
-    },
-    {
-      "test": "tests/unit/test_crypto.py::test_encrypt_is_idempotent_on_already_encrypted_value",
-      "outcome": "passed",
-      "duration_ms": 0.11
-    },
-    {
-      "test": "tests/unit/test_enrichment_durability.py::test_message_gen_modes_have_distinct_keys",
-      "outcome": "passed",
-      "duration_ms": 0.11
-    },
-    {
-      "test": "tests/unit/test_enrichment_durability.py::test_remaining_days_enqueue_uses_deterministic_key_and_coalesces",
-      "outcome": "passed",
-      "duration_ms": 0.11
-    },
-    {
-      "test": "tests/unit/test_growthtoolkit_service.py::test_auth_error_raises",
-      "outcome": "passed",
-      "duration_ms": 0.11
-    },
-    {
-      "test": "tests/unit/test_growthtoolkit_service.py::test_invalid_input_raises",
-      "outcome": "passed",
-      "duration_ms": 0.11
-    },
-    {
-      "test": "tests/unit/test_growthtoolkit_service.py::test_usage_doc_written_on_success",
-      "outcome": "passed",
-      "duration_ms": 0.11
-    },
-    {
-      "test": "tests/unit/test_growthtoolkit_service.py::test_usage_doc_written_on_credit_error",
-      "outcome": "passed",
-      "duration_ms": 0.11
-    },
-    {
-      "test": "tests/unit/test_growthtoolkit_service.py::test_requests_reuse_single_shared_client",
-      "outcome": "passed",
-      "duration_ms": 0.11
-    },
-    {
-      "test": "tests/unit/test_production_config.py::test_unsafe_production_configuration_is_rejected[overrides2-UNIPILE_WEBHOOK_SECRET]",
-      "outcome": "passed",
-      "duration_ms": 0.11
-    },
-    {
-      "test": "tests/unit/test_production_config.py::test_unsafe_production_configuration_is_rejected[overrides3-DEBUG]",
-      "outcome": "passed",
-      "duration_ms": 0.11
-    },
-    {
-      "test": "tests/unit/test_production_config.py::test_unsafe_production_configuration_is_rejected[overrides6-GOOGLE_REDIRECT_URI]",
-      "outcome": "passed",
-      "duration_ms": 0.11
-    },
-    {
-      "test": "tests/unit/test_production_config.py::test_unsafe_production_configuration_is_rejected[overrides7-ENRICHMENT_STARTUP_SWEEP_ENABLED]",
-      "outcome": "passed",
-      "duration_ms": 0.11
-    },
-    {
-      "test": "tests/unit/test_prospect_activity_isolation.py::test_manual_linkedin_lookup_rejects_other_tenant_before_shared_read",
-      "outcome": "passed",
-      "duration_ms": 0.11
-    },
-    {
-      "test": "tests/unit/test_prospect_exclusion_reuse.py::test_paused_never_sent_campaign_releases_prospect",
-      "outcome": "passed",
-      "duration_ms": 0.11
-    },
-    {
-      "test": "tests/unit/test_scoring.py::test_v2_ideal_prospect_scores_high_and_capped_at_100",
-      "outcome": "passed",
-      "duration_ms": 0.11
-    },
-    {
-      "test": "tests/unit/test_scoring.py::test_v2_email_presence_signal",
-      "outcome": "passed",
-      "duration_ms": 0.11
-    },
-    {
-      "test": "tests/unit/test_scoring.py::test_v2_icp_alignment_bonus",
-      "outcome": "passed",
-      "duration_ms": 0.11
-    },
-    {
-      "test": "tests/unit/test_unset_legacy_campaign_scores.py::test_execute_unsets_only_intended_fields_and_is_idempotent",
-      "outcome": "passed",
-      "duration_ms": 0.11
-    },
-    {
-      "test": "tests/unit/test_wave_a_security_containment.py::test_linkedin_chat_read_discards_other_account_messages",
-      "outcome": "passed",
-      "duration_ms": 0.11
-    },
-    {
-      "test": "tests/unit/test_activity_feed_isolation.py::test_activity_summary_scopes_conversations_and_overlays",
-      "outcome": "passed",
-      "duration_ms": 0.1
-    },
-    {
-      "test": "tests/unit/test_campaign_prospect_state.py::test_reused_prospect_is_recomputed_for_each_campaign",
-      "outcome": "passed",
-      "duration_ms": 0.1
-    },
-    {
-      "test": "tests/unit/test_campaign_sequence_launch_guard.py::test_invalid_persisted_sequence_is_rejected",
-      "outcome": "passed",
-      "duration_ms": 0.1
-    },
-    {
-      "test": "tests/unit/test_canonicalizers.py::test_seniority_one_input_many_tokens_no_duplicates",
-      "outcome": "passed",
-      "duration_ms": 0.1
-    },
-    {
-      "test": "tests/unit/test_canonicalizers.py::test_industry_exact_alias",
-      "outcome": "passed",
-      "duration_ms": 0.1
-    },
-    {
-      "test": "tests/unit/test_companies_prospect_count_live.py::test_list_companies_paginates_before_lookup_when_not_needed",
-      "outcome": "passed",
-      "duration_ms": 0.1
-    },
-    {
-      "test": "tests/unit/test_enrichment_durability.py::test_dispatcher_discovers_and_claims_campaign_day_jobs_independently",
-      "outcome": "passed",
-      "duration_ms": 0.1
-    },
-    {
-      "test": "tests/unit/test_enrichment_durability.py::test_pre_enrichment_triage_writes_decision_only_to_tenant_state",
-      "outcome": "passed",
-      "duration_ms": 0.1
-    },
-    {
-      "test": "tests/unit/test_growthtoolkit_service.py::test_find_email_success",
-      "outcome": "passed",
-      "duration_ms": 0.1
-    },
-    {
-      "test": "tests/unit/test_growthtoolkit_service.py::test_find_email_credits_exhausted_raises",
-      "outcome": "passed",
-      "duration_ms": 0.1
-    },
-    {
-      "test": "tests/unit/test_growthtoolkit_service.py::test_shared_client_lazy_init_reuse_and_aclose",
-      "outcome": "passed",
-      "duration_ms": 0.1
-    },
-    {
-      "test": "tests/unit/test_production_config.py::test_unsafe_production_configuration_is_rejected[overrides4-APP_ROLE]",
-      "outcome": "passed",
-      "duration_ms": 0.1
-    },
-    {
-      "test": "tests/unit/test_production_config.py::test_unsafe_production_configuration_is_rejected[overrides5-CORS_ORIGINS]",
-      "outcome": "passed",
-      "duration_ms": 0.1
-    },
-    {
-      "test": "tests/unit/test_prospect_exclusion_reuse.py::test_active_campaign_still_owns_prospect",
-      "outcome": "passed",
-      "duration_ms": 0.1
-    },
-    {
-      "test": "tests/unit/test_prospect_exclusion_reuse.py::test_draft_and_awaiting_approval_occupy",
-      "outcome": "passed",
-      "duration_ms": 0.1
-    },
-    {
-      "test": "tests/unit/test_prospect_exclusion_reuse.py::test_send_guard_protects_messaged_prospect_even_if_campaign_archived",
-      "outcome": "passed",
-      "duration_ms": 0.1
-    },
-    {
-      "test": "tests/unit/test_prospect_exclusion_reuse.py::test_old_send_beyond_cooldown_releases_prospect",
-      "outcome": "passed",
-      "duration_ms": 0.1
-    },
-    {
-      "test": "tests/unit/test_rate_limiter.py::test_allows_calls_up_to_budget_without_waiting",
-      "outcome": "passed",
-      "duration_ms": 0.1
-    },
-    {
-      "test": "tests/unit/test_rate_limiter.py::test_parse_retry_after_none_for_garbage",
-      "outcome": "passed",
-      "duration_ms": 0.1
-    },
-    {
-      "test": "tests/unit/test_scoring.py::test_v2_empty_lead_scores_low_but_not_zero",
-      "outcome": "passed",
-      "duration_ms": 0.1
-    },
-    {
-      "test": "tests/unit/test_scoring.py::test_v2_company_size_bands",
-      "outcome": "passed",
-      "duration_ms": 0.1
-    },
-    {
-      "test": "tests/unit/test_scoring.py::test_campaign_score_full_match",
-      "outcome": "passed",
-      "duration_ms": 0.1
-    },
-    {
-      "test": "tests/unit/test_scoring.py::test_decision_maker_rules[prospect6-True]",
-      "outcome": "passed",
-      "duration_ms": 0.1
-    },
-    {
-      "test": "tests/unit/test_scoring.py::test_title_gate_blocklist_keyword",
-      "outcome": "passed",
-      "duration_ms": 0.1
-    },
-    {
-      "test": "tests/unit/test_scoring.py::test_company_fit_only_company_dimensions",
-      "outcome": "passed",
-      "duration_ms": 0.1
-    },
-    {
-      "test": "tests/unit/test_sequence_service.py::test_sent_moves_to_awaiting_and_schedules_timeout",
-      "outcome": "passed",
-      "duration_ms": 0.1
-    },
-    {
-      "test": "tests/unit/test_shared_pool_migration.py::test_ambiguous_tenant_payload_is_never_assigned_to_an_overlay",
-      "outcome": "passed",
-      "duration_ms": 0.1
-    },
-    {
-      "test": "tests/unit/test_shared_pool_migration.py::test_inventory_reports_duplicates_leakage_and_broken_references",
-      "outcome": "passed",
-      "duration_ms": 0.1
-    },
-    {
-      "test": "tests/unit/test_shared_pool_migration.py::test_missing_identity_is_quarantined_not_restored",
-      "outcome": "passed",
-      "duration_ms": 0.1
-    },
-    {
-      "test": "tests/unit/test_unset_legacy_campaign_scores.py::test_dry_run_reports_but_does_not_modify",
-      "outcome": "passed",
-      "duration_ms": 0.1
-    },
-    {
-      "test": "tests/unit/test_website_scraper_service.py::test_fetch_website_data_non_html_returns_none",
-      "outcome": "passed",
-      "duration_ms": 0.1
-    },
-    {
-      "test": "tests/unit/test_website_scraper_service.py::test_fetch_website_data_timeout_returns_none",
-      "outcome": "passed",
-      "duration_ms": 0.1
-    },
-    {
-      "test": "tests/unit/test_website_scraper_service.py::test_scrape_website_error_returns_empty",
-      "outcome": "passed",
-      "duration_ms": 0.1
-    },
-    {
-      "test": "tests/unit/test_apify_retry_wiring.py::test_scrape_companies_uses_call_actor_with_retry",
-      "outcome": "passed",
-      "duration_ms": 0.09
-    },
-    {
-      "test": "tests/unit/test_campaign_sequence_launch_guard.py::test_valid_persisted_sequence_passes_launch_guard",
-      "outcome": "passed",
-      "duration_ms": 0.09
-    },
-    {
-      "test": "tests/unit/test_canonicalizers.py::test_canonicalize_icp_empty_input",
-      "outcome": "passed",
-      "duration_ms": 0.09
-    },
-    {
-      "test": "tests/unit/test_companies_prospect_count_live.py::test_by_industry_sums_live_prospect_count",
-      "outcome": "passed",
-      "duration_ms": 0.09
-    },
-    {
-      "test": "tests/unit/test_email_provider_factory.py::test_get_provider_smtp_returns_smtp_imap_provider",
-      "outcome": "passed",
-      "duration_ms": 0.09
+      "duration_ms": 198.5
     },
     {
       "test": "tests/unit/test_enrichment_durability.py::test_user_supplied_prospect_id_is_returned_only_after_overlay_proof",
       "outcome": "passed",
-      "duration_ms": 0.09
+      "duration_ms": 178.0
     },
     {
-      "test": "tests/unit/test_enrichment_durability.py::test_runtime_status_is_written_to_tenant_overlay_not_shared_pool",
+      "test": "tests/unit/test_apify_service.py::test_global_semaphore_bounds_concurrency",
       "outcome": "passed",
-      "duration_ms": 0.09
+      "duration_ms": 156.16
+    },
+    {
+      "test": "tests/unit/test_enrichment_durability.py::test_user_supplied_prospect_id_requires_tenant_state_or_enrollment",
+      "outcome": "passed",
+      "duration_ms": 89.12
+    },
+    {
+      "test": "tests/unit/test_daily_cap_service.py::test_reserve_slot_rejects_malformed_campaign_ids_without_db_access[not-an-object-id]",
+      "outcome": "passed",
+      "duration_ms": 79.61
+    },
+    {
+      "test": "tests/unit/test_company_sourcing_retry.py::test_exhausts_retries_and_batch_returns_empty",
+      "outcome": "passed",
+      "duration_ms": 78.32
+    },
+    {
+      "test": "tests/unit/test_geo_resolver.py::test_resolve_city_via_sqlite",
+      "outcome": "passed",
+      "duration_ms": 73.68
+    },
+    {
+      "test": "tests/unit/test_daily_cap_service.py::test_reserve_slot_rejects_malformed_campaign_ids_without_db_access[None]",
+      "outcome": "passed",
+      "duration_ms": 63.47
+    },
+    {
+      "test": "tests/unit/test_crypto.py::test_encrypt_decrypt_round_trip",
+      "outcome": "passed",
+      "duration_ms": 59.47
+    },
+    {
+      "test": "tests/unit/test_curated_discovery_maps.py::test_headcount_bands_range_spanning_several_bands",
+      "outcome": "passed",
+      "duration_ms": 55.32
     },
     {
       "test": "tests/unit/test_enrichment_durability.py::test_enqueue_uses_deterministic_tenant_run_key",
       "outcome": "passed",
-      "duration_ms": 0.09
+      "duration_ms": 48.23
     },
     {
-      "test": "tests/unit/test_enrichment_durability.py::test_dispatcher_discovers_and_claims_new_durable_job_types",
+      "test": "tests/unit/test_growthtoolkit_service.py::test_auth_error_raises",
       "outcome": "passed",
-      "duration_ms": 0.09
+      "duration_ms": 48.16
     },
     {
-      "test": "tests/unit/test_growthtoolkit_service.py::test_find_email_not_found_returns_none",
+      "test": "tests/unit/test_curated_discovery_maps.py::test_function_id_mapping[consulting-6]",
       "outcome": "passed",
-      "duration_ms": 0.09
+      "duration_ms": 42.48
     },
     {
-      "test": "tests/unit/test_growthtoolkit_service.py::test_find_emails_empty_entries",
+      "test": "tests/unit/test_daily_cap_service.py::test_reserve_slot_rejects_malformed_campaign_ids_without_db_access[123]",
       "outcome": "passed",
-      "duration_ms": 0.09
+      "duration_ms": 40.42
     },
     {
-      "test": "tests/unit/test_growthtoolkit_service.py::test_find_emails_credit_warnings_default_none_is_safe",
+      "test": "tests/unit/test_growthtoolkit_service.py::test_429_retry_then_success",
       "outcome": "passed",
-      "duration_ms": 0.09
+      "duration_ms": 30.02
     },
     {
-      "test": "tests/unit/test_prospect_exclusion_reuse.py::test_archived_never_sent_campaign_releases_prospect",
+      "test": "tests/unit/test_enrichment_durability.py::test_missing_overlay_logs_warning_and_does_not_abort_pipeline",
       "outcome": "passed",
-      "duration_ms": 0.09
+      "duration_ms": 26.39
     },
     {
-      "test": "tests/unit/test_prospect_exclusion_reuse.py::test_hard_deleted_campaign_releases_prospect",
+      "test": "tests/unit/test_lead_mapping_service.py::test_company_row_only_company_signal",
       "outcome": "passed",
-      "duration_ms": 0.09
+      "duration_ms": 25.93
     },
     {
-      "test": "tests/unit/test_prospect_exclusion_reuse.py::test_hard_exclude_status_always_excluded",
+      "test": "tests/unit/test_email_thread_context.py::test_falls_back_to_campaign_messages_when_conversation_has_no_thread",
       "outcome": "passed",
-      "duration_ms": 0.09
+      "duration_ms": 22.41
     },
     {
-      "test": "tests/unit/test_rate_limiter.py::test_parse_retry_after_numeric_seconds",
+      "test": "tests/unit/test_employee_selection_isolation.py::test_existing_shared_prospect_requires_and_receives_tenant_overlay",
       "outcome": "passed",
-      "duration_ms": 0.09
+      "duration_ms": 21.77
     },
     {
-      "test": "tests/unit/test_scoring.py::test_v2_bad_numeric_inputs_do_not_crash",
+      "test": "tests/unit/test_daily_cap_service.py::test_reserve_slot_finds_object_id_campaign_from_safe_representations[str]",
       "outcome": "passed",
-      "duration_ms": 0.09
+      "duration_ms": 20.69
     },
     {
-      "test": "tests/unit/test_scoring.py::test_decision_maker_rules[prospect7-False]",
+      "test": "tests/unit/test_daily_cap_service.py::test_release_and_usage_use_the_same_object_id_boundary",
       "outcome": "passed",
-      "duration_ms": 0.09
+      "duration_ms": 19.53
     },
     {
-      "test": "tests/unit/test_scoring.py::test_title_gate_non_dm_title_blocked_for_senior_icp",
+      "test": "tests/unit/test_enrollment_ranking_no_legacy.py::test_ranking_source_has_no_legacy_shared_pool_fallbacks",
       "outcome": "passed",
-      "duration_ms": 0.09
+      "duration_ms": 17.41
     },
     {
-      "test": "tests/unit/test_scoring.py::test_title_gate_non_dm_title_allowed_for_junior_icp",
+      "test": "tests/unit/test_daily_cap_service.py::test_reserve_slot_fails_safely_when_campaign_does_not_exist",
       "outcome": "passed",
-      "duration_ms": 0.09
+      "duration_ms": 15.74
     },
     {
-      "test": "tests/unit/test_scoring.py::test_title_gate_passes_clean_title",
+      "test": "tests/unit/test_geo_resolver.py::test_resolve_cache_hit_is_fast",
       "outcome": "passed",
-      "duration_ms": 0.09
+      "duration_ms": 15.74
     },
     {
-      "test": "tests/unit/test_shared_pool_migration.py::test_nested_tenant_markers_are_removed_and_audited",
+      "test": "tests/unit/test_daily_cap_service.py::test_reserve_slot_preserves_account_override_clamp",
       "outcome": "passed",
-      "duration_ms": 0.09
+      "duration_ms": 15.69
     },
     {
-      "test": "tests/unit/test_system_settings_and_audit.py::test_get_flag_default_when_no_override",
+      "test": "tests/unit/test_growthtoolkit_service.py::test_5xx_retry_then_success",
       "outcome": "passed",
-      "duration_ms": 0.09
+      "duration_ms": 15.65
     },
     {
-      "test": "tests/unit/test_unipile_retry.py::test_request_succeeds_first_try",
+      "test": "tests/unit/test_employee_selection_isolation.py::test_other_tenant_employee_id_cannot_trigger_lookup_or_mutation",
       "outcome": "passed",
-      "duration_ms": 0.09
+      "duration_ms": 15.53
     },
     {
-      "test": "tests/unit/test_unset_legacy_campaign_scores.py::test_document_without_legacy_fields_is_untouched",
+      "test": "tests/unit/test_apify_service.py::test_call_actor_with_retry_succeeds_first_try",
       "outcome": "passed",
-      "duration_ms": 0.09
+      "duration_ms": 14.58
     },
     {
-      "test": "tests/unit/test_wave_a_security_containment.py::test_linkedin_send_chat_carries_bound_provider_account",
+      "test": "tests/unit/test_curated_discovery_maps.py::test_extract_company_url_falls_back_to_currentposition_singular",
       "outcome": "passed",
-      "duration_ms": 0.09
+      "duration_ms": 14.38
     },
     {
-      "test": "tests/unit/test_wave_a_security_containment.py::test_manual_linkedin_client_resolves_only_authenticated_tenant",
+      "test": "tests/unit/test_daily_cap_service.py::test_scheduled_smart_email_reaches_sender_cap_with_string_campaign_id",
       "outcome": "passed",
-      "duration_ms": 0.09
+      "duration_ms": 12.13
     },
     {
-      "test": "tests/unit/test_wave_a_security_containment.py::test_microsoft_connection_and_exchange_are_disabled",
+      "test": "tests/unit/test_unipile_retry.py::test_request_honors_retry_after_header",
       "outcome": "passed",
-      "duration_ms": 0.09
+      "duration_ms": 11.23
     },
     {
-      "test": "tests/unit/test_wave_a_security_containment.py::test_microsoft_refresh_is_disabled_before_token_or_network",
+      "test": "tests/unit/test_employee_selection_isolation.py::test_company_apify_client_is_constructed_only_on_first_dataset_access",
       "outcome": "passed",
-      "duration_ms": 0.09
+      "duration_ms": 10.29
     },
     {
-      "test": "tests/unit/test_website_scraper_service.py::test_upsert_scrapes_when_website_data_missing",
+      "test": "tests/unit/test_email_thread_context.py::test_conversation_thread_ref_wins_over_campaign_messages",
       "outcome": "passed",
-      "duration_ms": 0.09
+      "duration_ms": 10.06
     },
     {
-      "test": "tests/unit/test_website_scraper_service.py::test_upsert_records_failure_marker_when_fetch_fails",
+      "test": "tests/unit/test_growthtoolkit_service.py::test_enrich_linkedin_task_failure",
       "outcome": "passed",
-      "duration_ms": 0.09
+      "duration_ms": 9.76
     },
     {
-      "test": "tests/unit/test_website_scraper_service.py::test_upsert_skips_when_website_data_fresh",
+      "test": "tests/unit/test_enrichment_durability.py::test_remaining_days_enqueue_uses_deterministic_key_and_coalesces",
       "outcome": "passed",
-      "duration_ms": 0.09
+      "duration_ms": 9.32
     },
     {
-      "test": "tests/unit/test_apify_retry_wiring.py::test_scrape_employees_for_company_uses_call_actor_with_retry",
+      "test": "tests/unit/test_enrichment_durability.py::test_worker_rejects_message_gen_job_for_foreign_tenant",
       "outcome": "passed",
-      "duration_ms": 0.08
+      "duration_ms": 9.12
     },
     {
-      "test": "tests/unit/test_apify_retry_wiring.py::test_scrape_company_pages_empty_urls_short_circuits",
+      "test": "tests/unit/test_connected_system_isolation.py::test_signed_provider_identity_selects_only_its_tenant_conversation",
       "outcome": "passed",
-      "duration_ms": 0.08
+      "duration_ms": 8.96
     },
     {
-      "test": "tests/unit/test_campaign_prospect_state.py::test_zero_is_scored_while_none_remains_unscored",
+      "test": "tests/unit/test_notification_isolation.py::test_create_notification_requires_tenant_before_database_access",
       "outcome": "passed",
-      "duration_ms": 0.08
+      "duration_ms": 8.92
     },
     {
-      "test": "tests/unit/test_curated_discovery_maps.py::test_seniority_unknown_label_dropped",
+      "test": "tests/unit/test_campaign_prospect_state.py::test_cohort_selection_persists_explicit_ids_without_source_tags",
       "outcome": "passed",
-      "duration_ms": 0.08
+      "duration_ms": 7.66
+    },
+    {
+      "test": "tests/unit/test_growthtoolkit_service.py::test_find_emails_batch_shapes",
+      "outcome": "passed",
+      "duration_ms": 7.66
+    },
+    {
+      "test": "tests/unit/test_enrichment_durability.py::test_pre_enrichment_triage_writes_decision_only_to_tenant_state",
+      "outcome": "passed",
+      "duration_ms": 6.88
+    },
+    {
+      "test": "tests/unit/test_daily_cap_service.py::test_email_sender_policy_applies_warmup_ramp_and_provider_ceiling",
+      "outcome": "passed",
+      "duration_ms": 6.83
+    },
+    {
+      "test": "tests/unit/test_company_sourcing_retry.py::test_honors_retry_delay_from_gemini_error",
+      "outcome": "passed",
+      "duration_ms": 6.4
+    },
+    {
+      "test": "tests/unit/test_enrichment_durability.py::test_worker_dispatches_message_gen_ensure_day_to_service",
+      "outcome": "passed",
+      "duration_ms": 6.39
+    },
+    {
+      "test": "tests/unit/test_growthtoolkit_service.py::test_missing_api_key_raises_auth_error",
+      "outcome": "passed",
+      "duration_ms": 6.12
+    },
+    {
+      "test": "tests/unit/test_geo_resolver.py::test_resolve_with_country_hint",
+      "outcome": "passed",
+      "duration_ms": 5.99
+    },
+    {
+      "test": "tests/unit/test_apify_service.py::test_retries_on_network_error_then_succeeds",
+      "outcome": "passed",
+      "duration_ms": 5.93
+    },
+    {
+      "test": "tests/unit/test_geo_resolver.py::test_resolve_unresolvable_returns_none_and_caches",
+      "outcome": "passed",
+      "duration_ms": 5.38
+    },
+    {
+      "test": "tests/unit/test_canonicalizers.py::test_seniority_free_text_to_tokens",
+      "outcome": "passed",
+      "duration_ms": 5.37
+    },
+    {
+      "test": "tests/unit/test_daily_cap_service.py::test_scheduled_sequence_linkedin_reaches_sender_cap_with_string_campaign_id",
+      "outcome": "passed",
+      "duration_ms": 5.29
+    },
+    {
+      "test": "tests/unit/test_shared_pool_migration.py::test_bundle_hash_tampering_fails_closed",
+      "outcome": "passed",
+      "duration_ms": 5.27
+    },
+    {
+      "test": "tests/unit/test_company_sourcing_retry.py::test_retries_on_429_then_succeeds",
+      "outcome": "passed",
+      "duration_ms": 4.97
+    },
+    {
+      "test": "tests/unit/test_inbound_message_id_capture.py::test_ingest_stores_the_inbound_message_id",
+      "outcome": "passed",
+      "duration_ms": 4.92
+    },
+    {
+      "test": "tests/unit/test_provider_security_meetings_calendar.py::test_apify_dataset_clients_are_lazy_and_thread_safe[services.employee_scraper_service]",
+      "outcome": "passed",
+      "duration_ms": 4.82
     },
     {
       "test": "tests/unit/test_enrichment_durability.py::test_campaign_day_enqueue_is_generation_idempotent",
       "outcome": "passed",
-      "duration_ms": 0.08
+      "duration_ms": 4.78
     },
     {
-      "test": "tests/unit/test_enrichment_durability.py::test_campaign_discovery_enqueue_is_generation_idempotent",
+      "test": "tests/unit/test_daily_cap_service.py::test_valid_campaign_id_preserves_unknown_channel_bypass",
       "outcome": "passed",
-      "duration_ms": 0.08
+      "duration_ms": 4.6
+    },
+    {
+      "test": "tests/unit/test_daily_cap_service.py::test_reserve_slot_finds_object_id_campaign_from_safe_representations[<lambda>]",
+      "outcome": "passed",
+      "duration_ms": 4.5
+    },
+    {
+      "test": "tests/unit/test_provider_security_meetings_calendar.py::test_public_booking_binds_invite_to_known_prospect_email",
+      "outcome": "passed",
+      "duration_ms": 4.13
+    },
+    {
+      "test": "tests/unit/test_canonicalizers.py::test_canonicalize_icp_ecommerce_strict_no_group_bleed",
+      "outcome": "passed",
+      "duration_ms": 4.06
+    },
+    {
+      "test": "tests/unit/test_unipile_retry.py::test_request_exhausts_retries_and_raises",
+      "outcome": "passed",
+      "duration_ms": 3.96
     },
     {
       "test": "tests/unit/test_enrichment_durability.py::test_message_gen_enqueue_rejects_unknown_mode",
       "outcome": "passed",
-      "duration_ms": 0.08
+      "duration_ms": 3.94
+    },
+    {
+      "test": "tests/unit/test_employee_selection_isolation.py::test_new_prospect_is_canonical_and_private_state_is_overlay_only",
+      "outcome": "passed",
+      "duration_ms": 3.91
+    },
+    {
+      "test": "tests/unit/test_curated_discovery_maps.py::test_headcount_bands_max_only_starts_from_zero",
+      "outcome": "passed",
+      "duration_ms": 3.87
+    },
+    {
+      "test": "tests/unit/test_enrichment_durability.py::test_message_gen_enqueue_uses_deterministic_key_and_coalesces",
+      "outcome": "passed",
+      "duration_ms": 3.72
+    },
+    {
+      "test": "tests/unit/test_growthtoolkit_service.py::test_enrich_linkedin_task_polling",
+      "outcome": "passed",
+      "duration_ms": 3.67
+    },
+    {
+      "test": "tests/unit/test_prompt_tenant_isolation.py::test_prompt_without_tenant_uses_registry_and_never_queries_override",
+      "outcome": "passed",
+      "duration_ms": 3.59
+    },
+    {
+      "test": "tests/unit/test_calendar_reconciliation.py::test_reschedule_and_attendee_acceptance_are_projected",
+      "outcome": "passed",
+      "duration_ms": 3.48
+    },
+    {
+      "test": "tests/unit/test_job_queue_service.py::test_two_workers_racing_one_job_yield_one_lease_owner",
+      "outcome": "passed",
+      "duration_ms": 3.47
+    },
+    {
+      "test": "tests/unit/test_calendar_reconciliation.py::test_attendee_decline_cancels_and_provider_error_only_schedules_retry",
+      "outcome": "passed",
+      "duration_ms": 3.46
+    },
+    {
+      "test": "tests/unit/test_apify_retry_wiring.py::test_scrape_linkedin_posts_bulk_handles_actor_failure",
+      "outcome": "passed",
+      "duration_ms": 3.38
+    },
+    {
+      "test": "tests/unit/test_provider_security_meetings_calendar.py::test_calendar_watch_stores_only_token_hash_and_binds_provider",
+      "outcome": "passed",
+      "duration_ms": 3.36
+    },
+    {
+      "test": "tests/unit/test_growthtoolkit_service.py::test_facade_never_raises_on_provider_error",
+      "outcome": "passed",
+      "duration_ms": 3.34
+    },
+    {
+      "test": "tests/unit/test_job_queue_service.py::test_failure_retries_then_dead_letters_on_final_attempt",
+      "outcome": "passed",
+      "duration_ms": 3.2
+    },
+    {
+      "test": "tests/unit/test_inbound_message_id_capture.py::test_gmail_requests_the_message_id_header",
+      "outcome": "passed",
+      "duration_ms": 3.18
+    },
+    {
+      "test": "tests/unit/test_provider_security_meetings_calendar.py::test_meeting_proposal_creation_and_reply_are_idempotent",
+      "outcome": "passed",
+      "duration_ms": 3.07
+    },
+    {
+      "test": "tests/unit/test_growthtoolkit_service.py::test_find_emails_surfaces_credit_warning",
+      "outcome": "passed",
+      "duration_ms": 3.06
+    },
+    {
+      "test": "tests/unit/test_apify_service.py::test_retries_on_failed_run_status_then_succeeds",
+      "outcome": "passed",
+      "duration_ms": 3.05
+    },
+    {
+      "test": "tests/unit/test_provider_security_meetings_calendar.py::test_meeting_proposal_defaults_to_draft_and_never_sends",
+      "outcome": "passed",
+      "duration_ms": 3.04
+    },
+    {
+      "test": "tests/unit/test_prompt_tenant_isolation.py::test_prompt_cache_and_lookup_are_partitioned_by_tenant",
+      "outcome": "passed",
+      "duration_ms": 3.02
+    },
+    {
+      "test": "tests/unit/test_daily_cap_service.py::test_reserve_slot_rejects_malformed_campaign_ids_without_db_access[]",
+      "outcome": "passed",
+      "duration_ms": 2.96
+    },
+    {
+      "test": "tests/unit/test_apify_service.py::test_network_error_exhausted_raises",
+      "outcome": "passed",
+      "duration_ms": 2.85
+    },
+    {
+      "test": "tests/unit/test_calendar_reconciliation.py::test_calendar_credential_exactly_matches_tenant_google_account",
+      "outcome": "passed",
+      "duration_ms": 2.84
+    },
+    {
+      "test": "tests/unit/test_enrichment_durability.py::test_runtime_status_is_written_to_tenant_overlay_not_shared_pool",
+      "outcome": "passed",
+      "duration_ms": 2.84
+    },
+    {
+      "test": "tests/unit/test_email_thread_context.py::test_thread_ref_comes_from_conversation_when_campaign_messages_empty",
+      "outcome": "passed",
+      "duration_ms": 2.74
+    },
+    {
+      "test": "tests/unit/test_unipile_retry.py::test_request_retries_429_then_succeeds",
+      "outcome": "passed",
+      "duration_ms": 2.73
+    },
+    {
+      "test": "tests/unit/test_growthtoolkit_service.py::test_extract_first_last_prefers_explicit_fields",
+      "outcome": "passed",
+      "duration_ms": 2.67
+    },
+    {
+      "test": "tests/unit/test_lead_mapping_service.py::test_is_person_vs_company_linkedin",
+      "outcome": "passed",
+      "duration_ms": 2.67
+    },
+    {
+      "test": "tests/unit/test_shared_pool_migration.py::test_restore_preview_validates_bundle_without_credentials",
+      "outcome": "passed",
+      "duration_ms": 2.67
+    },
+    {
+      "test": "tests/unit/test_calendar_reconciliation.py::test_cancelled_event_is_exactly_bound_claimed_and_idempotent",
+      "outcome": "passed",
+      "duration_ms": 2.64
+    },
+    {
+      "test": "tests/unit/test_growthtoolkit_service.py::test_usage_doc_written_on_success",
+      "outcome": "passed",
+      "duration_ms": 2.64
+    },
+    {
+      "test": "tests/unit/test_lead_mapping_service.py::test_person_with_name_and_company_email_only_path",
+      "outcome": "passed",
+      "duration_ms": 2.64
+    },
+    {
+      "test": "tests/unit/test_production_config.py::test_unsafe_production_configuration_is_rejected[overrides7-ENRICHMENT_STARTUP_SWEEP_ENABLED]",
+      "outcome": "passed",
+      "duration_ms": 2.53
+    },
+    {
+      "test": "tests/unit/test_canonicalizers.py::test_cosine_similarity_basics",
+      "outcome": "passed",
+      "duration_ms": 2.49
+    },
+    {
+      "test": "tests/unit/test_enrichment_durability.py::test_campaign_day_endpoint_is_queue_only_and_tenant_scoped",
+      "outcome": "passed",
+      "duration_ms": 2.46
+    },
+    {
+      "test": "tests/unit/test_send_attempt_service.py::test_not_sent_reconciliation_releases_caps_exactly_once",
+      "outcome": "passed",
+      "duration_ms": 2.45
+    },
+    {
+      "test": "tests/unit/test_prospect_activity_isolation.py::test_manual_linkedin_lookup_rejects_other_tenant_before_shared_read",
+      "outcome": "passed",
+      "duration_ms": 2.39
+    },
+    {
+      "test": "tests/unit/test_job_queue_service.py::test_every_read_and_mutation_is_tenant_scoped",
+      "outcome": "passed",
+      "duration_ms": 2.38
+    },
+    {
+      "test": "tests/unit/test_enrichment_durability.py::test_message_gen_modes_have_distinct_keys",
+      "outcome": "passed",
+      "duration_ms": 2.35
+    },
+    {
+      "test": "tests/unit/test_job_queue_service.py::test_expired_lease_is_reclaimed_and_stale_worker_loses_ownership",
+      "outcome": "passed",
+      "duration_ms": 2.3
+    },
+    {
+      "test": "tests/unit/test_job_queue_service.py::test_heartbeat_checkpoint_completion_and_cancellation_are_durable",
+      "outcome": "passed",
+      "duration_ms": 2.27
+    },
+    {
+      "test": "tests/unit/test_growthtoolkit_service.py::test_requests_reuse_single_shared_client",
+      "outcome": "passed",
+      "duration_ms": 2.24
+    },
+    {
+      "test": "tests/unit/test_conversation_isolation.py::test_missing_tenant_context_fails_before_database_access",
+      "outcome": "passed",
+      "duration_ms": 2.22
+    },
+    {
+      "test": "tests/unit/test_inbound_message_id_capture.py::test_reply_meta_carries_rfc_message_id",
+      "outcome": "passed",
+      "duration_ms": 2.21
+    },
+    {
+      "test": "tests/unit/test_canonicalizers.py::test_industry_exact_alias",
+      "outcome": "passed",
+      "duration_ms": 2.2
+    },
+    {
+      "test": "tests/unit/test_provider_security_meetings_calendar.py::test_google_webhook_rejects_body_and_resource_mismatch_before_sync",
+      "outcome": "passed",
+      "duration_ms": 2.18
+    },
+    {
+      "test": "tests/unit/test_apify_service.py::test_returns_last_failed_run_when_retries_exhausted",
+      "outcome": "passed",
+      "duration_ms": 2.16
+    },
+    {
+      "test": "tests/unit/test_apify_retry_wiring.py::test_run_one_employee_scrape_uses_call_actor_with_retry",
+      "outcome": "passed",
+      "duration_ms": 2.12
+    },
+    {
+      "test": "tests/unit/test_provider_security_meetings_calendar.py::test_meeting_confirmation_is_tenant_scoped_and_provider_idempotent",
+      "outcome": "passed",
+      "duration_ms": 2.07
+    },
+    {
+      "test": "tests/unit/test_job_queue_service.py::test_deterministic_key_is_idempotent_within_tenant_and_job_type",
+      "outcome": "passed",
+      "duration_ms": 2.04
+    },
+    {
+      "test": "tests/unit/test_curated_discovery_maps.py::test_seniority_director_maps_to_220",
+      "outcome": "passed",
+      "duration_ms": 2.03
+    },
+    {
+      "test": "tests/unit/test_daily_cap_service.py::test_sender_reservation_enforces_runtime_spacing_and_effective_cap",
+      "outcome": "passed",
+      "duration_ms": 2.01
     },
     {
       "test": "tests/unit/test_geo_resolver.py::test_resolve_country_name_no_sqlite_needed",
       "outcome": "passed",
-      "duration_ms": 0.08
+      "duration_ms": 2.01
+    },
+    {
+      "test": "tests/unit/test_provider_security_meetings_calendar.py::test_apify_dataset_clients_are_lazy_and_thread_safe[services.linkedin_post_scraper_service]",
+      "outcome": "passed",
+      "duration_ms": 1.99
+    },
+    {
+      "test": "tests/unit/test_growthtoolkit_service.py::test_find_emails_empty_entries",
+      "outcome": "passed",
+      "duration_ms": 1.95
+    },
+    {
+      "test": "tests/unit/test_enrichment_durability.py::test_dispatcher_discovers_and_claims_campaign_day_jobs_independently",
+      "outcome": "passed",
+      "duration_ms": 1.93
+    },
+    {
+      "test": "tests/unit/test_prospect_activity_isolation.py::test_arbitrary_prospect_id_cannot_create_activity_ownership",
+      "outcome": "passed",
+      "duration_ms": 1.92
+    },
+    {
+      "test": "tests/unit/test_calendar_reconciliation.py::test_scheduler_bounds_groups_and_passes_exact_provider_binding",
+      "outcome": "passed",
+      "duration_ms": 1.91
+    },
+    {
+      "test": "tests/unit/test_enrichment_durability.py::test_campaign_day_worker_reads_campaign_and_enrollments_inside_tenant",
+      "outcome": "passed",
+      "duration_ms": 1.81
+    },
+    {
+      "test": "tests/unit/test_curated_discovery_maps.py::test_short_mode_employee_transform_title_and_company",
+      "outcome": "passed",
+      "duration_ms": 1.79
+    },
+    {
+      "test": "tests/unit/test_company_sourcing_retry.py::test_source_companies_succeeds_first_try",
+      "outcome": "passed",
+      "duration_ms": 1.74
+    },
+    {
+      "test": "tests/unit/test_email_provider_factory.py::test_get_provider_does_not_mutate_original_dict",
+      "outcome": "passed",
+      "duration_ms": 1.72
+    },
+    {
+      "test": "tests/unit/test_notification_isolation.py::test_notification_mutations_are_tenant_scoped",
+      "outcome": "passed",
+      "duration_ms": 1.7
+    },
+    {
+      "test": "tests/unit/test_lead_mapping_service.py::test_build_lead_fields_company_linkedin_from_generic_column",
+      "outcome": "passed",
+      "duration_ms": 1.67
+    },
+    {
+      "test": "tests/unit/test_provider_security_meetings_calendar.py::test_meeting_confirmation_rejects_cross_tenant_before_provider",
+      "outcome": "passed",
+      "duration_ms": 1.67
+    },
+    {
+      "test": "tests/unit/test_enrollment_ranking_no_legacy.py::test_unscored_sorts_after_zero_and_positive_scores",
+      "outcome": "passed",
+      "duration_ms": 1.55
+    },
+    {
+      "test": "tests/unit/test_prospect_exclusion_reuse.py::test_active_campaign_still_owns_prospect",
+      "outcome": "passed",
+      "duration_ms": 1.55
+    },
+    {
+      "test": "tests/unit/test_sequence_endpoints.py::test_put_sequence_persists_valid_graph",
+      "outcome": "passed",
+      "duration_ms": 1.53
+    },
+    {
+      "test": "tests/unit/test_apify_retry_wiring.py::test_scrape_company_pages_uses_call_actor_with_retry",
+      "outcome": "passed",
+      "duration_ms": 1.47
+    },
+    {
+      "test": "tests/unit/test_production_config.py::test_unsafe_production_configuration_is_rejected[overrides0-JWT_SECRET_KEY]",
+      "outcome": "passed",
+      "duration_ms": 1.44
     },
     {
       "test": "tests/unit/test_geo_resolver.py::test_resolve_iso2_code",
       "outcome": "passed",
-      "duration_ms": 0.08
+      "duration_ms": 1.43
+    },
+    {
+      "test": "tests/unit/test_growthtoolkit_service.py::test_find_emails_credit_warning_checks_error_code_not_subclass",
+      "outcome": "passed",
+      "duration_ms": 1.42
+    },
+    {
+      "test": "tests/unit/test_lead_mapping_service.py::test_person_with_direct_email_no_linkedin_no_company",
+      "outcome": "passed",
+      "duration_ms": 1.41
+    },
+    {
+      "test": "tests/unit/test_apify_retry_wiring.py::test_scrape_linkedin_posts_bulk_uses_call_actor_with_retry",
+      "outcome": "passed",
+      "duration_ms": 1.4
+    },
+    {
+      "test": "tests/unit/test_conversation_isolation.py::test_same_shared_prospect_and_chat_are_isolated_by_tenant_and_provider",
+      "outcome": "passed",
+      "duration_ms": 1.4
+    },
+    {
+      "test": "tests/unit/test_campaign_prospect_state.py::test_enrichment_transitions_started_completed_and_failed_are_atomic",
+      "outcome": "passed",
+      "duration_ms": 1.37
+    },
+    {
+      "test": "tests/unit/test_canonicalizers.py::test_expand_icp_to_industry_ids_strict_no_group_expansion",
+      "outcome": "passed",
+      "duration_ms": 1.37
+    },
+    {
+      "test": "tests/unit/test_geo_resolver.py::test_normalize_raw",
+      "outcome": "passed",
+      "duration_ms": 1.36
+    },
+    {
+      "test": "tests/unit/test_prospect_exclusion_reuse.py::test_draft_and_awaiting_approval_occupy",
+      "outcome": "passed",
+      "duration_ms": 1.36
+    },
+    {
+      "test": "tests/unit/test_crypto.py::test_decrypt_with_no_key_configured_returns_none",
+      "outcome": "passed",
+      "duration_ms": 1.35
+    },
+    {
+      "test": "tests/unit/test_unipile_retry.py::test_request_form_retries_5xx_then_succeeds",
+      "outcome": "passed",
+      "duration_ms": 1.33
+    },
+    {
+      "test": "tests/unit/test_unipile_retry.py::test_request_retries_5xx_then_succeeds",
+      "outcome": "passed",
+      "duration_ms": 1.32
+    },
+    {
+      "test": "tests/unit/test_send_attempt_service.py::test_provider_reconciliation_sent_closes_attempt_without_resend",
+      "outcome": "passed",
+      "duration_ms": 1.25
+    },
+    {
+      "test": "tests/unit/test_companies_prospect_count_live.py::test_list_companies_uses_live_lookup_no_stored_field",
+      "outcome": "passed",
+      "duration_ms": 1.23
+    },
+    {
+      "test": "tests/unit/test_send_attempt_service.py::test_two_workers_same_send_key_cross_provider_boundary_once",
+      "outcome": "passed",
+      "duration_ms": 1.22
+    },
+    {
+      "test": "tests/unit/test_calendar_reconciliation.py::test_calendar_credential_without_binding_fails_closed_when_ambiguous",
+      "outcome": "passed",
+      "duration_ms": 1.19
+    },
+    {
+      "test": "tests/unit/test_sequence_service.py::test_edge_to_unknown_node_is_rejected",
+      "outcome": "passed",
+      "duration_ms": 1.18
     },
     {
       "test": "tests/unit/test_production_config.py::test_development_configuration_is_not_forced_to_have_provider_secrets",
+      "outcome": "passed",
+      "duration_ms": 1.16
+    },
+    {
+      "test": "tests/unit/test_send_attempt_service.py::test_failure_after_provider_boundary_is_ambiguous_and_never_blind_retried",
+      "outcome": "passed",
+      "duration_ms": 1.15
+    },
+    {
+      "test": "tests/unit/test_campaign_prospect_query_contract.py::test_campaign_list_uses_membership_then_canonical_score_page",
+      "outcome": "passed",
+      "duration_ms": 1.13
+    },
+    {
+      "test": "tests/unit/test_campaign_prospect_state.py::test_reused_prospect_is_recomputed_for_each_campaign",
+      "outcome": "passed",
+      "duration_ms": 1.13
+    },
+    {
+      "test": "tests/unit/test_shared_pool_authorization.py::test_prospect_read_and_patch_are_tenant_scoped_and_overlay_only",
+      "outcome": "passed",
+      "duration_ms": 1.12
+    },
+    {
+      "test": "tests/unit/test_activity_feed_isolation.py::test_activity_feed_fails_closed_without_tenant",
+      "outcome": "passed",
+      "duration_ms": 1.1
+    },
+    {
+      "test": "tests/unit/test_canonicalizers.py::test_industry_unresolvable_returns_none",
+      "outcome": "passed",
+      "duration_ms": 1.1
+    },
+    {
+      "test": "tests/unit/test_canonicalizers.py::test_canonicalize_icp_local_paths",
+      "outcome": "passed",
+      "duration_ms": 1.08
+    },
+    {
+      "test": "tests/unit/test_enrichment_durability.py::test_dispatcher_discovers_and_claims_new_durable_job_types",
+      "outcome": "passed",
+      "duration_ms": 1.08
+    },
+    {
+      "test": "tests/unit/test_send_attempt_service.py::test_failure_before_provider_is_retryable_without_calling_provider",
+      "outcome": "passed",
+      "duration_ms": 1.08
+    },
+    {
+      "test": "tests/unit/test_curated_discovery_maps.py::test_full_mode_employee_transform_still_works_backward_compat",
+      "outcome": "passed",
+      "duration_ms": 1.07
+    },
+    {
+      "test": "tests/unit/test_email_provider_factory.py::test_get_provider_google_returns_gmail_provider",
+      "outcome": "passed",
+      "duration_ms": 1.05
+    },
+    {
+      "test": "tests/unit/test_provider_security_meetings_calendar.py::test_public_booking_requires_valid_email_when_no_known_email",
+      "outcome": "passed",
+      "duration_ms": 1.0
+    },
+    {
+      "test": "tests/unit/test_prospect_exclusion_reuse.py::test_archived_never_sent_campaign_releases_prospect",
+      "outcome": "passed",
+      "duration_ms": 0.99
+    },
+    {
+      "test": "tests/unit/test_onboarding_draft_whitelist.py::test_unknown_and_mistyped_fields_are_dropped",
+      "outcome": "passed",
+      "duration_ms": 0.98
+    },
+    {
+      "test": "tests/unit/test_conversation_isolation.py::test_reply_fanout_claim_is_idempotent_within_tenant_provider",
+      "outcome": "passed",
+      "duration_ms": 0.97
+    },
+    {
+      "test": "tests/unit/test_send_attempt_service.py::test_two_workers_racing_one_due_enrollment_get_one_lease",
+      "outcome": "passed",
+      "duration_ms": 0.97
+    },
+    {
+      "test": "tests/unit/test_canonicalizers.py::test_canonicalize_icp_empty_input",
+      "outcome": "passed",
+      "duration_ms": 0.96
+    },
+    {
+      "test": "tests/unit/test_calendar_reconciliation.py::test_get_event_uses_exact_mailbox_calendar_and_normalizes_not_found",
+      "outcome": "passed",
+      "duration_ms": 0.91
+    },
+    {
+      "test": "tests/unit/test_enrichment_durability.py::test_campaign_discovery_enqueue_is_generation_idempotent",
+      "outcome": "passed",
+      "duration_ms": 0.89
+    },
+    {
+      "test": "tests/unit/test_growthtoolkit_service.py::test_split_full_name",
+      "outcome": "passed",
+      "duration_ms": 0.88
+    },
+    {
+      "test": "tests/unit/test_outreach_prompt_context.py::test_batch_prompt_without_profile_still_builds",
+      "outcome": "passed",
+      "duration_ms": 0.87
+    },
+    {
+      "test": "tests/unit/test_shared_pool_migration.py::test_nonempty_output_directory_fails_before_writing",
+      "outcome": "passed",
+      "duration_ms": 0.85
+    },
+    {
+      "test": "tests/unit/test_prospect_activity_isolation.py::test_campaign_activity_updates_only_matching_tenant_enrollment",
+      "outcome": "passed",
+      "duration_ms": 0.84
+    },
+    {
+      "test": "tests/unit/test_provider_security_meetings_calendar.py::test_google_webhook_requires_exact_channel_secret_resource_and_tenant_provider",
+      "outcome": "passed",
+      "duration_ms": 0.84
+    },
+    {
+      "test": "tests/unit/test_conversation_isolation.py::test_provider_message_replay_appends_only_once",
+      "outcome": "passed",
+      "duration_ms": 0.83
+    },
+    {
+      "test": "tests/unit/test_notification_isolation.py::test_create_notification_persists_one_canonical_schema",
+      "outcome": "passed",
+      "duration_ms": 0.83
+    },
+    {
+      "test": "tests/unit/test_campaign_prospect_state.py::test_same_pool_prospect_has_independent_campaign_score_keys",
+      "outcome": "passed",
+      "duration_ms": 0.82
+    },
+    {
+      "test": "tests/unit/test_session_security.py::test_explicit_bearer_client_does_not_require_csrf",
+      "outcome": "passed",
+      "duration_ms": 0.81
+    },
+    {
+      "test": "tests/unit/test_prospect_exclusion_reuse.py::test_paused_never_sent_campaign_releases_prospect",
+      "outcome": "passed",
+      "duration_ms": 0.79
+    },
+    {
+      "test": "tests/unit/test_activity_feed_isolation.py::test_activity_feed_requires_and_applies_tenant_to_every_pipeline",
+      "outcome": "passed",
+      "duration_ms": 0.77
+    },
+    {
+      "test": "tests/unit/test_enrollment_ranking_no_legacy.py::test_zero_is_a_real_score_and_null_is_unscored",
+      "outcome": "passed",
+      "duration_ms": 0.76
+    },
+    {
+      "test": "tests/unit/test_prospect_activity_isolation.py::test_same_shared_prospect_has_isolated_tenant_activity",
+      "outcome": "passed",
+      "duration_ms": 0.74
+    },
+    {
+      "test": "tests/unit/test_apify_service.py::test_invalid_input_error_is_not_retried",
+      "outcome": "passed",
+      "duration_ms": 0.73
+    },
+    {
+      "test": "tests/unit/test_sequence_endpoints.py::test_put_sequence_locked_when_active_or_completed[active]",
+      "outcome": "passed",
+      "duration_ms": 0.73
+    },
+    {
+      "test": "tests/unit/test_growthtoolkit_service.py::test_find_emails_no_warning_for_non_credit_error",
+      "outcome": "passed",
+      "duration_ms": 0.71
+    },
+    {
+      "test": "tests/unit/test_canonicalizers.py::test_seniority_unknown_input_yields_empty",
+      "outcome": "passed",
+      "duration_ms": 0.7
+    },
+    {
+      "test": "tests/unit/test_apify_service.py::test_timeout_secs_forwarded_to_call",
+      "outcome": "passed",
+      "duration_ms": 0.69
+    },
+    {
+      "test": "tests/unit/test_provider_security_meetings_calendar.py::test_calendar_watch_rejects_arbitrary_callback_before_credentials",
+      "outcome": "passed",
+      "duration_ms": 0.69
+    },
+    {
+      "test": "tests/unit/test_companies_prospect_count_live.py::test_list_companies_paginates_before_lookup_when_not_needed",
+      "outcome": "passed",
+      "duration_ms": 0.68
+    },
+    {
+      "test": "tests/unit/test_enrichment_durability.py::test_worker_dispatches_message_gen_generate_day_to_service",
+      "outcome": "passed",
+      "duration_ms": 0.68
+    },
+    {
+      "test": "tests/unit/test_lead_mapping_service.py::test_normalize_domain[-None]",
+      "outcome": "passed",
+      "duration_ms": 0.68
+    },
+    {
+      "test": "tests/unit/test_apify_retry_wiring.py::test_scrape_employees_for_company_uses_call_actor_with_retry",
+      "outcome": "passed",
+      "duration_ms": 0.67
+    },
+    {
+      "test": "tests/unit/test_growthtoolkit_service.py::test_invalid_input_raises",
+      "outcome": "passed",
+      "duration_ms": 0.66
+    },
+    {
+      "test": "tests/unit/test_lead_mapping_service.py::test_company_row_domain_only",
+      "outcome": "passed",
+      "duration_ms": 0.65
+    },
+    {
+      "test": "tests/unit/test_production_config.py::test_valid_production_configuration_passes",
+      "outcome": "passed",
+      "duration_ms": 0.65
+    },
+    {
+      "test": "tests/unit/test_curated_discovery_maps.py::test_function_id_mapping[customer_success-26]",
+      "outcome": "passed",
+      "duration_ms": 0.64
+    },
+    {
+      "test": "tests/unit/test_lead_mapping_service.py::test_person_with_linkedin_profile",
+      "outcome": "passed",
+      "duration_ms": 0.63
+    },
+    {
+      "test": "tests/unit/test_lead_mapping_service.py::test_build_lead_fields_splits_full_name",
+      "outcome": "passed",
+      "duration_ms": 0.63
+    },
+    {
+      "test": "tests/unit/test_website_scraper_service.py::test_fetch_website_data_structured",
+      "outcome": "passed",
+      "duration_ms": 0.62
+    },
+    {
+      "test": "tests/unit/test_website_scraper_service.py::test_fetch_website_data_http_error_returns_none",
+      "outcome": "passed",
+      "duration_ms": 0.62
+    },
+    {
+      "test": "tests/unit/test_enrichment_durability.py::test_worker_dispatches_remaining_days_to_service",
+      "outcome": "passed",
+      "duration_ms": 0.61
+    },
+    {
+      "test": "tests/unit/test_growthtoolkit_service.py::test_find_email_success",
+      "outcome": "passed",
+      "duration_ms": 0.61
+    },
+    {
+      "test": "tests/unit/test_curated_discovery_maps.py::test_function_id_mapping[hr-12]",
+      "outcome": "passed",
+      "duration_ms": 0.6
+    },
+    {
+      "test": "tests/unit/test_growthtoolkit_service.py::test_find_email_not_found_returns_none",
+      "outcome": "passed",
+      "duration_ms": 0.6
+    },
+    {
+      "test": "tests/unit/test_campaign_engine_sequence.py::test_enrollment_without_sequence_state_does_not_enter_sequence_path",
+      "outcome": "passed",
+      "duration_ms": 0.58
+    },
+    {
+      "test": "tests/unit/test_campaign_sequence_launch_guard.py::test_declared_sequence_without_persisted_graph_is_rejected",
+      "outcome": "passed",
+      "duration_ms": 0.58
+    },
+    {
+      "test": "tests/unit/test_canonicalizers.py::test_seniority_one_input_many_tokens_no_duplicates",
+      "outcome": "passed",
+      "duration_ms": 0.58
+    },
+    {
+      "test": "tests/unit/test_curated_discovery_maps.py::test_seniority_head_maps_to_220",
+      "outcome": "passed",
+      "duration_ms": 0.57
+    },
+    {
+      "test": "tests/unit/test_email_provider_factory.py::test_get_provider_none_account_returns_none",
+      "outcome": "passed",
+      "duration_ms": 0.56
+    },
+    {
+      "test": "tests/unit/test_session_security.py::test_browser_auth_response_sets_httponly_session_without_returning_jwt",
+      "outcome": "passed",
+      "duration_ms": 0.56
+    },
+    {
+      "test": "tests/unit/test_shared_pool_authorization.py::test_bulk_and_single_enrollment_require_prospect_overlay_access",
+      "outcome": "passed",
+      "duration_ms": 0.56
+    },
+    {
+      "test": "tests/unit/test_production_config.py::test_unsafe_production_configuration_is_rejected[overrides6-GOOGLE_REDIRECT_URI]",
+      "outcome": "passed",
+      "duration_ms": 0.55
+    },
+    {
+      "test": "tests/unit/test_curated_discovery_maps.py::test_extract_company_url_prefers_currentpositions_plural",
+      "outcome": "passed",
+      "duration_ms": 0.54
+    },
+    {
+      "test": "tests/unit/test_lead_mapping_service.py::test_normalize_linkedin_url_variants",
+      "outcome": "passed",
+      "duration_ms": 0.54
+    },
+    {
+      "test": "tests/unit/test_connected_system_isolation.py::test_ai_draft_lookup_rejects_missing_tenant_before_database",
+      "outcome": "passed",
+      "duration_ms": 0.53
+    },
+    {
+      "test": "tests/unit/test_growthtoolkit_service.py::test_usage_doc_written_on_credit_error",
+      "outcome": "passed",
+      "duration_ms": 0.53
+    },
+    {
+      "test": "tests/unit/test_connected_system_isolation.py::test_webhook_missing_or_conflicting_provider_identity_fails_closed",
+      "outcome": "passed",
+      "duration_ms": 0.52
+    },
+    {
+      "test": "tests/unit/test_activity_feed_isolation.py::test_activity_summary_scopes_conversations_and_overlays",
+      "outcome": "passed",
+      "duration_ms": 0.51
+    },
+    {
+      "test": "tests/unit/test_canonicalizers.py::test_suggest_industry_expansions_empty_for_non_group_terms",
+      "outcome": "passed",
+      "duration_ms": 0.51
+    },
+    {
+      "test": "tests/unit/test_growthtoolkit_service.py::test_find_email_credits_exhausted_raises",
+      "outcome": "passed",
+      "duration_ms": 0.51
+    },
+    {
+      "test": "tests/unit/test_prospect_exclusion_reuse.py::test_old_send_beyond_cooldown_releases_prospect",
+      "outcome": "passed",
+      "duration_ms": 0.51
+    },
+    {
+      "test": "tests/unit/test_shared_pool_migration.py::test_tenant_fields_move_to_overlay_and_campaign_history_is_quarantined",
+      "outcome": "passed",
+      "duration_ms": 0.51
+    },
+    {
+      "test": "tests/unit/test_curated_discovery_maps.py::test_headcount_bands_huge_company_only",
+      "outcome": "passed",
+      "duration_ms": 0.5
+    },
+    {
+      "test": "tests/unit/test_campaign_sequence_launch_guard.py::test_legacy_auto_launch_rejects_missing_graph_before_database_work",
+      "outcome": "passed",
+      "duration_ms": 0.49
+    },
+    {
+      "test": "tests/unit/test_campaign_sequence_launch_guard.py::test_invalid_persisted_sequence_is_rejected",
+      "outcome": "passed",
+      "duration_ms": 0.48
+    },
+    {
+      "test": "tests/unit/test_lead_mapping_service.py::test_normalize_domain[None-None]",
+      "outcome": "passed",
+      "duration_ms": 0.48
+    },
+    {
+      "test": "tests/unit/test_lead_mapping_service.py::test_heuristic_mapping_ambiguous_creates_question",
+      "outcome": "passed",
+      "duration_ms": 0.48
+    },
+    {
+      "test": "tests/unit/test_production_config.py::test_unsafe_production_configuration_is_rejected[overrides3-DEBUG]",
+      "outcome": "passed",
+      "duration_ms": 0.48
+    },
+    {
+      "test": "tests/unit/test_campaign_engine_sequence.py::test_legacy_smart_campaign_never_enters_sequence_path",
+      "outcome": "passed",
+      "duration_ms": 0.47
+    },
+    {
+      "test": "tests/unit/test_sequence_endpoints.py::test_get_sequence_returns_default_when_none_stored",
+      "outcome": "passed",
+      "duration_ms": 0.46
+    },
+    {
+      "test": "tests/unit/test_curated_discovery_maps.py::test_seniority_other_levels_unchanged",
+      "outcome": "passed",
+      "duration_ms": 0.45
+    },
+    {
+      "test": "tests/unit/test_send_attempt_service.py::test_tenant_sender_lookup_rejects_other_tenants_sender",
+      "outcome": "passed",
+      "duration_ms": 0.45
+    },
+    {
+      "test": "tests/unit/test_growthtoolkit_service.py::test_shared_client_lazy_init_reuse_and_aclose",
+      "outcome": "passed",
+      "duration_ms": 0.44
+    },
+    {
+      "test": "tests/unit/test_scoring.py::test_v2_empty_lead_scores_low_but_not_zero",
+      "outcome": "passed",
+      "duration_ms": 0.44
+    },
+    {
+      "test": "tests/unit/test_wave_a_security_containment.py::test_oauth_state_is_bound_and_one_time",
+      "outcome": "passed",
+      "duration_ms": 0.44
+    },
+    {
+      "test": "tests/unit/test_campaign_sequence_launch_guard.py::test_approve_day_rejects_missing_graph_before_database_work",
+      "outcome": "passed",
+      "duration_ms": 0.43
+    },
+    {
+      "test": "tests/unit/test_company_sourcing_retry.py::test_extract_retry_delay_from_structured_details",
+      "outcome": "passed",
+      "duration_ms": 0.43
+    },
+    {
+      "test": "tests/unit/test_apify_retry_wiring.py::test_scrape_companies_uses_call_actor_with_retry",
+      "outcome": "passed",
+      "duration_ms": 0.42
+    },
+    {
+      "test": "tests/unit/test_crypto.py::test_encrypt_is_idempotent_on_already_encrypted_value",
+      "outcome": "passed",
+      "duration_ms": 0.42
+    },
+    {
+      "test": "tests/unit/test_geo_resolver.py::test_hint_to_code",
+      "outcome": "passed",
+      "duration_ms": 0.41
+    },
+    {
+      "test": "tests/unit/test_notification_isolation.py::test_sse_event_uses_canonical_body_and_campaign_fields",
+      "outcome": "passed",
+      "duration_ms": 0.41
+    },
+    {
+      "test": "tests/unit/test_auth_membership_boundary.py::test_account_context_accepts_object_id_membership",
+      "outcome": "passed",
+      "duration_ms": 0.4
+    },
+    {
+      "test": "tests/unit/test_email_provider_factory.py::test_get_provider_zoho_returns_zoho_provider",
+      "outcome": "passed",
+      "duration_ms": 0.4
+    },
+    {
+      "test": "tests/unit/test_production_config.py::test_unsafe_production_configuration_is_rejected[overrides1-ENCRYPTION_KEY]",
+      "outcome": "passed",
+      "duration_ms": 0.4
+    },
+    {
+      "test": "tests/unit/test_website_scraper_service.py::test_fetch_website_data_bounds_about_text",
+      "outcome": "passed",
+      "duration_ms": 0.4
+    },
+    {
+      "test": "tests/unit/test_canonicalizers.py::test_employee_bands",
+      "outcome": "passed",
+      "duration_ms": 0.39
+    },
+    {
+      "test": "tests/unit/test_sequence_service.py::test_default_template_no_reply_gaps_are_one_or_two_days",
+      "outcome": "passed",
+      "duration_ms": 0.39
+    },
+    {
+      "test": "tests/unit/test_sequence_service.py::test_invalid_channel_is_rejected",
+      "outcome": "passed",
+      "duration_ms": 0.39
+    },
+    {
+      "test": "tests/unit/test_wave_a_security_containment.py::test_onboarding_uses_shared_signed_state_contract",
+      "outcome": "passed",
+      "duration_ms": 0.39
+    },
+    {
+      "test": "tests/unit/test_canonicalizers.py::test_expand_icp_to_industry_ids_dedupes",
+      "outcome": "passed",
+      "duration_ms": 0.38
+    },
+    {
+      "test": "tests/unit/test_canonicalizers.py::test_suggest_industry_expansions_surfaces_group_siblings",
+      "outcome": "passed",
+      "duration_ms": 0.38
+    },
+    {
+      "test": "tests/unit/test_geo_resolver.py::test_resolve_empty_and_none",
+      "outcome": "passed",
+      "duration_ms": 0.38
+    },
+    {
+      "test": "tests/unit/test_growthtoolkit_service.py::test_find_emails_credit_warnings_default_none_is_safe",
+      "outcome": "passed",
+      "duration_ms": 0.38
+    },
+    {
+      "test": "tests/unit/test_scoring.py::test_decision_maker_rules[prospect1-True]",
+      "outcome": "passed",
+      "duration_ms": 0.38
+    },
+    {
+      "test": "tests/unit/test_scoring.py::test_title_gate_non_dm_title_allowed_for_junior_icp",
+      "outcome": "passed",
+      "duration_ms": 0.38
+    },
+    {
+      "test": "tests/unit/test_canonicalizers.py::test_industry_alias_substring",
+      "outcome": "passed",
+      "duration_ms": 0.37
+    },
+    {
+      "test": "tests/unit/test_curated_discovery_maps.py::test_function_id_mapping_unknown_dropped",
+      "outcome": "passed",
+      "duration_ms": 0.37
+    },
+    {
+      "test": "tests/unit/test_curated_discovery_maps.py::test_short_mode_employee_transform_has_no_email",
+      "outcome": "passed",
+      "duration_ms": 0.37
+    },
+    {
+      "test": "tests/unit/test_prospect_exclusion_reuse.py::test_send_guard_protects_messaged_prospect_even_if_campaign_archived",
+      "outcome": "passed",
+      "duration_ms": 0.37
+    },
+    {
+      "test": "tests/unit/test_channel_plan_skip_reasons.py::test_channel_mismatch_when_contact_channel_has_no_account",
+      "outcome": "passed",
+      "duration_ms": 0.36
+    },
+    {
+      "test": "tests/unit/test_scoring.py::test_tier_from_score[79.9-warm]",
+      "outcome": "passed",
+      "duration_ms": 0.36
+    },
+    {
+      "test": "tests/unit/test_sequence_endpoints.py::test_get_sequence_returns_stored_graph",
+      "outcome": "passed",
+      "duration_ms": 0.35
+    },
+    {
+      "test": "tests/unit/test_lead_mapping_service.py::test_unresolvable_junk_row",
+      "outcome": "passed",
+      "duration_ms": 0.34
+    },
+    {
+      "test": "tests/unit/test_prospect_exclusion_reuse.py::test_hard_deleted_campaign_releases_prospect",
+      "outcome": "passed",
+      "duration_ms": 0.34
+    },
+    {
+      "test": "tests/unit/test_rate_limiter.py::test_get_rate_limiter_returns_same_instance_for_same_key",
+      "outcome": "passed",
+      "duration_ms": 0.34
+    },
+    {
+      "test": "tests/unit/test_campaign_engine_sequence.py::test_routes_to_sequence_when_graph_and_state_present",
+      "outcome": "passed",
+      "duration_ms": 0.33
+    },
+    {
+      "test": "tests/unit/test_lead_mapping_service.py::test_unresolvable_name_only",
+      "outcome": "passed",
+      "duration_ms": 0.33
+    },
+    {
+      "test": "tests/unit/test_provider_security_meetings_calendar.py::test_calendar_status_uses_stored_google_provider_value",
+      "outcome": "passed",
+      "duration_ms": 0.33
+    },
+    {
+      "test": "tests/unit/test_companies_prospect_count_live.py::test_by_industry_sums_live_prospect_count",
+      "outcome": "passed",
+      "duration_ms": 0.32
+    },
+    {
+      "test": "tests/unit/test_company_sourcing_retry.py::test_extract_retry_delay_returns_none_when_absent",
+      "outcome": "passed",
+      "duration_ms": 0.32
+    },
+    {
+      "test": "tests/unit/test_lead_mapping_service.py::test_person_linkedin_wins_even_without_name_columns_but_full_name_present",
+      "outcome": "passed",
+      "duration_ms": 0.32
+    },
+    {
+      "test": "tests/unit/test_scoring.py::test_decision_maker_rules[prospect2-False]",
+      "outcome": "passed",
+      "duration_ms": 0.32
+    },
+    {
+      "test": "tests/unit/test_company_sourcing_retry.py::test_extract_retry_delay_falls_back_to_regex",
+      "outcome": "passed",
+      "duration_ms": 0.31
+    },
+    {
+      "test": "tests/unit/test_curated_discovery_maps.py::test_function_id_mapping_case_and_space_insensitive",
+      "outcome": "passed",
+      "duration_ms": 0.31
+    },
+    {
+      "test": "tests/unit/test_curated_discovery_maps.py::test_db_company_sc_dict_has_no_hardcoded_score",
+      "outcome": "passed",
+      "duration_ms": 0.31
+    },
+    {
+      "test": "tests/unit/test_wave_a_security_containment.py::test_oauth_state_rejects_cross_tenant_binding",
+      "outcome": "passed",
+      "duration_ms": 0.31
+    },
+    {
+      "test": "tests/unit/test_website_scraper_service.py::test_fetch_website_data_missing_content_type_parsed",
+      "outcome": "passed",
+      "duration_ms": 0.31
+    },
+    {
+      "test": "tests/unit/test_apify_retry_wiring.py::test_scrape_company_pages_empty_urls_short_circuits",
+      "outcome": "passed",
+      "duration_ms": 0.3
+    },
+    {
+      "test": "tests/unit/test_rate_limiter.py::test_allows_calls_up_to_budget_without_waiting",
+      "outcome": "passed",
+      "duration_ms": 0.3
+    },
+    {
+      "test": "tests/unit/test_rate_limiter.py::test_get_rate_limiter_returns_different_instances_for_different_keys",
+      "outcome": "passed",
+      "duration_ms": 0.3
+    },
+    {
+      "test": "tests/unit/test_shared_pool_authorization.py::test_cross_tenant_enrollment_read_and_delete_fail_closed",
+      "outcome": "passed",
+      "duration_ms": 0.3
+    },
+    {
+      "test": "tests/unit/test_canonicalizers.py::test_extract_geographies_and_titles",
+      "outcome": "passed",
+      "duration_ms": 0.29
+    },
+    {
+      "test": "tests/unit/test_production_config.py::test_unsafe_production_configuration_is_rejected[overrides4-APP_ROLE]",
+      "outcome": "passed",
+      "duration_ms": 0.29
+    },
+    {
+      "test": "tests/unit/test_auth_membership_boundary.py::test_id_representations_supports_canonical_and_legacy_memberships",
+      "outcome": "passed",
+      "duration_ms": 0.28
+    },
+    {
+      "test": "tests/unit/test_channel_plan_skip_reasons.py::test_no_sending_account_is_reported_when_prospects_are_contactable",
+      "outcome": "passed",
+      "duration_ms": 0.28
+    },
+    {
+      "test": "tests/unit/test_curated_discovery_maps.py::test_function_id_mapping[it-13]",
+      "outcome": "passed",
+      "duration_ms": 0.28
+    },
+    {
+      "test": "tests/unit/test_production_config.py::test_unsafe_production_configuration_is_rejected[overrides2-UNIPILE_WEBHOOK_SECRET]",
+      "outcome": "passed",
+      "duration_ms": 0.28
+    },
+    {
+      "test": "tests/unit/test_sequence_service.py::test_default_template_is_valid",
+      "outcome": "passed",
+      "duration_ms": 0.28
+    },
+    {
+      "test": "tests/unit/test_website_scraper_service.py::test_scrape_website_text_dump",
+      "outcome": "passed",
+      "duration_ms": 0.28
+    },
+    {
+      "test": "tests/unit/test_company_sourcing_retry.py::test_is_gemini_rate_limit_error_detects_code_429",
+      "outcome": "passed",
+      "duration_ms": 0.27
+    },
+    {
+      "test": "tests/unit/test_curated_discovery_maps.py::test_function_id_mapping[engineering-8]",
+      "outcome": "passed",
+      "duration_ms": 0.27
+    },
+    {
+      "test": "tests/unit/test_curated_discovery_maps.py::test_headcount_bands_self_employed",
+      "outcome": "passed",
+      "duration_ms": 0.27
+    },
+    {
+      "test": "tests/unit/test_scoring.py::test_decision_maker_rules[prospect6-True]",
+      "outcome": "passed",
+      "duration_ms": 0.27
+    },
+    {
+      "test": "tests/unit/test_shared_pool_authorization.py::test_manual_admin_prospect_creation_never_writes_tenant_private_fields",
+      "outcome": "passed",
+      "duration_ms": 0.27
+    },
+    {
+      "test": "tests/unit/test_crypto.py::test_encrypt_none_and_empty_are_noop",
+      "outcome": "passed",
+      "duration_ms": 0.26
+    },
+    {
+      "test": "tests/unit/test_production_config.py::test_unsafe_production_configuration_is_rejected[overrides5-CORS_ORIGINS]",
+      "outcome": "passed",
+      "duration_ms": 0.26
+    },
+    {
+      "test": "tests/unit/test_sequence_endpoints.py::test_put_sequence_rejects_invalid_graph_with_400",
+      "outcome": "passed",
+      "duration_ms": 0.26
+    },
+    {
+      "test": "tests/unit/test_sequence_service.py::test_plan_route_first_touch_days_fills_quota_per_day",
+      "outcome": "passed",
+      "duration_ms": 0.26
+    },
+    {
+      "test": "tests/unit/test_shared_pool_authorization.py::test_every_legacy_company_pool_mutation_requires_superadmin",
+      "outcome": "passed",
+      "duration_ms": 0.26
+    },
+    {
+      "test": "tests/unit/test_wave_a_security_containment.py::test_zoho_origin_allowlist_rejects_ssrf_inputs[http://accounts.zoho.com]",
+      "outcome": "passed",
+      "duration_ms": 0.26
+    },
+    {
+      "test": "tests/unit/test_campaign_engine_sequence.py::test_detect_accepted_false_without_timestamp",
+      "outcome": "passed",
+      "duration_ms": 0.25
+    },
+    {
+      "test": "tests/unit/test_campaign_sequence_launch_guard.py::test_valid_persisted_sequence_passes_launch_guard",
+      "outcome": "passed",
+      "duration_ms": 0.25
+    },
+    {
+      "test": "tests/unit/test_daily_cap_service.py::test_linkedin_sender_policy_has_separate_channel_caps_and_pause",
+      "outcome": "passed",
+      "duration_ms": 0.25
+    },
+    {
+      "test": "tests/unit/test_scoring.py::test_v2_icp_alignment_bonus",
+      "outcome": "passed",
+      "duration_ms": 0.25
+    },
+    {
+      "test": "tests/unit/test_sequence_service.py::test_cycle_is_rejected",
+      "outcome": "passed",
+      "duration_ms": 0.25
+    },
+    {
+      "test": "tests/unit/test_wave_a_security_containment.py::test_zoho_refresh_rejects_legacy_malicious_origin_before_http",
+      "outcome": "passed",
+      "duration_ms": 0.25
+    },
+    {
+      "test": "tests/unit/test_curated_discovery_maps.py::test_function_id_mapping[product-19]",
+      "outcome": "passed",
+      "duration_ms": 0.24
+    },
+    {
+      "test": "tests/unit/test_lead_mapping_service.py::test_heuristic_mapping_dedupes_single_value_fields",
+      "outcome": "passed",
+      "duration_ms": 0.24
+    },
+    {
+      "test": "tests/unit/test_outreach_prompt_context.py::test_batch_prompt_includes_company_context_and_voice",
+      "outcome": "passed",
+      "duration_ms": 0.24
+    },
+    {
+      "test": "tests/unit/test_outreach_prompt_context.py::test_single_prompt_includes_voice_and_banned",
+      "outcome": "passed",
+      "duration_ms": 0.24
+    },
+    {
+      "test": "tests/unit/test_scoring.py::test_tier_from_score[80-hot]",
+      "outcome": "passed",
+      "duration_ms": 0.24
+    },
+    {
+      "test": "tests/unit/test_sequence_service.py::test_valid_minimal_graph",
+      "outcome": "passed",
+      "duration_ms": 0.24
+    },
+    {
+      "test": "tests/unit/test_campaign_prospect_state.py::test_campaign_page_pipeline_filters_sorts_and_pages_before_any_join",
+      "outcome": "passed",
+      "duration_ms": 0.23
+    },
+    {
+      "test": "tests/unit/test_channel_plan_skip_reasons.py::test_contactable_prospect_is_scheduled_when_the_channel_is_connected",
+      "outcome": "passed",
+      "duration_ms": 0.23
+    },
+    {
+      "test": "tests/unit/test_curated_discovery_maps.py::test_function_id_mapping[marketing-15]",
+      "outcome": "passed",
+      "duration_ms": 0.23
+    },
+    {
+      "test": "tests/unit/test_sequence_service.py::test_max_touches_cap_exceeded_is_rejected",
+      "outcome": "passed",
+      "duration_ms": 0.23
+    },
+    {
+      "test": "tests/unit/test_shared_pool_authorization.py::test_enrollment_badges_are_scoped_to_requesting_account",
+      "outcome": "passed",
+      "duration_ms": 0.23
+    },
+    {
+      "test": "tests/unit/test_shared_pool_migration.py::test_nonconflicting_duplicates_merge_and_company_reference_is_remapped",
+      "outcome": "passed",
+      "duration_ms": 0.23
+    },
+    {
+      "test": "tests/unit/test_canonicalizers.py::test_extract_prefers_first_matching_key",
+      "outcome": "passed",
+      "duration_ms": 0.22
+    },
+    {
+      "test": "tests/unit/test_sequence_service.py::test_default_template_start_node_is_connection",
+      "outcome": "passed",
+      "duration_ms": 0.22
+    },
+    {
+      "test": "tests/unit/test_campaign_prospect_state.py::test_zero_is_scored_while_none_remains_unscored",
+      "outcome": "passed",
+      "duration_ms": 0.21
+    },
+    {
+      "test": "tests/unit/test_email_provider_factory.py::test_get_provider_smtp_returns_smtp_imap_provider",
+      "outcome": "passed",
+      "duration_ms": 0.21
+    },
+    {
+      "test": "tests/unit/test_sequence_service.py::test_default_template_is_single_linkedin_first_route",
+      "outcome": "passed",
+      "duration_ms": 0.21
+    },
+    {
+      "test": "tests/unit/test_shared_pool_migration.py::test_conflicting_duplicate_identity_and_dependent_prospect_are_quarantined",
+      "outcome": "passed",
+      "duration_ms": 0.21
+    },
+    {
+      "test": "tests/unit/test_stream_ticket_auth.py::test_ticket_is_opaque_and_scoped",
+      "outcome": "passed",
+      "duration_ms": 0.21
+    },
+    {
+      "test": "tests/unit/test_unset_legacy_campaign_scores.py::test_refuses_any_collection_other_than_prospects",
+      "outcome": "passed",
+      "duration_ms": 0.21
+    },
+    {
+      "test": "tests/unit/test_wave_a_security_containment.py::test_linkedin_chat_read_discards_other_account_messages",
+      "outcome": "passed",
+      "duration_ms": 0.21
+    },
+    {
+      "test": "tests/unit/test_campaign_engine_sequence.py::test_extract_connection_note_from_legacy",
+      "outcome": "passed",
+      "duration_ms": 0.2
+    },
+    {
+      "test": "tests/unit/test_campaign_engine_sequence.py::test_detect_accepted_ignores_legacy_shared_prospect_timestamp",
+      "outcome": "passed",
+      "duration_ms": 0.2
+    },
+    {
+      "test": "tests/unit/test_campaign_prospect_state.py::test_public_score_contract_is_stable_and_preserves_zero",
+      "outcome": "passed",
+      "duration_ms": 0.2
+    },
+    {
+      "test": "tests/unit/test_curated_discovery_maps.py::test_function_id_mapping[finance-10]",
+      "outcome": "passed",
+      "duration_ms": 0.2
+    },
+    {
+      "test": "tests/unit/test_curated_discovery_maps.py::test_headcount_bands_min_only_is_open_ended",
+      "outcome": "passed",
+      "duration_ms": 0.2
+    },
+    {
+      "test": "tests/unit/test_lead_mapping_service.py::test_unresolvable_empty_cells",
+      "outcome": "passed",
+      "duration_ms": 0.2
+    },
+    {
+      "test": "tests/unit/test_lead_mapping_service.py::test_normalize_domain[www.acme.com-acme.com]",
+      "outcome": "passed",
+      "duration_ms": 0.2
+    },
+    {
+      "test": "tests/unit/test_sequence_service.py::test_sent_moves_to_awaiting_and_schedules_timeout",
+      "outcome": "passed",
+      "duration_ms": 0.2
+    },
+    {
+      "test": "tests/unit/test_website_scraper_service.py::test_fetch_website_data_timeout_returns_none",
+      "outcome": "passed",
+      "duration_ms": 0.2
+    },
+    {
+      "test": "tests/unit/test_campaign_prospect_state.py::test_enrichment_contract_declares_campaign_ownership_and_provenance",
+      "outcome": "passed",
+      "duration_ms": 0.19
+    },
+    {
+      "test": "tests/unit/test_outreach_prompt_context.py::test_select_best_case_study_accepts_strings",
+      "outcome": "passed",
+      "duration_ms": 0.19
+    },
+    {
+      "test": "tests/unit/test_session_security.py::test_token_rotation_preserves_impersonation_binding_and_deadline",
+      "outcome": "passed",
+      "duration_ms": 0.19
+    },
+    {
+      "test": "tests/unit/test_unipile_retry.py::test_request_does_not_retry_4xx_other_than_429",
+      "outcome": "passed",
+      "duration_ms": 0.19
+    },
+    {
+      "test": "tests/unit/test_wave_a_security_containment.py::test_zoho_exchange_rejects_ssrf_before_provider_http",
+      "outcome": "passed",
+      "duration_ms": 0.19
+    },
+    {
+      "test": "tests/unit/test_crypto.py::test_decrypt_passes_through_legacy_plaintext",
+      "outcome": "passed",
+      "duration_ms": 0.18
+    },
+    {
+      "test": "tests/unit/test_crypto.py::test_encrypt_with_no_key_configured_stores_plaintext",
+      "outcome": "passed",
+      "duration_ms": 0.18
+    },
+    {
+      "test": "tests/unit/test_curated_discovery_maps.py::test_seniority_unknown_label_dropped",
+      "outcome": "passed",
+      "duration_ms": 0.18
+    },
+    {
+      "test": "tests/unit/test_curated_discovery_maps.py::test_function_id_mapping[support-26]",
+      "outcome": "passed",
+      "duration_ms": 0.18
+    },
+    {
+      "test": "tests/unit/test_email_provider_factory.py::test_get_provider_unknown_provider_returns_none",
+      "outcome": "passed",
+      "duration_ms": 0.18
+    },
+    {
+      "test": "tests/unit/test_lead_mapping_service.py::test_normalize_domain[https://www.acme.com/about-acme.com]",
+      "outcome": "passed",
+      "duration_ms": 0.18
+    },
+    {
+      "test": "tests/unit/test_system_settings_and_audit.py::test_db_error_falls_back_to_default",
+      "outcome": "passed",
+      "duration_ms": 0.18
+    },
+    {
+      "test": "tests/unit/test_campaign_engine_sequence.py::test_detect_accepted_true_when_accepted_after_last_send",
+      "outcome": "passed",
+      "duration_ms": 0.17
+    },
+    {
+      "test": "tests/unit/test_company_sourcing_retry.py::test_is_gemini_rate_limit_error_false_for_other_errors",
+      "outcome": "passed",
+      "duration_ms": 0.17
+    },
+    {
+      "test": "tests/unit/test_curated_discovery_maps.py::test_seniority_manager_maps_to_210",
+      "outcome": "passed",
+      "duration_ms": 0.17
+    },
+    {
+      "test": "tests/unit/test_curated_discovery_maps.py::test_function_id_mapping[legal-14]",
+      "outcome": "passed",
+      "duration_ms": 0.17
+    },
+    {
+      "test": "tests/unit/test_prospect_exclusion_reuse.py::test_hard_exclude_status_always_excluded",
+      "outcome": "passed",
+      "duration_ms": 0.17
+    },
+    {
+      "test": "tests/unit/test_scoring.py::test_v2_ideal_prospect_scores_high_and_capped_at_100",
+      "outcome": "passed",
+      "duration_ms": 0.17
+    },
+    {
+      "test": "tests/unit/test_scoring.py::test_v2_company_size_bands",
+      "outcome": "passed",
+      "duration_ms": 0.17
+    },
+    {
+      "test": "tests/unit/test_scoring.py::test_tier_from_score[59.9-cold]",
+      "outcome": "passed",
+      "duration_ms": 0.17
+    },
+    {
+      "test": "tests/unit/test_send_attempt_service.py::test_attempt_cap_ownership_matches_retry_boundary[prepared-True]",
+      "outcome": "passed",
+      "duration_ms": 0.17
+    },
+    {
+      "test": "tests/unit/test_sequence_endpoints.py::test_put_sequence_locked_when_active_or_completed[completed]",
+      "outcome": "passed",
+      "duration_ms": 0.17
+    },
+    {
+      "test": "tests/unit/test_sequence_service.py::test_full_accepted_path_walk",
+      "outcome": "passed",
+      "duration_ms": 0.17
+    },
+    {
+      "test": "tests/unit/test_campaign_engine_sequence.py::test_extract_prefers_per_node_message",
+      "outcome": "passed",
+      "duration_ms": 0.16
+    },
+    {
+      "test": "tests/unit/test_campaign_engine_sequence.py::test_extract_email_from_legacy_cold_email",
+      "outcome": "passed",
+      "duration_ms": 0.16
+    },
+    {
+      "test": "tests/unit/test_campaign_engine_sequence.py::test_detect_accepted_true_when_no_last_sent_recorded",
+      "outcome": "passed",
+      "duration_ms": 0.16
+    },
+    {
+      "test": "tests/unit/test_curated_discovery_maps.py::test_db_company_off_icp_scores_below_threshold",
+      "outcome": "passed",
+      "duration_ms": 0.16
+    },
+    {
+      "test": "tests/unit/test_scoring.py::test_decision_maker_rules[prospect7-False]",
+      "outcome": "passed",
+      "duration_ms": 0.16
+    },
+    {
+      "test": "tests/unit/test_session_security.py::test_cookie_mutation_requires_matching_double_submit_token",
+      "outcome": "passed",
+      "duration_ms": 0.16
+    },
+    {
+      "test": "tests/unit/test_shared_pool_migration.py::test_inventory_reports_duplicates_leakage_and_broken_references",
+      "outcome": "passed",
+      "duration_ms": 0.16
+    },
+    {
+      "test": "tests/unit/test_shared_pool_migration.py::test_missing_identity_is_quarantined_not_restored",
+      "outcome": "passed",
+      "duration_ms": 0.16
+    },
+    {
+      "test": "tests/unit/test_unipile_webhook_verification.py::test_valid_hmac_over_raw_body_is_accepted",
+      "outcome": "passed",
+      "duration_ms": 0.16
+    },
+    {
+      "test": "tests/unit/test_wave_a_security_containment.py::test_zoho_origin_allowlist_rejects_ssrf_inputs[https://accounts.zoho.com.evil.test]",
+      "outcome": "passed",
+      "duration_ms": 0.16
+    },
+    {
+      "test": "tests/unit/test_website_scraper_service.py::test_fetch_website_data_non_html_returns_none",
+      "outcome": "passed",
+      "duration_ms": 0.16
+    },
+    {
+      "test": "tests/unit/test_channel_plan_skip_reasons.py::test_no_contact_info_only_when_the_prospect_really_has_none",
+      "outcome": "passed",
+      "duration_ms": 0.15
+    },
+    {
+      "test": "tests/unit/test_curated_discovery_maps.py::test_function_id_mapping[human_resources-12]",
+      "outcome": "passed",
+      "duration_ms": 0.15
+    },
+    {
+      "test": "tests/unit/test_lead_mapping_service.py::test_apply_mapping_ignores_and_dedupes",
+      "outcome": "passed",
+      "duration_ms": 0.15
+    },
+    {
+      "test": "tests/unit/test_lead_mapping_service.py::test_heuristic_mapping_basic_headers",
+      "outcome": "passed",
+      "duration_ms": 0.15
+    },
+    {
+      "test": "tests/unit/test_rate_limiter.py::test_parse_retry_after_none_for_garbage",
+      "outcome": "passed",
+      "duration_ms": 0.15
+    },
+    {
+      "test": "tests/unit/test_scoring.py::test_decision_maker_rules[prospect4-True]",
+      "outcome": "passed",
+      "duration_ms": 0.15
+    },
+    {
+      "test": "tests/unit/test_scoring.py::test_decision_maker_rules[prospect5-False]",
+      "outcome": "passed",
+      "duration_ms": 0.15
+    },
+    {
+      "test": "tests/unit/test_session_security.py::test_production_cookie_mutation_requires_exact_allowed_origin",
+      "outcome": "passed",
+      "duration_ms": 0.15
+    },
+    {
+      "test": "tests/unit/test_shared_pool_migration.py::test_ambiguous_tenant_payload_is_never_assigned_to_an_overlay",
+      "outcome": "passed",
+      "duration_ms": 0.15
+    },
+    {
+      "test": "tests/unit/test_shared_pool_migration.py::test_nested_tenant_markers_are_removed_and_audited",
+      "outcome": "passed",
+      "duration_ms": 0.15
+    },
+    {
+      "test": "tests/unit/test_stream_ticket_auth.py::test_unknown_ticket_is_rejected",
+      "outcome": "passed",
+      "duration_ms": 0.15
+    },
+    {
+      "test": "tests/unit/test_unset_legacy_campaign_scores.py::test_execute_unsets_only_intended_fields_and_is_idempotent",
+      "outcome": "passed",
+      "duration_ms": 0.15
+    },
+    {
+      "test": "tests/unit/test_website_scraper_service.py::test_upsert_skips_when_website_data_fresh",
+      "outcome": "passed",
+      "duration_ms": 0.15
+    },
+    {
+      "test": "tests/unit/test_campaign_engine_sequence.py::test_extract_inmail_from_legacy",
+      "outcome": "passed",
+      "duration_ms": 0.14
+    },
+    {
+      "test": "tests/unit/test_curated_discovery_maps.py::test_function_id_mapping[sales-25]",
+      "outcome": "passed",
+      "duration_ms": 0.14
+    },
+    {
+      "test": "tests/unit/test_geo_resolver.py::test_to_geojson_lng_lat_order",
+      "outcome": "passed",
+      "duration_ms": 0.14
+    },
+    {
+      "test": "tests/unit/test_rate_limiter.py::test_parse_retry_after_numeric_seconds",
+      "outcome": "passed",
+      "duration_ms": 0.14
+    },
+    {
+      "test": "tests/unit/test_scoring.py::test_v2_bad_numeric_inputs_do_not_crash",
+      "outcome": "passed",
+      "duration_ms": 0.14
+    },
+    {
+      "test": "tests/unit/test_sequence_service.py::test_default_template_has_accepted_and_not_accepted_branches",
+      "outcome": "passed",
+      "duration_ms": 0.14
+    },
+    {
+      "test": "tests/unit/test_unset_legacy_campaign_scores.py::test_dry_run_reports_but_does_not_modify",
+      "outcome": "passed",
+      "duration_ms": 0.14
+    },
+    {
+      "test": "tests/unit/test_wave_a_security_containment.py::test_manual_linkedin_client_resolves_only_authenticated_tenant",
+      "outcome": "passed",
+      "duration_ms": 0.14
+    },
+    {
+      "test": "tests/unit/test_wave_a_security_containment.py::test_microsoft_connection_and_exchange_are_disabled",
+      "outcome": "passed",
+      "duration_ms": 0.14
+    },
+    {
+      "test": "tests/unit/test_website_scraper_service.py::test_scrape_website_error_returns_empty",
+      "outcome": "passed",
+      "duration_ms": 0.14
+    },
+    {
+      "test": "tests/unit/test_website_scraper_service.py::test_upsert_scrapes_when_website_data_missing",
+      "outcome": "passed",
+      "duration_ms": 0.14
+    },
+    {
+      "test": "tests/unit/test_campaign_engine_sequence.py::test_extract_returns_empty_when_no_message",
+      "outcome": "passed",
+      "duration_ms": 0.13
+    },
+    {
+      "test": "tests/unit/test_canonicalizers.py::test_normalize_industry",
+      "outcome": "passed",
+      "duration_ms": 0.13
+    },
+    {
+      "test": "tests/unit/test_curated_discovery_maps.py::test_function_id_mapping[business_development-4]",
+      "outcome": "passed",
+      "duration_ms": 0.13
+    },
+    {
+      "test": "tests/unit/test_curated_discovery_maps.py::test_headcount_bands_exact_small_company",
+      "outcome": "passed",
+      "duration_ms": 0.13
+    },
+    {
+      "test": "tests/unit/test_onboarding_draft_whitelist.py::test_strings_are_trimmed_and_blanks_dropped",
+      "outcome": "passed",
+      "duration_ms": 0.13
+    },
+    {
+      "test": "tests/unit/test_scoring.py::test_campaign_score_full_match",
+      "outcome": "passed",
+      "duration_ms": 0.13
+    },
+    {
+      "test": "tests/unit/test_send_attempt_service.py::test_attempt_cap_ownership_matches_retry_boundary[dispatching-True]",
+      "outcome": "passed",
+      "duration_ms": 0.13
+    },
+    {
+      "test": "tests/unit/test_send_attempt_service.py::test_attempt_cap_ownership_matches_retry_boundary[failed_terminal-False]",
+      "outcome": "passed",
+      "duration_ms": 0.13
+    },
+    {
+      "test": "tests/unit/test_sequence_service.py::test_default_template_nodes_carry_guidance",
+      "outcome": "passed",
+      "duration_ms": 0.13
+    },
+    {
+      "test": "tests/unit/test_stream_ticket_auth.py::test_expired_ticket_is_rejected_even_before_ttl_sweep",
+      "outcome": "passed",
+      "duration_ms": 0.13
+    },
+    {
+      "test": "tests/unit/test_unipile_retry.py::test_request_succeeds_first_try",
+      "outcome": "passed",
+      "duration_ms": 0.13
+    },
+    {
+      "test": "tests/unit/test_wave_a_security_containment.py::test_linkedin_send_chat_carries_bound_provider_account",
+      "outcome": "passed",
+      "duration_ms": 0.13
+    },
+    {
+      "test": "tests/unit/test_wave_a_security_containment.py::test_microsoft_refresh_is_disabled_before_token_or_network",
+      "outcome": "passed",
+      "duration_ms": 0.13
+    },
+    {
+      "test": "tests/unit/test_curated_discovery_maps.py::test_headcount_bands_no_range_returns_empty",
+      "outcome": "passed",
+      "duration_ms": 0.12
+    },
+    {
+      "test": "tests/unit/test_lead_mapping_service.py::test_normalize_domain[acme.com-acme.com]",
+      "outcome": "passed",
+      "duration_ms": 0.12
+    },
+    {
+      "test": "tests/unit/test_lead_mapping_service.py::test_company_domain_for_row_skips_free_email",
+      "outcome": "passed",
+      "duration_ms": 0.12
+    },
+    {
+      "test": "tests/unit/test_outreach_prompt_context.py::test_followup_prompt_includes_voice_diff_case_study",
+      "outcome": "passed",
+      "duration_ms": 0.12
+    },
+    {
+      "test": "tests/unit/test_prospect_filter_keys.py::test_pk_projection_covers_all_built_keys",
+      "outcome": "passed",
+      "duration_ms": 0.12
+    },
+    {
+      "test": "tests/unit/test_scoring.py::test_v2_email_presence_signal",
+      "outcome": "passed",
+      "duration_ms": 0.12
+    },
+    {
+      "test": "tests/unit/test_scoring.py::test_tier_from_score[60-warm]",
+      "outcome": "passed",
+      "duration_ms": 0.12
+    },
+    {
+      "test": "tests/unit/test_scoring.py::test_tier_from_score[100-hot]",
+      "outcome": "passed",
+      "duration_ms": 0.12
+    },
+    {
+      "test": "tests/unit/test_sequence_service.py::test_default_template_accepted_edge_is_thirty_minutes",
+      "outcome": "passed",
+      "duration_ms": 0.12
+    },
+    {
+      "test": "tests/unit/test_sequence_service.py::test_invalid_condition_is_rejected",
+      "outcome": "passed",
+      "duration_ms": 0.12
+    },
+    {
+      "test": "tests/unit/test_shared_pool_migration.py::test_logical_hash_is_order_independent",
+      "outcome": "passed",
+      "duration_ms": 0.12
+    },
+    {
+      "test": "tests/unit/test_shared_pool_migration.py::test_weak_owner_metadata_is_quarantined_not_guessed",
+      "outcome": "passed",
+      "duration_ms": 0.12
+    },
+    {
+      "test": "tests/unit/test_system_settings_and_audit.py::test_get_flag_default_when_no_override",
+      "outcome": "passed",
+      "duration_ms": 0.12
+    },
+    {
+      "test": "tests/unit/test_system_settings_and_audit.py::test_get_flag_db_override_wins",
+      "outcome": "passed",
+      "duration_ms": 0.12
+    },
+    {
+      "test": "tests/unit/test_unset_legacy_campaign_scores.py::test_document_without_legacy_fields_is_untouched",
+      "outcome": "passed",
+      "duration_ms": 0.12
+    },
+    {
+      "test": "tests/unit/test_website_scraper_service.py::test_upsert_records_failure_marker_when_fetch_fails",
+      "outcome": "passed",
+      "duration_ms": 0.12
+    },
+    {
+      "test": "tests/unit/test_website_scraper_service.py::test_upsert_noop_without_website_or_domain",
+      "outcome": "passed",
+      "duration_ms": 0.12
+    },
+    {
+      "test": "tests/unit/test_curated_discovery_maps.py::test_function_id_mapping[information_technology-13]",
+      "outcome": "passed",
+      "duration_ms": 0.11
+    },
+    {
+      "test": "tests/unit/test_lead_mapping_service.py::test_normalize_domain[notadomain-None]",
+      "outcome": "passed",
+      "duration_ms": 0.11
+    },
+    {
+      "test": "tests/unit/test_rate_limiter.py::test_parse_retry_after_caps_pathological_values",
+      "outcome": "passed",
+      "duration_ms": 0.11
+    },
+    {
+      "test": "tests/unit/test_scoring.py::test_v2_digital_maturity_gap",
+      "outcome": "passed",
+      "duration_ms": 0.11
+    },
+    {
+      "test": "tests/unit/test_scoring.py::test_company_fit_only_company_dimensions",
+      "outcome": "passed",
+      "duration_ms": 0.11
+    },
+    {
+      "test": "tests/unit/test_send_attempt_service.py::test_attempt_cap_ownership_matches_retry_boundary[sent-True]",
+      "outcome": "passed",
+      "duration_ms": 0.11
+    },
+    {
+      "test": "tests/unit/test_send_attempt_service.py::test_attempt_cap_ownership_matches_retry_boundary[retry_scheduled-False]",
+      "outcome": "passed",
+      "duration_ms": 0.11
+    },
+    {
+      "test": "tests/unit/test_shared_pool_migration.py::test_export_preview_never_requires_credentials_or_connects",
+      "outcome": "passed",
+      "duration_ms": 0.11
+    },
+    {
+      "test": "tests/unit/test_shared_pool_migration.py::test_validator_rejects_nested_tenant_leakage_and_overlay_history",
+      "outcome": "passed",
+      "duration_ms": 0.11
+    },
+    {
+      "test": "tests/unit/test_system_settings_and_audit.py::test_negative_lookup_is_cached",
+      "outcome": "passed",
+      "duration_ms": 0.11
+    },
+    {
+      "test": "tests/unit/test_system_settings_and_audit.py::test_cached_false_value_not_confused_with_miss",
+      "outcome": "passed",
+      "duration_ms": 0.11
+    },
+    {
+      "test": "tests/unit/test_system_settings_and_audit.py::test_cache_ttl_expiry",
+      "outcome": "passed",
+      "duration_ms": 0.11
+    },
+    {
+      "test": "tests/unit/test_unipile_webhook_verification.py::test_timestamped_hmac_outside_tolerance_is_rejected",
+      "outcome": "passed",
+      "duration_ms": 0.11
+    },
+    {
+      "test": "tests/unit/test_curated_discovery_maps.py::test_function_id_mapping[product_management-19]",
+      "outcome": "passed",
+      "duration_ms": 0.1
+    },
+    {
+      "test": "tests/unit/test_email_thread_context.py::test_id_variants_matches_both_storage_types",
+      "outcome": "passed",
+      "duration_ms": 0.1
+    },
+    {
+      "test": "tests/unit/test_lead_mapping_service.py::test_normalize_domain[http://acme.io-acme.io]",
+      "outcome": "passed",
+      "duration_ms": 0.1
+    },
+    {
+      "test": "tests/unit/test_scoring.py::test_decision_maker_rules[prospect3-True]",
+      "outcome": "passed",
+      "duration_ms": 0.1
+    },
+    {
+      "test": "tests/unit/test_send_attempt_service.py::test_attempt_cap_ownership_matches_retry_boundary[ambiguous-True]",
+      "outcome": "passed",
+      "duration_ms": 0.1
+    },
+    {
+      "test": "tests/unit/test_sequence_service.py::test_multiple_start_nodes_are_allowed",
+      "outcome": "passed",
+      "duration_ms": 0.1
+    },
+    {
+      "test": "tests/unit/test_sequence_service.py::test_accepted_follows_accepted_edge_with_its_delay",
+      "outcome": "passed",
+      "duration_ms": 0.1
+    },
+    {
+      "test": "tests/unit/test_sequence_service.py::test_no_reply_timeout_on_connection_takes_not_accepted_branch_immediately",
+      "outcome": "passed",
+      "duration_ms": 0.1
+    },
+    {
+      "test": "tests/unit/test_serialization.py::test_uuid_binary_rendered_as_uuid_string",
+      "outcome": "passed",
+      "duration_ms": 0.1
+    },
+    {
+      "test": "tests/unit/test_session_security.py::test_notification_stream_has_no_query_string_token_contract",
+      "outcome": "passed",
+      "duration_ms": 0.1
+    },
+    {
+      "test": "tests/unit/test_wave_a_security_containment.py::test_unsigned_webhook_fails_closed_outside_dev_and_test",
+      "outcome": "passed",
+      "duration_ms": 0.1
+    },
+    {
+      "test": "tests/unit/test_wave_a_security_containment.py::test_production_encryption_refuses_missing_key",
+      "outcome": "passed",
+      "duration_ms": 0.1
+    },
+    {
+      "test": "tests/unit/test_curated_discovery_maps.py::test_seniority_dedupes_and_sorts",
+      "outcome": "passed",
+      "duration_ms": 0.09
+    },
+    {
+      "test": "tests/unit/test_curated_discovery_maps.py::test_function_id_mapping[operations-18]",
+      "outcome": "passed",
+      "duration_ms": 0.09
+    },
+    {
+      "test": "tests/unit/test_outreach_prompt_context.py::test_preview_prompt_includes_differentiators_and_case_study",
+      "outcome": "passed",
+      "duration_ms": 0.09
+    },
+    {
+      "test": "tests/unit/test_rate_limiter.py::test_parse_retry_after_none_for_missing_header",
+      "outcome": "passed",
+      "duration_ms": 0.09
+    },
+    {
+      "test": "tests/unit/test_sequence_service.py::test_no_start_node_when_all_have_incoming",
+      "outcome": "passed",
+      "duration_ms": 0.09
+    },
+    {
+      "test": "tests/unit/test_sequence_service.py::test_sent_increments_touches_and_caps_at_max_touches",
+      "outcome": "passed",
+      "duration_ms": 0.09
+    },
+    {
+      "test": "tests/unit/test_sequence_service.py::test_no_reply_timeout_follows_no_reply_edge",
+      "outcome": "passed",
+      "duration_ms": 0.09
+    },
+    {
+      "test": "tests/unit/test_sequence_service.py::test_plan_first_touch_days_respects_cap_and_score_order",
+      "outcome": "passed",
+      "duration_ms": 0.09
+    },
+    {
+      "test": "tests/unit/test_serialization.py::test_objectid_to_string_recursive",
+      "outcome": "passed",
+      "duration_ms": 0.09
+    },
+    {
+      "test": "tests/unit/test_serialization.py::test_non_utf8_binary_becomes_none",
+      "outcome": "passed",
+      "duration_ms": 0.09
+    },
+    {
+      "test": "tests/unit/test_unipile_webhook_verification.py::test_unsigned_fails_closed_without_secret_in_production",
+      "outcome": "passed",
+      "duration_ms": 0.09
+    },
+    {
+      "test": "tests/unit/test_unipile_webhook_verification.py::test_unsigned_allowed_without_secret_in_test_env",
+      "outcome": "passed",
+      "duration_ms": 0.09
+    },
+    {
+      "test": "tests/unit/test_wave_a_security_containment.py::test_oauth_state_rejects_external_return_destination[https://evil.example/callback]",
+      "outcome": "passed",
+      "duration_ms": 0.09
+    },
+    {
+      "test": "tests/unit/test_wave_a_security_containment.py::test_unsigned_webhook_is_explicitly_allowed_in_test",
+      "outcome": "passed",
+      "duration_ms": 0.09
+    },
+    {
+      "test": "tests/unit/test_campaign_sequence_launch_guard.py::test_legacy_campaign_without_sequence_declaration_is_unchanged",
+      "outcome": "passed",
+      "duration_ms": 0.08
+    },
+    {
+      "test": "tests/unit/test_curated_discovery_maps.py::test_extract_company_url_meta_query_wins_over_both",
+      "outcome": "passed",
+      "duration_ms": 0.08
+    },
+    {
+      "test": "tests/unit/test_onboarding_draft_whitelist.py::test_lists_are_cleaned_but_empties_preserved",
+      "outcome": "passed",
+      "duration_ms": 0.08
+    },
+    {
+      "test": "tests/unit/test_outreach_prompt_context.py::test_select_best_case_study_mixed_and_industry_match",
+      "outcome": "passed",
+      "duration_ms": 0.08
+    },
+    {
+      "test": "tests/unit/test_prospect_filter_keys.py::test_build_filter_keys_full_doc",
       "outcome": "passed",
       "duration_ms": 0.08
     },
     {
       "test": "tests/unit/test_rate_limiter.py::test_backoff_with_jitter_increases_with_attempt_and_respects_cap",
-      "outcome": "passed",
-      "duration_ms": 0.08
-    },
-    {
-      "test": "tests/unit/test_scoring.py::test_v2_digital_maturity_gap",
       "outcome": "passed",
       "duration_ms": 0.08
     },
@@ -1445,172 +2360,102 @@
       "duration_ms": 0.08
     },
     {
-      "test": "tests/unit/test_scoring.py::test_decision_maker_rules[prospect3-True]",
+      "test": "tests/unit/test_scoring.py::test_title_gate_blocklist_keyword",
       "outcome": "passed",
       "duration_ms": 0.08
     },
     {
-      "test": "tests/unit/test_sequence_service.py::test_default_template_is_valid",
+      "test": "tests/unit/test_scoring.py::test_title_gate_non_dm_title_blocked_for_senior_icp",
       "outcome": "passed",
       "duration_ms": 0.08
     },
     {
-      "test": "tests/unit/test_sequence_service.py::test_accepted_follows_accepted_edge_with_its_delay",
+      "test": "tests/unit/test_sequence_service.py::test_reply_stops_even_mid_sequence_regardless_of_node",
       "outcome": "passed",
       "duration_ms": 0.08
     },
     {
-      "test": "tests/unit/test_sequence_service.py::test_no_reply_timeout_follows_no_reply_edge",
+      "test": "tests/unit/test_sequence_service.py::test_resolve_routes_yields_three_capped_routes",
       "outcome": "passed",
       "duration_ms": 0.08
     },
     {
-      "test": "tests/unit/test_session_security.py::test_cookie_mutation_requires_matching_double_submit_token",
+      "test": "tests/unit/test_sequence_service.py::test_plan_route_first_touch_days_respects_identifier_availability",
       "outcome": "passed",
       "duration_ms": 0.08
     },
     {
-      "test": "tests/unit/test_session_security.py::test_production_cookie_mutation_requires_exact_allowed_origin",
+      "test": "tests/unit/test_sequence_service.py::test_validator_rejects_invalid_sub_day_delay_fields",
       "outcome": "passed",
       "duration_ms": 0.08
     },
     {
-      "test": "tests/unit/test_shared_pool_migration.py::test_logical_hash_is_order_independent",
+      "test": "tests/unit/test_sequence_service.py::test_sent_timeout_wait_includes_hours_and_minutes",
       "outcome": "passed",
       "duration_ms": 0.08
     },
     {
-      "test": "tests/unit/test_shared_pool_migration.py::test_weak_owner_metadata_is_quarantined_not_guessed",
+      "test": "tests/unit/test_sequence_service.py::test_days_only_graph_behaves_identically",
       "outcome": "passed",
       "duration_ms": 0.08
     },
     {
-      "test": "tests/unit/test_system_settings_and_audit.py::test_get_flag_db_override_wins",
+      "test": "tests/unit/test_sequence_service.py::test_accepted_edge_minutes_only_delay",
       "outcome": "passed",
       "duration_ms": 0.08
     },
     {
-      "test": "tests/unit/test_system_settings_and_audit.py::test_negative_lookup_is_cached",
+      "test": "tests/unit/test_session_security.py::test_non_browser_auth_contract_remains_bearer_compatible",
       "outcome": "passed",
       "duration_ms": 0.08
     },
     {
-      "test": "tests/unit/test_system_settings_and_audit.py::test_cached_false_value_not_confused_with_miss",
+      "test": "tests/unit/test_system_settings_and_audit.py::test_sanitize_redacts_credential_shaped_keys",
       "outcome": "passed",
       "duration_ms": 0.08
     },
     {
-      "test": "tests/unit/test_system_settings_and_audit.py::test_cache_ttl_expiry",
+      "test": "tests/unit/test_system_settings_and_audit.py::test_sanitize_objectid_and_datetime",
       "outcome": "passed",
       "duration_ms": 0.08
     },
     {
-      "test": "tests/unit/test_wave_a_security_containment.py::test_zoho_origin_allowlist_rejects_ssrf_inputs[http://accounts.zoho.com]",
+      "test": "tests/unit/test_system_settings_and_audit.py::test_sanitize_truncates_long_strings_and_lists",
       "outcome": "passed",
       "duration_ms": 0.08
     },
     {
-      "test": "tests/unit/test_website_scraper_service.py::test_upsert_noop_without_website_or_domain",
+      "test": "tests/unit/test_system_settings_and_audit.py::test_sanitize_stringifies_unknown_types",
       "outcome": "passed",
       "duration_ms": 0.08
     },
     {
-      "test": "tests/unit/test_campaign_engine_sequence.py::test_extract_prefers_per_node_message",
+      "test": "tests/unit/test_unipile_webhook_verification.py::test_timestamped_hmac_within_tolerance_is_accepted",
       "outcome": "passed",
-      "duration_ms": 0.07
+      "duration_ms": 0.08
     },
     {
-      "test": "tests/unit/test_campaign_engine_sequence.py::test_extract_email_from_legacy_cold_email",
+      "test": "tests/unit/test_unipile_webhook_verification.py::test_plain_secret_accepted_in_transition_mode",
       "outcome": "passed",
-      "duration_ms": 0.07
+      "duration_ms": 0.08
     },
     {
-      "test": "tests/unit/test_campaign_engine_sequence.py::test_extract_connection_note_from_legacy",
+      "test": "tests/unit/test_unset_legacy_campaign_scores.py::test_filter_and_update_cover_exactly_the_legacy_fields",
       "outcome": "passed",
-      "duration_ms": 0.07
+      "duration_ms": 0.08
     },
     {
-      "test": "tests/unit/test_campaign_engine_sequence.py::test_extract_returns_empty_when_no_message",
+      "test": "tests/unit/test_wave_a_security_containment.py::test_zoho_origins_are_exactly_mapped[https://accounts.zoho.com-https://mail.zoho.com]",
       "outcome": "passed",
-      "duration_ms": 0.07
+      "duration_ms": 0.08
     },
     {
-      "test": "tests/unit/test_campaign_engine_sequence.py::test_detect_accepted_true_when_accepted_after_last_send",
-      "outcome": "passed",
-      "duration_ms": 0.07
-    },
-    {
-      "test": "tests/unit/test_campaign_engine_sequence.py::test_detect_accepted_true_when_no_last_sent_recorded",
-      "outcome": "passed",
-      "duration_ms": 0.07
-    },
-    {
-      "test": "tests/unit/test_campaign_prospect_state.py::test_public_score_contract_is_stable_and_preserves_zero",
-      "outcome": "passed",
-      "duration_ms": 0.07
-    },
-    {
-      "test": "tests/unit/test_campaign_prospect_state.py::test_campaign_page_pipeline_filters_sorts_and_pages_before_any_join",
-      "outcome": "passed",
-      "duration_ms": 0.07
-    },
-    {
-      "test": "tests/unit/test_canonicalizers.py::test_seniority_unknown_input_yields_empty",
-      "outcome": "passed",
-      "duration_ms": 0.07
-    },
-    {
-      "test": "tests/unit/test_channel_plan_skip_reasons.py::test_contactable_prospect_is_scheduled_when_the_channel_is_connected",
-      "outcome": "passed",
-      "duration_ms": 0.07
-    },
-    {
-      "test": "tests/unit/test_company_sourcing_retry.py::test_extract_retry_delay_returns_none_when_absent",
-      "outcome": "passed",
-      "duration_ms": 0.07
-    },
-    {
-      "test": "tests/unit/test_curated_discovery_maps.py::test_function_id_mapping_unknown_dropped",
-      "outcome": "passed",
-      "duration_ms": 0.07
-    },
-    {
-      "test": "tests/unit/test_email_provider_factory.py::test_get_provider_zoho_returns_zoho_provider",
-      "outcome": "passed",
-      "duration_ms": 0.07
-    },
-    {
-      "test": "tests/unit/test_geo_resolver.py::test_resolve_empty_and_none",
-      "outcome": "passed",
-      "duration_ms": 0.07
-    },
-    {
-      "test": "tests/unit/test_rate_limiter.py::test_parse_retry_after_caps_pathological_values",
-      "outcome": "passed",
-      "duration_ms": 0.07
-    },
-    {
-      "test": "tests/unit/test_rate_limiter.py::test_parse_retry_after_none_for_missing_header",
+      "test": "tests/unit/test_prospect_filter_keys.py::test_build_filter_keys_missing_fields_become_none",
       "outcome": "passed",
       "duration_ms": 0.07
     },
     {
       "test": "tests/unit/test_scoring.py::test_tier_from_score[0-cold]",
-      "outcome": "passed",
-      "duration_ms": 0.07
-    },
-    {
-      "test": "tests/unit/test_scoring.py::test_tier_from_score[59.9-cold]",
-      "outcome": "passed",
-      "duration_ms": 0.07
-    },
-    {
-      "test": "tests/unit/test_scoring.py::test_tier_from_score[60-warm]",
-      "outcome": "passed",
-      "duration_ms": 0.07
-    },
-    {
-      "test": "tests/unit/test_scoring.py::test_tier_from_score[79.9-warm]",
       "outcome": "passed",
       "duration_ms": 0.07
     },
@@ -1625,1024 +2470,194 @@
       "duration_ms": 0.07
     },
     {
-      "test": "tests/unit/test_scoring.py::test_campaign_score_location_subdocument_fallback",
-      "outcome": "passed",
-      "duration_ms": 0.07
-    },
-    {
       "test": "tests/unit/test_scoring.py::test_decision_maker_rules[prospect0-True]",
       "outcome": "passed",
       "duration_ms": 0.07
     },
     {
-      "test": "tests/unit/test_scoring.py::test_decision_maker_rules[prospect1-True]",
+      "test": "tests/unit/test_scoring.py::test_title_gate_passes_clean_title",
       "outcome": "passed",
       "duration_ms": 0.07
-    },
-    {
-      "test": "tests/unit/test_scoring.py::test_decision_maker_rules[prospect2-False]",
-      "outcome": "passed",
-      "duration_ms": 0.07
-    },
-    {
-      "test": "tests/unit/test_scoring.py::test_decision_maker_rules[prospect4-True]",
-      "outcome": "passed",
-      "duration_ms": 0.07
-    },
-    {
-      "test": "tests/unit/test_send_attempt_service.py::test_attempt_cap_ownership_matches_retry_boundary[prepared-True]",
-      "outcome": "passed",
-      "duration_ms": 0.07
-    },
-    {
-      "test": "tests/unit/test_send_attempt_service.py::test_attempt_cap_ownership_matches_retry_boundary[dispatching-True]",
-      "outcome": "passed",
-      "duration_ms": 0.07
-    },
-    {
-      "test": "tests/unit/test_send_attempt_service.py::test_attempt_cap_ownership_matches_retry_boundary[ambiguous-True]",
-      "outcome": "passed",
-      "duration_ms": 0.07
-    },
-    {
-      "test": "tests/unit/test_send_attempt_service.py::test_attempt_cap_ownership_matches_retry_boundary[sent-True]",
-      "outcome": "passed",
-      "duration_ms": 0.07
-    },
-    {
-      "test": "tests/unit/test_send_attempt_service.py::test_attempt_cap_ownership_matches_retry_boundary[retry_scheduled-False]",
-      "outcome": "passed",
-      "duration_ms": 0.07
-    },
-    {
-      "test": "tests/unit/test_sequence_service.py::test_default_template_start_node_is_connection",
-      "outcome": "passed",
-      "duration_ms": 0.07
-    },
-    {
-      "test": "tests/unit/test_sequence_service.py::test_max_touches_cap_exceeded_is_rejected",
-      "outcome": "passed",
-      "duration_ms": 0.07
-    },
-    {
-      "test": "tests/unit/test_sequence_service.py::test_no_reply_timeout_on_connection_takes_not_accepted_branch_immediately",
-      "outcome": "passed",
-      "duration_ms": 0.07
-    },
-    {
-      "test": "tests/unit/test_sequence_service.py::test_plan_first_touch_days_respects_cap_and_score_order",
-      "outcome": "passed",
-      "duration_ms": 0.07
-    },
-    {
-      "test": "tests/unit/test_serialization.py::test_uuid_binary_rendered_as_uuid_string",
-      "outcome": "passed",
-      "duration_ms": 0.07
-    },
-    {
-      "test": "tests/unit/test_session_security.py::test_notification_stream_has_no_query_string_token_contract",
-      "outcome": "passed",
-      "duration_ms": 0.07
-    },
-    {
-      "test": "tests/unit/test_shared_pool_migration.py::test_validator_rejects_nested_tenant_leakage_and_overlay_history",
-      "outcome": "passed",
-      "duration_ms": 0.07
-    },
-    {
-      "test": "tests/unit/test_unipile_webhook_verification.py::test_timestamped_hmac_outside_tolerance_is_rejected",
-      "outcome": "passed",
-      "duration_ms": 0.07
-    },
-    {
-      "test": "tests/unit/test_campaign_engine_sequence.py::test_extract_inmail_from_legacy",
-      "outcome": "passed",
-      "duration_ms": 0.06
-    },
-    {
-      "test": "tests/unit/test_campaign_engine_sequence.py::test_detect_accepted_false_without_timestamp",
-      "outcome": "passed",
-      "duration_ms": 0.06
-    },
-    {
-      "test": "tests/unit/test_campaign_engine_sequence.py::test_detect_accepted_ignores_legacy_shared_prospect_timestamp",
-      "outcome": "passed",
-      "duration_ms": 0.06
-    },
-    {
-      "test": "tests/unit/test_campaign_prospect_state.py::test_enrichment_contract_declares_campaign_ownership_and_provenance",
-      "outcome": "passed",
-      "duration_ms": 0.06
-    },
-    {
-      "test": "tests/unit/test_campaign_sequence_launch_guard.py::test_legacy_campaign_without_sequence_declaration_is_unchanged",
-      "outcome": "passed",
-      "duration_ms": 0.06
-    },
-    {
-      "test": "tests/unit/test_canonicalizers.py::test_employee_bands",
-      "outcome": "passed",
-      "duration_ms": 0.06
-    },
-    {
-      "test": "tests/unit/test_channel_plan_skip_reasons.py::test_no_sending_account_is_reported_when_prospects_are_contactable",
-      "outcome": "passed",
-      "duration_ms": 0.06
-    },
-    {
-      "test": "tests/unit/test_channel_plan_skip_reasons.py::test_no_contact_info_only_when_the_prospect_really_has_none",
-      "outcome": "passed",
-      "duration_ms": 0.06
-    },
-    {
-      "test": "tests/unit/test_channel_plan_skip_reasons.py::test_channel_mismatch_when_contact_channel_has_no_account",
-      "outcome": "passed",
-      "duration_ms": 0.06
-    },
-    {
-      "test": "tests/unit/test_company_sourcing_retry.py::test_extract_retry_delay_falls_back_to_regex",
-      "outcome": "passed",
-      "duration_ms": 0.06
-    },
-    {
-      "test": "tests/unit/test_company_sourcing_retry.py::test_is_gemini_rate_limit_error_detects_code_429",
-      "outcome": "passed",
-      "duration_ms": 0.06
-    },
-    {
-      "test": "tests/unit/test_crypto.py::test_encrypt_none_and_empty_are_noop",
-      "outcome": "passed",
-      "duration_ms": 0.06
-    },
-    {
-      "test": "tests/unit/test_curated_discovery_maps.py::test_seniority_other_levels_unchanged",
-      "outcome": "passed",
-      "duration_ms": 0.06
-    },
-    {
-      "test": "tests/unit/test_curated_discovery_maps.py::test_short_mode_employee_transform_title_and_company",
-      "outcome": "passed",
-      "duration_ms": 0.06
-    },
-    {
-      "test": "tests/unit/test_email_provider_factory.py::test_get_provider_does_not_mutate_original_dict",
-      "outcome": "passed",
-      "duration_ms": 0.06
-    },
-    {
-      "test": "tests/unit/test_growthtoolkit_service.py::test_split_full_name",
-      "outcome": "passed",
-      "duration_ms": 0.06
-    },
-    {
-      "test": "tests/unit/test_lead_mapping_service.py::test_company_row_only_company_signal",
-      "outcome": "passed",
-      "duration_ms": 0.06
-    },
-    {
-      "test": "tests/unit/test_lead_mapping_service.py::test_person_with_linkedin_profile",
-      "outcome": "passed",
-      "duration_ms": 0.06
-    },
-    {
-      "test": "tests/unit/test_outreach_prompt_context.py::test_batch_prompt_includes_company_context_and_voice",
-      "outcome": "passed",
-      "duration_ms": 0.06
-    },
-    {
-      "test": "tests/unit/test_outreach_prompt_context.py::test_single_prompt_includes_voice_and_banned",
-      "outcome": "passed",
-      "duration_ms": 0.06
-    },
-    {
-      "test": "tests/unit/test_scoring.py::test_tier_from_score[80-hot]",
-      "outcome": "passed",
-      "duration_ms": 0.06
-    },
-    {
-      "test": "tests/unit/test_scoring.py::test_tier_from_score[100-hot]",
-      "outcome": "passed",
-      "duration_ms": 0.06
-    },
-    {
-      "test": "tests/unit/test_send_attempt_service.py::test_attempt_cap_ownership_matches_retry_boundary[failed_terminal-False]",
-      "outcome": "passed",
-      "duration_ms": 0.06
-    },
-    {
-      "test": "tests/unit/test_sequence_service.py::test_default_template_is_single_linkedin_first_route",
-      "outcome": "passed",
-      "duration_ms": 0.06
-    },
-    {
-      "test": "tests/unit/test_sequence_service.py::test_default_template_has_accepted_and_not_accepted_branches",
-      "outcome": "passed",
-      "duration_ms": 0.06
-    },
-    {
-      "test": "tests/unit/test_sequence_service.py::test_default_template_accepted_edge_is_thirty_minutes",
-      "outcome": "passed",
-      "duration_ms": 0.06
-    },
-    {
-      "test": "tests/unit/test_sequence_service.py::test_default_template_no_reply_gaps_are_one_or_two_days",
-      "outcome": "passed",
-      "duration_ms": 0.06
-    },
-    {
-      "test": "tests/unit/test_sequence_service.py::test_default_template_nodes_carry_guidance",
-      "outcome": "passed",
-      "duration_ms": 0.06
-    },
-    {
-      "test": "tests/unit/test_sequence_service.py::test_valid_minimal_graph",
-      "outcome": "passed",
-      "duration_ms": 0.06
-    },
-    {
-      "test": "tests/unit/test_sequence_service.py::test_cycle_is_rejected",
-      "outcome": "passed",
-      "duration_ms": 0.06
-    },
-    {
-      "test": "tests/unit/test_sequence_service.py::test_multiple_start_nodes_are_allowed",
-      "outcome": "passed",
-      "duration_ms": 0.06
-    },
-    {
-      "test": "tests/unit/test_sequence_service.py::test_no_start_node_when_all_have_incoming",
-      "outcome": "passed",
-      "duration_ms": 0.06
-    },
-    {
-      "test": "tests/unit/test_sequence_service.py::test_invalid_channel_is_rejected",
-      "outcome": "passed",
-      "duration_ms": 0.06
-    },
-    {
-      "test": "tests/unit/test_sequence_service.py::test_invalid_condition_is_rejected",
-      "outcome": "passed",
-      "duration_ms": 0.06
     },
     {
       "test": "tests/unit/test_sequence_service.py::test_negative_delay_is_rejected",
       "outcome": "passed",
-      "duration_ms": 0.06
-    },
-    {
-      "test": "tests/unit/test_sequence_service.py::test_sent_increments_touches_and_caps_at_max_touches",
-      "outcome": "passed",
-      "duration_ms": 0.06
+      "duration_ms": 0.07
     },
     {
       "test": "tests/unit/test_sequence_service.py::test_replied_stops_everything",
       "outcome": "passed",
-      "duration_ms": 0.06
-    },
-    {
-      "test": "tests/unit/test_sequence_service.py::test_reply_stops_even_mid_sequence_regardless_of_node",
-      "outcome": "passed",
-      "duration_ms": 0.06
-    },
-    {
-      "test": "tests/unit/test_sequence_service.py::test_resolve_routes_yields_three_capped_routes",
-      "outcome": "passed",
-      "duration_ms": 0.06
-    },
-    {
-      "test": "tests/unit/test_sequence_service.py::test_plan_route_first_touch_days_respects_identifier_availability",
-      "outcome": "passed",
-      "duration_ms": 0.06
-    },
-    {
-      "test": "tests/unit/test_sequence_service.py::test_validator_accepts_sub_day_delay_fields",
-      "outcome": "passed",
-      "duration_ms": 0.06
-    },
-    {
-      "test": "tests/unit/test_sequence_service.py::test_validator_rejects_invalid_sub_day_delay_fields",
-      "outcome": "passed",
-      "duration_ms": 0.06
-    },
-    {
-      "test": "tests/unit/test_sequence_service.py::test_sent_timeout_wait_includes_hours_and_minutes",
-      "outcome": "passed",
-      "duration_ms": 0.06
-    },
-    {
-      "test": "tests/unit/test_sequence_service.py::test_days_only_graph_behaves_identically",
-      "outcome": "passed",
-      "duration_ms": 0.06
-    },
-    {
-      "test": "tests/unit/test_sequence_service.py::test_accepted_edge_minutes_only_delay",
-      "outcome": "passed",
-      "duration_ms": 0.06
-    },
-    {
-      "test": "tests/unit/test_serialization.py::test_objectid_to_string_recursive",
-      "outcome": "passed",
-      "duration_ms": 0.06
-    },
-    {
-      "test": "tests/unit/test_serialization.py::test_non_utf8_binary_becomes_none",
-      "outcome": "passed",
-      "duration_ms": 0.06
-    },
-    {
-      "test": "tests/unit/test_shared_pool_authorization.py::test_every_legacy_company_pool_mutation_requires_superadmin",
-      "outcome": "passed",
-      "duration_ms": 0.06
-    },
-    {
-      "test": "tests/unit/test_shared_pool_migration.py::test_export_preview_never_requires_credentials_or_connects",
-      "outcome": "passed",
-      "duration_ms": 0.06
-    },
-    {
-      "test": "tests/unit/test_unipile_webhook_verification.py::test_valid_hmac_over_raw_body_is_accepted",
-      "outcome": "passed",
-      "duration_ms": 0.06
-    },
-    {
-      "test": "tests/unit/test_unipile_webhook_verification.py::test_unsigned_fails_closed_without_secret_in_production",
-      "outcome": "passed",
-      "duration_ms": 0.06
-    },
-    {
-      "test": "tests/unit/test_unipile_webhook_verification.py::test_unsigned_allowed_without_secret_in_test_env",
-      "outcome": "passed",
-      "duration_ms": 0.06
-    },
-    {
-      "test": "tests/unit/test_wave_a_security_containment.py::test_unsigned_webhook_fails_closed_outside_dev_and_test",
-      "outcome": "passed",
-      "duration_ms": 0.06
-    },
-    {
-      "test": "tests/unit/test_wave_a_security_containment.py::test_unsigned_webhook_is_explicitly_allowed_in_test",
-      "outcome": "passed",
-      "duration_ms": 0.06
-    },
-    {
-      "test": "tests/unit/test_canonicalizers.py::test_extract_prefers_first_matching_key",
-      "outcome": "passed",
-      "duration_ms": 0.05
-    },
-    {
-      "test": "tests/unit/test_canonicalizers.py::test_extract_geographies_and_titles",
-      "outcome": "passed",
-      "duration_ms": 0.05
-    },
-    {
-      "test": "tests/unit/test_canonicalizers.py::test_normalize_industry",
-      "outcome": "passed",
-      "duration_ms": 0.05
-    },
-    {
-      "test": "tests/unit/test_company_sourcing_retry.py::test_is_gemini_rate_limit_error_false_for_other_errors",
-      "outcome": "passed",
-      "duration_ms": 0.05
-    },
-    {
-      "test": "tests/unit/test_crypto.py::test_decrypt_passes_through_legacy_plaintext",
-      "outcome": "passed",
-      "duration_ms": 0.05
-    },
-    {
-      "test": "tests/unit/test_crypto.py::test_encrypt_with_no_key_configured_stores_plaintext",
-      "outcome": "passed",
-      "duration_ms": 0.05
-    },
-    {
-      "test": "tests/unit/test_curated_discovery_maps.py::test_seniority_head_maps_to_220",
-      "outcome": "passed",
-      "duration_ms": 0.05
-    },
-    {
-      "test": "tests/unit/test_curated_discovery_maps.py::test_seniority_manager_maps_to_210",
-      "outcome": "passed",
-      "duration_ms": 0.05
-    },
-    {
-      "test": "tests/unit/test_curated_discovery_maps.py::test_seniority_dedupes_and_sorts",
-      "outcome": "passed",
-      "duration_ms": 0.05
-    },
-    {
-      "test": "tests/unit/test_curated_discovery_maps.py::test_function_id_mapping[engineering-8]",
-      "outcome": "passed",
-      "duration_ms": 0.05
-    },
-    {
-      "test": "tests/unit/test_curated_discovery_maps.py::test_function_id_mapping[finance-10]",
-      "outcome": "passed",
-      "duration_ms": 0.05
-    },
-    {
-      "test": "tests/unit/test_curated_discovery_maps.py::test_function_id_mapping[hr-12]",
-      "outcome": "passed",
-      "duration_ms": 0.05
-    },
-    {
-      "test": "tests/unit/test_curated_discovery_maps.py::test_function_id_mapping[human_resources-12]",
-      "outcome": "passed",
-      "duration_ms": 0.05
-    },
-    {
-      "test": "tests/unit/test_curated_discovery_maps.py::test_function_id_mapping[operations-18]",
-      "outcome": "passed",
-      "duration_ms": 0.05
-    },
-    {
-      "test": "tests/unit/test_curated_discovery_maps.py::test_function_id_mapping[product-19]",
-      "outcome": "passed",
-      "duration_ms": 0.05
-    },
-    {
-      "test": "tests/unit/test_curated_discovery_maps.py::test_function_id_mapping[product_management-19]",
-      "outcome": "passed",
-      "duration_ms": 0.05
-    },
-    {
-      "test": "tests/unit/test_curated_discovery_maps.py::test_function_id_mapping[marketing-15]",
-      "outcome": "passed",
-      "duration_ms": 0.05
-    },
-    {
-      "test": "tests/unit/test_curated_discovery_maps.py::test_function_id_mapping[sales-25]",
-      "outcome": "passed",
-      "duration_ms": 0.05
-    },
-    {
-      "test": "tests/unit/test_curated_discovery_maps.py::test_function_id_mapping[business_development-4]",
-      "outcome": "passed",
-      "duration_ms": 0.05
-    },
-    {
-      "test": "tests/unit/test_curated_discovery_maps.py::test_function_id_mapping[it-13]",
-      "outcome": "passed",
-      "duration_ms": 0.05
-    },
-    {
-      "test": "tests/unit/test_curated_discovery_maps.py::test_function_id_mapping_case_and_space_insensitive",
-      "outcome": "passed",
-      "duration_ms": 0.05
-    },
-    {
-      "test": "tests/unit/test_curated_discovery_maps.py::test_headcount_bands_exact_small_company",
-      "outcome": "passed",
-      "duration_ms": 0.05
-    },
-    {
-      "test": "tests/unit/test_curated_discovery_maps.py::test_db_company_sc_dict_has_no_hardcoded_score",
-      "outcome": "passed",
-      "duration_ms": 0.05
-    },
-    {
-      "test": "tests/unit/test_curated_discovery_maps.py::test_short_mode_employee_transform_has_no_email",
-      "outcome": "passed",
-      "duration_ms": 0.05
-    },
-    {
-      "test": "tests/unit/test_curated_discovery_maps.py::test_full_mode_employee_transform_still_works_backward_compat",
-      "outcome": "passed",
-      "duration_ms": 0.05
-    },
-    {
-      "test": "tests/unit/test_daily_cap_service.py::test_email_sender_policy_applies_warmup_ramp_and_provider_ceiling",
-      "outcome": "passed",
-      "duration_ms": 0.05
-    },
-    {
-      "test": "tests/unit/test_employee_selection_isolation.py::test_company_apify_client_is_constructed_only_on_first_dataset_access",
-      "outcome": "passed",
-      "duration_ms": 0.05
-    },
-    {
-      "test": "tests/unit/test_growthtoolkit_service.py::test_extract_first_last_prefers_explicit_fields",
-      "outcome": "passed",
-      "duration_ms": 0.05
-    },
-    {
-      "test": "tests/unit/test_inbound_message_id_capture.py::test_reply_meta_carries_rfc_message_id",
-      "outcome": "passed",
-      "duration_ms": 0.05
-    },
-    {
-      "test": "tests/unit/test_lead_mapping_service.py::test_company_row_domain_only",
-      "outcome": "passed",
-      "duration_ms": 0.05
-    },
-    {
-      "test": "tests/unit/test_lead_mapping_service.py::test_person_with_name_and_company_email_only_path",
-      "outcome": "passed",
-      "duration_ms": 0.05
-    },
-    {
-      "test": "tests/unit/test_lead_mapping_service.py::test_person_with_direct_email_no_linkedin_no_company",
-      "outcome": "passed",
-      "duration_ms": 0.05
-    },
-    {
-      "test": "tests/unit/test_lead_mapping_service.py::test_person_linkedin_wins_even_without_name_columns_but_full_name_present",
-      "outcome": "passed",
-      "duration_ms": 0.05
-    },
-    {
-      "test": "tests/unit/test_lead_mapping_service.py::test_build_lead_fields_splits_full_name",
-      "outcome": "passed",
-      "duration_ms": 0.05
-    },
-    {
-      "test": "tests/unit/test_lead_mapping_service.py::test_build_lead_fields_company_linkedin_from_generic_column",
-      "outcome": "passed",
-      "duration_ms": 0.05
-    },
-    {
-      "test": "tests/unit/test_lead_mapping_service.py::test_normalize_domain[https://www.acme.com/about-acme.com]",
-      "outcome": "passed",
-      "duration_ms": 0.05
-    },
-    {
-      "test": "tests/unit/test_lead_mapping_service.py::test_normalize_domain[http://acme.io-acme.io]",
-      "outcome": "passed",
-      "duration_ms": 0.05
-    },
-    {
-      "test": "tests/unit/test_lead_mapping_service.py::test_normalize_linkedin_url_variants",
-      "outcome": "passed",
-      "duration_ms": 0.05
-    },
-    {
-      "test": "tests/unit/test_lead_mapping_service.py::test_is_person_vs_company_linkedin",
-      "outcome": "passed",
-      "duration_ms": 0.05
-    },
-    {
-      "test": "tests/unit/test_lead_mapping_service.py::test_heuristic_mapping_basic_headers",
-      "outcome": "passed",
-      "duration_ms": 0.05
-    },
-    {
-      "test": "tests/unit/test_lead_mapping_service.py::test_heuristic_mapping_ambiguous_creates_question",
-      "outcome": "passed",
-      "duration_ms": 0.05
-    },
-    {
-      "test": "tests/unit/test_notification_isolation.py::test_sse_event_uses_canonical_body_and_campaign_fields",
-      "outcome": "passed",
-      "duration_ms": 0.05
-    },
-    {
-      "test": "tests/unit/test_outreach_prompt_context.py::test_followup_prompt_includes_voice_diff_case_study",
-      "outcome": "passed",
-      "duration_ms": 0.05
+      "duration_ms": 0.07
     },
     {
       "test": "tests/unit/test_sequence_service.py::test_already_stopped_is_idempotent",
       "outcome": "passed",
-      "duration_ms": 0.05
+      "duration_ms": 0.07
     },
     {
       "test": "tests/unit/test_sequence_service.py::test_terminal_breakup_node_ends_sequence_on_send",
       "outcome": "passed",
-      "duration_ms": 0.05
-    },
-    {
-      "test": "tests/unit/test_sequence_service.py::test_engine_channel_maps_inmail",
-      "outcome": "passed",
-      "duration_ms": 0.05
+      "duration_ms": 0.07
     },
     {
       "test": "tests/unit/test_sequence_service.py::test_plan_first_touch_days_skips_prospects_without_channel",
       "outcome": "passed",
-      "duration_ms": 0.05
+      "duration_ms": 0.07
     },
     {
       "test": "tests/unit/test_sequence_service.py::test_resolve_routes_single_route_for_default_template",
       "outcome": "passed",
-      "duration_ms": 0.05
+      "duration_ms": 0.07
+    },
+    {
+      "test": "tests/unit/test_sequence_service.py::test_validator_accepts_sub_day_delay_fields",
+      "outcome": "passed",
+      "duration_ms": 0.07
     },
     {
       "test": "tests/unit/test_serialization.py::test_naive_datetime_assumed_utc_with_z_suffix",
       "outcome": "passed",
-      "duration_ms": 0.05
+      "duration_ms": 0.07
     },
     {
       "test": "tests/unit/test_serialization.py::test_aware_datetime_utc_gets_z_suffix",
       "outcome": "passed",
-      "duration_ms": 0.05
-    },
-    {
-      "test": "tests/unit/test_serialization.py::test_aware_non_utc_datetime_preserves_offset",
-      "outcome": "passed",
-      "duration_ms": 0.05
-    },
-    {
-      "test": "tests/unit/test_serialization.py::test_utf8_binary_decoded_as_text",
-      "outcome": "passed",
-      "duration_ms": 0.05
-    },
-    {
-      "test": "tests/unit/test_serialization.py::test_scalars_passthrough",
-      "outcome": "passed",
-      "duration_ms": 0.05
+      "duration_ms": 0.07
     },
     {
       "test": "tests/unit/test_serialization.py::test_list_of_mixed_types",
       "outcome": "passed",
-      "duration_ms": 0.05
-    },
-    {
-      "test": "tests/unit/test_session_security.py::test_non_browser_auth_contract_remains_bearer_compatible",
-      "outcome": "passed",
-      "duration_ms": 0.05
-    },
-    {
-      "test": "tests/unit/test_system_settings_and_audit.py::test_sanitize_redacts_credential_shaped_keys",
-      "outcome": "passed",
-      "duration_ms": 0.05
-    },
-    {
-      "test": "tests/unit/test_system_settings_and_audit.py::test_sanitize_objectid_and_datetime",
-      "outcome": "passed",
-      "duration_ms": 0.05
-    },
-    {
-      "test": "tests/unit/test_system_settings_and_audit.py::test_sanitize_truncates_long_strings_and_lists",
-      "outcome": "passed",
-      "duration_ms": 0.05
-    },
-    {
-      "test": "tests/unit/test_system_settings_and_audit.py::test_sanitize_stringifies_unknown_types",
-      "outcome": "passed",
-      "duration_ms": 0.05
+      "duration_ms": 0.07
     },
     {
       "test": "tests/unit/test_unipile_webhook_verification.py::test_sha256_prefixed_hmac_is_accepted",
       "outcome": "passed",
-      "duration_ms": 0.05
+      "duration_ms": 0.07
     },
     {
       "test": "tests/unit/test_unipile_webhook_verification.py::test_tampered_body_fails_hmac",
       "outcome": "passed",
-      "duration_ms": 0.05
+      "duration_ms": 0.07
     },
     {
       "test": "tests/unit/test_unipile_webhook_verification.py::test_wrong_secret_fails_hmac",
       "outcome": "passed",
-      "duration_ms": 0.05
-    },
-    {
-      "test": "tests/unit/test_unipile_webhook_verification.py::test_timestamped_hmac_within_tolerance_is_accepted",
-      "outcome": "passed",
-      "duration_ms": 0.05
+      "duration_ms": 0.07
     },
     {
       "test": "tests/unit/test_unipile_webhook_verification.py::test_non_numeric_timestamp_is_rejected",
       "outcome": "passed",
-      "duration_ms": 0.05
-    },
-    {
-      "test": "tests/unit/test_unipile_webhook_verification.py::test_plain_secret_accepted_in_transition_mode",
-      "outcome": "passed",
-      "duration_ms": 0.05
+      "duration_ms": 0.07
     },
     {
       "test": "tests/unit/test_unipile_webhook_verification.py::test_plain_secret_rejected_when_hmac_required",
       "outcome": "passed",
-      "duration_ms": 0.05
-    },
-    {
-      "test": "tests/unit/test_unset_legacy_campaign_scores.py::test_filter_and_update_cover_exactly_the_legacy_fields",
-      "outcome": "passed",
-      "duration_ms": 0.05
-    },
-    {
-      "test": "tests/unit/test_wave_a_security_containment.py::test_zoho_origins_are_exactly_mapped[https://accounts.zoho.com-https://mail.zoho.com]",
-      "outcome": "passed",
-      "duration_ms": 0.05
-    },
-    {
-      "test": "tests/unit/test_wave_a_security_containment.py::test_zoho_origin_allowlist_rejects_ssrf_inputs[https://accounts.zoho.com.evil.test]",
-      "outcome": "passed",
-      "duration_ms": 0.05
-    },
-    {
-      "test": "tests/unit/test_wave_a_security_containment.py::test_oauth_state_rejects_external_return_destination[https://evil.example/callback]",
-      "outcome": "passed",
-      "duration_ms": 0.05
-    },
-    {
-      "test": "tests/unit/test_wave_a_security_containment.py::test_oauth_state_rejects_external_return_destination[//evil.example/callback]",
-      "outcome": "passed",
-      "duration_ms": 0.05
-    },
-    {
-      "test": "tests/unit/test_wave_a_security_containment.py::test_oauth_state_rejects_external_return_destination[javascript:alert(1)]",
-      "outcome": "passed",
-      "duration_ms": 0.05
-    },
-    {
-      "test": "tests/unit/test_wave_a_security_containment.py::test_production_encryption_refuses_missing_key",
-      "outcome": "passed",
-      "duration_ms": 0.05
-    },
-    {
-      "test": "tests/unit/test_curated_discovery_maps.py::test_function_id_mapping[information_technology-13]",
-      "outcome": "passed",
-      "duration_ms": 0.04
-    },
-    {
-      "test": "tests/unit/test_curated_discovery_maps.py::test_function_id_mapping[legal-14]",
-      "outcome": "passed",
-      "duration_ms": 0.04
-    },
-    {
-      "test": "tests/unit/test_curated_discovery_maps.py::test_function_id_mapping[consulting-6]",
-      "outcome": "passed",
-      "duration_ms": 0.04
-    },
-    {
-      "test": "tests/unit/test_curated_discovery_maps.py::test_function_id_mapping[customer_success-26]",
-      "outcome": "passed",
-      "duration_ms": 0.04
-    },
-    {
-      "test": "tests/unit/test_curated_discovery_maps.py::test_function_id_mapping[support-26]",
-      "outcome": "passed",
-      "duration_ms": 0.04
-    },
-    {
-      "test": "tests/unit/test_curated_discovery_maps.py::test_headcount_bands_no_range_returns_empty",
-      "outcome": "passed",
-      "duration_ms": 0.04
-    },
-    {
-      "test": "tests/unit/test_curated_discovery_maps.py::test_headcount_bands_min_only_is_open_ended",
-      "outcome": "passed",
-      "duration_ms": 0.04
-    },
-    {
-      "test": "tests/unit/test_curated_discovery_maps.py::test_headcount_bands_max_only_starts_from_zero",
-      "outcome": "passed",
-      "duration_ms": 0.04
-    },
-    {
-      "test": "tests/unit/test_curated_discovery_maps.py::test_headcount_bands_range_spanning_several_bands",
-      "outcome": "passed",
-      "duration_ms": 0.04
-    },
-    {
-      "test": "tests/unit/test_curated_discovery_maps.py::test_headcount_bands_huge_company_only",
-      "outcome": "passed",
-      "duration_ms": 0.04
-    },
-    {
-      "test": "tests/unit/test_curated_discovery_maps.py::test_headcount_bands_self_employed",
-      "outcome": "passed",
-      "duration_ms": 0.04
-    },
-    {
-      "test": "tests/unit/test_curated_discovery_maps.py::test_db_company_off_icp_scores_below_threshold",
-      "outcome": "passed",
-      "duration_ms": 0.04
-    },
-    {
-      "test": "tests/unit/test_curated_discovery_maps.py::test_extract_company_url_prefers_currentpositions_plural",
-      "outcome": "passed",
-      "duration_ms": 0.04
-    },
-    {
-      "test": "tests/unit/test_curated_discovery_maps.py::test_extract_company_url_falls_back_to_currentposition_singular",
-      "outcome": "passed",
-      "duration_ms": 0.04
-    },
-    {
-      "test": "tests/unit/test_curated_discovery_maps.py::test_extract_company_url_meta_query_wins_over_both",
-      "outcome": "passed",
-      "duration_ms": 0.04
-    },
-    {
-      "test": "tests/unit/test_daily_cap_service.py::test_linkedin_sender_policy_has_separate_channel_caps_and_pause",
-      "outcome": "passed",
-      "duration_ms": 0.04
-    },
-    {
-      "test": "tests/unit/test_email_provider_factory.py::test_get_provider_unknown_provider_returns_none",
-      "outcome": "passed",
-      "duration_ms": 0.04
-    },
-    {
-      "test": "tests/unit/test_email_thread_context.py::test_id_variants_matches_both_storage_types",
-      "outcome": "passed",
-      "duration_ms": 0.04
-    },
-    {
-      "test": "tests/unit/test_enrollment_ranking_no_legacy.py::test_unscored_sorts_after_zero_and_positive_scores",
-      "outcome": "passed",
-      "duration_ms": 0.04
-    },
-    {
-      "test": "tests/unit/test_geo_resolver.py::test_to_geojson_lng_lat_order",
-      "outcome": "passed",
-      "duration_ms": 0.04
-    },
-    {
-      "test": "tests/unit/test_geo_resolver.py::test_normalize_raw",
-      "outcome": "passed",
-      "duration_ms": 0.04
-    },
-    {
-      "test": "tests/unit/test_geo_resolver.py::test_hint_to_code",
-      "outcome": "passed",
-      "duration_ms": 0.04
-    },
-    {
-      "test": "tests/unit/test_lead_mapping_service.py::test_unresolvable_name_only",
-      "outcome": "passed",
-      "duration_ms": 0.04
-    },
-    {
-      "test": "tests/unit/test_lead_mapping_service.py::test_unresolvable_junk_row",
-      "outcome": "passed",
-      "duration_ms": 0.04
-    },
-    {
-      "test": "tests/unit/test_lead_mapping_service.py::test_unresolvable_empty_cells",
-      "outcome": "passed",
-      "duration_ms": 0.04
-    },
-    {
-      "test": "tests/unit/test_lead_mapping_service.py::test_apply_mapping_ignores_and_dedupes",
-      "outcome": "passed",
-      "duration_ms": 0.04
-    },
-    {
-      "test": "tests/unit/test_lead_mapping_service.py::test_normalize_domain[acme.com-acme.com]",
-      "outcome": "passed",
-      "duration_ms": 0.04
-    },
-    {
-      "test": "tests/unit/test_lead_mapping_service.py::test_normalize_domain[www.acme.com-acme.com]",
-      "outcome": "passed",
-      "duration_ms": 0.04
-    },
-    {
-      "test": "tests/unit/test_lead_mapping_service.py::test_normalize_domain[notadomain-None]",
-      "outcome": "passed",
-      "duration_ms": 0.04
-    },
-    {
-      "test": "tests/unit/test_lead_mapping_service.py::test_normalize_domain[-None]",
-      "outcome": "passed",
-      "duration_ms": 0.04
-    },
-    {
-      "test": "tests/unit/test_lead_mapping_service.py::test_normalize_domain[None-None]",
-      "outcome": "passed",
-      "duration_ms": 0.04
-    },
-    {
-      "test": "tests/unit/test_lead_mapping_service.py::test_company_domain_for_row_skips_free_email",
-      "outcome": "passed",
-      "duration_ms": 0.04
-    },
-    {
-      "test": "tests/unit/test_lead_mapping_service.py::test_heuristic_mapping_dedupes_single_value_fields",
-      "outcome": "passed",
-      "duration_ms": 0.04
-    },
-    {
-      "test": "tests/unit/test_onboarding_draft_whitelist.py::test_strings_are_trimmed_and_blanks_dropped",
-      "outcome": "passed",
-      "duration_ms": 0.04
-    },
-    {
-      "test": "tests/unit/test_onboarding_draft_whitelist.py::test_lists_are_cleaned_but_empties_preserved",
-      "outcome": "passed",
-      "duration_ms": 0.04
-    },
-    {
-      "test": "tests/unit/test_onboarding_draft_whitelist.py::test_unknown_and_mistyped_fields_are_dropped",
-      "outcome": "passed",
-      "duration_ms": 0.04
-    },
-    {
-      "test": "tests/unit/test_outreach_prompt_context.py::test_select_best_case_study_accepts_strings",
-      "outcome": "passed",
-      "duration_ms": 0.04
-    },
-    {
-      "test": "tests/unit/test_outreach_prompt_context.py::test_select_best_case_study_mixed_and_industry_match",
-      "outcome": "passed",
-      "duration_ms": 0.04
-    },
-    {
-      "test": "tests/unit/test_outreach_prompt_context.py::test_batch_prompt_without_profile_still_builds",
-      "outcome": "passed",
-      "duration_ms": 0.04
-    },
-    {
-      "test": "tests/unit/test_outreach_prompt_context.py::test_preview_prompt_includes_differentiators_and_case_study",
-      "outcome": "passed",
-      "duration_ms": 0.04
-    },
-    {
-      "test": "tests/unit/test_prospect_filter_keys.py::test_build_filter_keys_full_doc",
-      "outcome": "passed",
-      "duration_ms": 0.04
-    },
-    {
-      "test": "tests/unit/test_prospect_filter_keys.py::test_build_filter_keys_missing_fields_become_none",
-      "outcome": "passed",
-      "duration_ms": 0.04
-    },
-    {
-      "test": "tests/unit/test_prospect_filter_keys.py::test_pk_projection_covers_all_built_keys",
-      "outcome": "passed",
-      "duration_ms": 0.04
-    },
-    {
-      "test": "tests/unit/test_system_settings_and_audit.py::test_sanitize_depth_cap",
-      "outcome": "passed",
-      "duration_ms": 0.04
-    },
-    {
-      "test": "tests/unit/test_unipile_webhook_verification.py::test_empty_signature_is_rejected",
-      "outcome": "passed",
-      "duration_ms": 0.04
+      "duration_ms": 0.07
     },
     {
       "test": "tests/unit/test_wave_a_security_containment.py::test_zoho_origins_are_exactly_mapped[https://accounts.zoho.eu/-https://mail.zoho.eu]",
       "outcome": "passed",
-      "duration_ms": 0.04
-    },
-    {
-      "test": "tests/unit/test_wave_a_security_containment.py::test_zoho_origins_are_exactly_mapped[https://accounts.zohocloud.ca-https://mail.zohocloud.ca]",
-      "outcome": "passed",
-      "duration_ms": 0.04
-    },
-    {
-      "test": "tests/unit/test_wave_a_security_containment.py::test_zoho_origins_are_exactly_mapped[https://accounts.zoho.sa-https://mail.zoho.sa]",
-      "outcome": "passed",
-      "duration_ms": 0.04
+      "duration_ms": 0.07
     },
     {
       "test": "tests/unit/test_wave_a_security_containment.py::test_zoho_origin_allowlist_rejects_ssrf_inputs[https://accounts.zoho.com@evil.test]",
       "outcome": "passed",
-      "duration_ms": 0.04
+      "duration_ms": 0.07
     },
     {
       "test": "tests/unit/test_wave_a_security_containment.py::test_zoho_origin_allowlist_rejects_ssrf_inputs[https://accounts.zoho.com/oauth/v2/token]",
       "outcome": "passed",
-      "duration_ms": 0.04
+      "duration_ms": 0.07
     },
     {
       "test": "tests/unit/test_wave_a_security_containment.py::test_zoho_origin_allowlist_rejects_ssrf_inputs[https://169.254.169.254/latest/meta-data]",
       "outcome": "passed",
-      "duration_ms": 0.04
+      "duration_ms": 0.07
     },
     {
       "test": "tests/unit/test_wave_a_security_containment.py::test_zoho_origin_allowlist_rejects_ssrf_inputs[https://accounts.zoho.com?next=https://evil.test]",
       "outcome": "passed",
-      "duration_ms": 0.04
+      "duration_ms": 0.07
+    },
+    {
+      "test": "tests/unit/test_wave_a_security_containment.py::test_oauth_state_rejects_external_return_destination[//evil.example/callback]",
+      "outcome": "passed",
+      "duration_ms": 0.07
+    },
+    {
+      "test": "tests/unit/test_wave_a_security_containment.py::test_oauth_state_rejects_external_return_destination[javascript:alert(1)]",
+      "outcome": "passed",
+      "duration_ms": 0.07
     },
     {
       "test": "tests/unit/test_website_scraper_service.py::test_failure_marker_is_distinguishable",
       "outcome": "passed",
-      "duration_ms": 0.04
-    },
-    {
-      "test": "tests/unit/test_website_scraper_service.py::test_staleness_missing_is_stale",
-      "outcome": "passed",
-      "duration_ms": 0.04
+      "duration_ms": 0.07
     },
     {
       "test": "tests/unit/test_website_scraper_service.py::test_staleness_recent_is_fresh",
       "outcome": "passed",
-      "duration_ms": 0.04
-    },
-    {
-      "test": "tests/unit/test_website_scraper_service.py::test_staleness_old_is_stale",
-      "outcome": "passed",
-      "duration_ms": 0.04
+      "duration_ms": 0.07
     },
     {
       "test": "tests/unit/test_website_scraper_service.py::test_staleness_custom_window",
       "outcome": "passed",
-      "duration_ms": 0.04
+      "duration_ms": 0.07
     },
     {
-      "test": "tests/unit/test_email_provider_factory.py::test_get_provider_none_account_returns_none",
+      "test": "tests/unit/test_scoring.py::test_campaign_score_location_subdocument_fallback",
       "outcome": "passed",
-      "duration_ms": 0.03
+      "duration_ms": 0.06
     },
     {
-      "test": "tests/unit/test_enrollment_ranking_no_legacy.py::test_zero_is_a_real_score_and_null_is_unscored",
+      "test": "tests/unit/test_sequence_service.py::test_engine_channel_maps_inmail",
       "outcome": "passed",
-      "duration_ms": 0.03
+      "duration_ms": 0.06
+    },
+    {
+      "test": "tests/unit/test_serialization.py::test_aware_non_utc_datetime_preserves_offset",
+      "outcome": "passed",
+      "duration_ms": 0.06
+    },
+    {
+      "test": "tests/unit/test_serialization.py::test_utf8_binary_decoded_as_text",
+      "outcome": "passed",
+      "duration_ms": 0.06
+    },
+    {
+      "test": "tests/unit/test_serialization.py::test_scalars_passthrough",
+      "outcome": "passed",
+      "duration_ms": 0.06
+    },
+    {
+      "test": "tests/unit/test_system_settings_and_audit.py::test_sanitize_depth_cap",
+      "outcome": "passed",
+      "duration_ms": 0.06
+    },
+    {
+      "test": "tests/unit/test_unipile_webhook_verification.py::test_empty_signature_is_rejected",
+      "outcome": "passed",
+      "duration_ms": 0.06
+    },
+    {
+      "test": "tests/unit/test_wave_a_security_containment.py::test_zoho_origins_are_exactly_mapped[https://accounts.zohocloud.ca-https://mail.zohocloud.ca]",
+      "outcome": "passed",
+      "duration_ms": 0.06
+    },
+    {
+      "test": "tests/unit/test_wave_a_security_containment.py::test_zoho_origins_are_exactly_mapped[https://accounts.zoho.sa-https://mail.zoho.sa]",
+      "outcome": "passed",
+      "duration_ms": 0.06
+    },
+    {
+      "test": "tests/unit/test_website_scraper_service.py::test_staleness_missing_is_stale",
+      "outcome": "passed",
+      "duration_ms": 0.06
+    },
+    {
+      "test": "tests/unit/test_website_scraper_service.py::test_staleness_old_is_stale",
+      "outcome": "passed",
+      "duration_ms": 0.06
     }
   ],
   "perf_metrics": []

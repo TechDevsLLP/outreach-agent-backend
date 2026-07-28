@@ -9,7 +9,7 @@ from typing import Optional
 from fastapi import APIRouter, Depends, HTTPException, Query, Request
 from fastapi.responses import StreamingResponse
 
-from auth import get_account_context
+from auth import get_account_context, get_account_context_sse
 from database import notifications_collection
 from services.notification_service import event_stream
 
@@ -19,9 +19,9 @@ router = APIRouter(prefix="/api/notifications", tags=["notifications"])
 @router.get("/stream")
 async def notification_stream(
     request: Request,
-    account_ctx=Depends(get_account_context),
+    account_ctx=Depends(get_account_context_sse),
 ):
-    """Tenant-scoped SSE stream authenticated by cookie or bearer header."""
+    """Tenant-scoped SSE stream (bearer header, cookie, or `?ticket=`)."""
     account_id = str(account_ctx["account"]["_id"])
 
     last_event_id = request.headers.get("Last-Event-ID")

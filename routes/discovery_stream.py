@@ -25,7 +25,7 @@ from fastapi import APIRouter, Depends, HTTPException
 from fastapi.responses import StreamingResponse
 
 import database
-from auth import get_account_context
+from auth import get_account_context_sse
 
 logger = logging.getLogger(__name__)
 
@@ -154,9 +154,13 @@ async def _discovery_event_stream(campaign_oid: ObjectId, campaign_id: str, acco
 @router.get("/{campaign_id}/discovery-stream")
 async def discovery_stream(
     campaign_id: str,
-    account_ctx=Depends(get_account_context),
+    account_ctx=Depends(get_account_context_sse),
 ):
-    """Tenant-scoped SSE stream of live discovery progress (cookie or bearer auth)."""
+    """Tenant-scoped SSE stream of live discovery progress.
+
+    Authenticates by bearer header, cookie, or `?ticket=` — browsers must use
+    the ticket, since EventSource cannot send headers.
+    """
     account_id = str(account_ctx["account"]["_id"])
     if not ObjectId.is_valid(campaign_id):
         raise HTTPException(status_code=400, detail="Invalid campaign id")

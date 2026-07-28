@@ -14,6 +14,8 @@ from config import get_settings
 from auth import (
     clear_session_cookies,
     create_access_token,
+    create_stream_ticket,
+    get_account_context,
     get_current_user,
     hash_password,
     is_browser_session_request,
@@ -260,6 +262,29 @@ async def logout(request: Request, response: Response):
     clear_session_cookies(response)
     response.headers["Cache-Control"] = "no-store"
     return {"message": "Logged out"}
+
+
+# ---------------------------------------------------------------------------
+# POST /api/auth/stream-ticket
+# ---------------------------------------------------------------------------
+
+@router.post("/stream-ticket")
+@limiter.limit("60/minute")
+async def mint_stream_ticket(
+    request: Request,
+    account_ctx: dict = Depends(get_account_context),
+):
+    """Trade the caller's session for a short-lived SSE ticket.
+
+    EventSource cannot send an Authorization header and the API is cross-origin,
+    so streaming endpoints accept `?ticket=` instead. The ticket is opaque,
+    account-scoped and expires in ~2 minutes.
+    """
+    ticket, ttl = await create_stream_ticket(
+        user_id=str(account_ctx["user"]["_id"]),
+        account_id=str(account_ctx["account"]["_id"]),
+    )
+    return {"ticket": ticket, "expires_in": ttl}
 
 
 # ---------------------------------------------------------------------------

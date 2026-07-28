@@ -96,6 +96,11 @@ send_attempts_collection = db["send_attempts"]
 # unique _id; TTL is cleanup, while atomic consumption enforces one-time use.
 oauth_state_nonces_collection = db["oauth_state_nonces"]
 
+# Short-lived SSE tickets. EventSource cannot send an Authorization header, so
+# the browser trades its bearer token for one of these and passes it in the
+# query string. The random ticket is the _id; TTL expiry is the only cleanup.
+stream_tickets_collection = db["stream_tickets"]
+
 
 async def create_indexes():
     """Create all MongoDB indexes on startup."""
@@ -773,6 +778,15 @@ async def create_indexes():
             ],
             partialFilterExpression={"provider_result.message_id": {"$type": "string"}},
             name="send_attempt_provider_reconcile",
+        ),
+    ])
+
+    # SSE stream tickets expire on their own; nothing else queries them.
+    await stream_tickets_collection.create_indexes([
+        IndexModel(
+            [("expires_at", ASCENDING)],
+            expireAfterSeconds=0,
+            name="stream_ticket_expiry_ttl_idx",
         ),
     ])
 
