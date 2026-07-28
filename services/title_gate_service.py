@@ -196,12 +196,42 @@ def _parse_rows(raw_content: str) -> list[dict]:
     return [r for r in parsed if isinstance(r, dict)]
 
 
-async def _judge_batch(gemini_client, batch: list[dict], icp: dict, batch_num: int) -> dict[int, dict]:
+async def _record_gemini_usage(resp, account_id: str | None, campaign_id: str | None, started_at: float):
+    """Log this Gemini call's token spend so it shows up in the cost portal.
+
+    Direct-SDK Gemini calls bypass OpenRouter, so without this the title gate —
+    which runs on every discovery batch — was unaccounted spend. Recorded into
+    the same collection as OpenRouter usage (the model name identifies the
+    provider).
+    """
+    try:
+        from services.openrouter_service import _record_openrouter_usage
+        usage = getattr(resp, "usage_metadata", None)
+        if usage is None:
+            return
+        await _record_openrouter_usage(
+            model=_GEMINI_MODEL,
+            prompt_tokens=getattr(usage, "prompt_token_count", 0) or 0,
+            completion_tokens=getattr(usage, "candidates_token_count", 0) or 0,
+            duration_ms=int((asyncio.get_event_loop().time() - started_at) * 1000),
+            account_id=account_id,
+            campaign_id=campaign_id,
+            feature="title_gate",
+        )
+    except Exception:
+        pass
+
+
+async def _judge_batch(
+    gemini_client, batch: list[dict], icp: dict, batch_num: int,
+    account_id: str | None = None, campaign_id: str | None = None,
+) -> dict[int, dict]:
     """Judge one batch. Every index in `batch` gets a verdict; failures fail open."""
     verdicts: dict[int, dict] = {c["index"]: _fail_open() for c in batch}
     batch_indices = set(verdicts.keys())
 
     prompt = _build_prompt(batch, icp)
+    _started_at = asyncio.get_event_loop().time()
     try:
         resp = await asyncio.wait_for(
             _call_gemini_with_retry(gemini_client, prompt), _CALL_TIMEOUT_SECONDS
@@ -209,6 +239,8 @@ async def _judge_batch(gemini_client, batch: list[dict], icp: dict, batch_num: i
     except Exception as e:
         logger.warning(f"[title-gate] batch {batch_num} failed (fail-open for {len(batch)}): {e}")
         return verdicts
+
+    await _record_gemini_usage(resp, account_id, campaign_id, _started_at)
 
     raw_content = getattr(resp, "text", None) if resp else None
     for row in _parse_rows(raw_content or ""):
@@ -238,13 +270,20 @@ async def _judge_batch(gemini_client, batch: list[dict], icp: dict, batch_num: i
 
 # ── Public API ───────────────────────────────────────────────────────────────
 
-async def ai_title_gate(candidates: list[dict], icp: dict) -> dict[int, dict]:
+async def ai_title_gate(
+    candidates: list[dict],
+    icp: dict,
+    *,
+    account_id: str | None = None,
+    campaign_id: str | None = None,
+) -> dict[int, dict]:
     """AI semantic title gate. Call AFTER deterministic gating.
 
     Args:
         candidates: list of {"index": int, "title": str, "headline": str (optional)}.
         icp: {"job_titles": [...], "seniorities": [...], "functions": [...],
               "notes": str (optional, campaign targeting description)}.
+        account_id / campaign_id: cost attribution tags for the usage log.
 
     Returns:
         {index: {"match": bool, "reason": str}} for EVERY input index.
@@ -284,7 +323,10 @@ async def ai_title_gate(candidates: list[dict], icp: dict) -> dict[int, dict]:
     for batch_num, start in enumerate(range(0, len(valid), _BATCH_SIZE), start=1):
         batch = valid[start:start + _BATCH_SIZE]
         try:
-            verdicts = await _judge_batch(gemini_client, batch, icp or {}, batch_num)
+            verdicts = await _judge_batch(
+                gemini_client, batch, icp or {}, batch_num,
+                account_id=account_id, campaign_id=campaign_id,
+            )
             results.update(verdicts)
         except Exception as e:  # belt-and-braces: _judge_batch already fails open
             logger.warning(f"[title-gate] batch {batch_num} crashed (fail-open): {e}")

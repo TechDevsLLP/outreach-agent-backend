@@ -54,8 +54,12 @@ async def test_list_companies_uses_live_lookup_no_stored_field(monkeypatch):
     fake = _FakeCollection(canned)
     monkeypatch.setattr(companies_route, "companies_collection", fake)
 
+    # Every filter arg is passed explicitly: calling the route function directly
+    # bypasses FastAPI, so omitted params arrive as raw `Query` objects.
     result = await companies_route.list_companies(
-        min_prospects=5, sort_by="prospect_count", sort_order="desc", page=1, page_size=20, ctx={},
+        industry=None, industry_id=None, search=None,
+        min_prospects=5, min_employees=None, max_employees=None, has_website=None,
+        sort_by="prospect_count", sort_order="desc", page=1, page_size=20, ctx={},
     )
 
     # Live lookup present, not a stored-field filter.
@@ -75,7 +79,11 @@ async def test_list_companies_paginates_before_lookup_when_not_needed(monkeypatc
     fake = _FakeCollection(canned)
     monkeypatch.setattr(companies_route, "companies_collection", fake)
 
-    await companies_route.list_companies(min_prospects=0, sort_by="name", sort_order="desc", page=1, page_size=20, ctx={})
+    await companies_route.list_companies(
+        industry=None, industry_id=None, search=None,
+        min_prospects=0, min_employees=None, max_employees=None, has_website=None,
+        sort_by="name", sort_order="desc", page=1, page_size=20, ctx={},
+    )
 
     # When not filtering/sorting by prospect_count, the lookup lives inside the
     # paginated facet branch (still a prospects lookup, just applied per-page).

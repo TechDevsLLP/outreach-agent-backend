@@ -8,7 +8,7 @@ can share the same business logic.
 import asyncio
 import logging
 import random
-from datetime import datetime, timedelta, date, time as dtime
+from datetime import datetime, timedelta, date, time as dtime, timezone
 from typing import Optional
 
 import pytz
@@ -233,13 +233,24 @@ def plan_channel_assignments(
         if p_fit < _min_enroll and not prospect.get("title_gate_passed"):
             skip_reasons["below_min_score"] = skip_reasons.get("below_min_score", 0) + 1
             continue
-        has_email = bool(prospect.get("email")) and has_email_account
-        has_linkedin = bool(prospect.get("linkedin")) and has_linkedin_account
-        if not has_email and not has_linkedin:
+        # Why a prospect can't be scheduled is three distinct problems, and the
+        # UI shows the dominant one as the campaign's failure reason. Folding
+        # them together told users with perfectly good, LinkedIn-bearing
+        # prospects that their ICP was too narrow, when the real answer was
+        # "you haven't connected a sending account yet".
+        prospect_has_email = bool(prospect.get("email"))
+        prospect_has_linkedin = bool(prospect.get("linkedin"))
+        if not prospect_has_email and not prospect_has_linkedin:
             skip_reasons["no_contact_info"] = skip_reasons.get("no_contact_info", 0) + 1
             continue
         if not has_email_account and not has_linkedin_account:
             skip_reasons["no_sending_account"] = skip_reasons.get("no_sending_account", 0) + 1
+            continue
+        has_email = prospect_has_email and has_email_account
+        has_linkedin = prospect_has_linkedin and has_linkedin_account
+        if not has_email and not has_linkedin:
+            # Contactable, but not on a channel this campaign can send through.
+            skip_reasons["channel_mismatch"] = skip_reasons.get("channel_mismatch", 0) + 1
             continue
         remaining.append(enrollment)
 
@@ -1049,6 +1060,40 @@ async def replan_channels_on_sender_add(account_id: str, sender_type: str) -> No
                 ))
         if seed_ops:
             await database.campaign_enrollments_collection.bulk_write(seed_ops, ordered=False)
+
+        # Refresh the campaign's own counters. Without this the UI kept showing
+        # "0 enrolled" and the stale "couldn't schedule anyone" failure reason
+        # even though the enrollments above are now active and sendable.
+        active_count = await database.campaign_enrollments_collection.count_documents(
+            {"campaign_id": campaign_oid, "status": "active"}
+        )
+        day_totals: dict = {}
+        async for row in database.campaign_enrollments_collection.aggregate([
+            {"$match": {
+                "campaign_id": campaign_oid,
+                "status": "active",
+                "smart_campaign_send_day": {"$ne": None},
+            }},
+            {"$group": {
+                "_id": {"day": "$smart_campaign_send_day", "channel": "$smart_campaign_channel"},
+                "count": {"$sum": 1},
+            }},
+        ]):
+            day = str(row["_id"]["day"])
+            channel = row["_id"]["channel"] or "unknown"
+            day_totals.setdefault(day, {})[channel] = row["count"]
+
+        await database.campaigns_collection.update_one(
+            {"_id": campaign_oid},
+            {"$set": {
+                "total_enrolled": active_count,
+                "discovery_prospects_enrolled": active_count,
+                "discovery_day_totals": day_totals,
+                "discovery_failure_reason": None,
+                "discovery_error": None,
+                "updated_at": datetime.now(timezone.utc),
+            }},
+        )
 
         logger.info(
             f"[replan_on_sender_add] Campaign {campaign_id}: promoted {len(newly_assigned)} "

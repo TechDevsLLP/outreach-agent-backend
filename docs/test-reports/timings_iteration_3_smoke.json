@@ -1,0 +1,90 @@
+{
+  "generated_at": "2026-07-10T14:57:01.024116+00:00",
+  "exit_status": 0,
+  "total_tests": 6,
+  "total_duration_ms": 20623.85,
+  "tests": [
+    {
+      "test": "tests/smoke_real/test_smoke_real_providers.py::test_smoke_apify_post_scraper_minimal",
+      "outcome": "passed",
+      "duration_ms": 13404.24
+    },
+    {
+      "test": "tests/smoke_real/test_smoke_real_providers.py::test_smoke_growthtoolkit_find_email",
+      "outcome": "passed",
+      "duration_ms": 2776.33
+    },
+    {
+      "test": "tests/smoke_real/test_smoke_real_providers.py::test_smoke_gemini_single_embedding",
+      "outcome": "passed",
+      "duration_ms": 1535.94
+    },
+    {
+      "test": "tests/smoke_real/test_smoke_real_providers.py::test_smoke_unipile_list_accounts",
+      "outcome": "passed",
+      "duration_ms": 1208.63
+    },
+    {
+      "test": "tests/smoke_real/test_smoke_real_providers.py::test_smoke_growthtoolkit_enrich_linkedin",
+      "outcome": "passed",
+      "duration_ms": 303.11
+    },
+    {
+      "test": "tests/smoke_real/test_smoke_real_providers.py::test_smoke_openrouter_haiku_completion",
+      "outcome": "passed",
+      "duration_ms": 1870.45
+    }
+  ],
+  "perf_metrics": [
+    {
+      "name": "smoke_growthtoolkit_find_email",
+      "ms": 2761.4,
+      "domain": "lu.athlon.com",
+      "credits": 1
+    },
+    {
+      "name": "smoke_growthtoolkit_find_email_result",
+      "ms": 2761.4,
+      "found": false
+    },
+    {
+      "name": "smoke_growthtoolkit_enrich_linkedin",
+      "ms": 288.7,
+      "credits": 1
+    },
+    {
+      "name": "smoke_growthtoolkit_enrich_linkedin_result",
+      "ms": 288.7,
+      "found": true
+    },
+    {
+      "name": "smoke_gemini_single_embedding",
+      "ms": 1171.5
+    },
+    {
+      "name": "smoke_unipile_list_accounts",
+      "ms": 1208.2
+    },
+    {
+      "name": "smoke_unipile_accounts_connected",
+      "ms": 1208.2,
+      "count": 2
+    },
+    {
+      "name": "smoke_apify_post_scraper_run",
+      "ms": 13390.9,
+      "profile": "https://www.linkedin.com/in/hannahkuntz"
+    },
+    {
+      "name": "smoke_apify_post_scraper_items",
+      "ms": 13390.9,
+      "items": 2
+    },
+    {
+      "name": "smoke_openrouter_haiku_completion",
+      "ms": 1856.2,
+      "model": "anthropic/claude-haiku-4-5"
+    }
+  ],
+  "note": "openrouter entry replaced by the passing rerun after a test-side prompt fix (the service's _is_refusal heuristic rejects replies <15 chars by design); all 6 smoke tests green"
+}

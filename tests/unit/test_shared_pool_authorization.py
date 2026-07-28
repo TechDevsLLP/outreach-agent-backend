@@ -146,11 +146,28 @@ async def test_prospect_read_and_patch_are_tenant_scoped_and_overlay_only(monkey
     assert visible["tags"] == ["account-a"]
     assert visible["status"] == "contacted"
 
-    with pytest.raises(HTTPException) as forbidden_read:
-        await prospects.get_prospect(
-            str(prospect_id), campaign_id=None, account_ctx=_ctx(account_b)
-        )
-    assert forbidden_read.value.status_code == 404
+    # Account B has no overlay and no enrollment, so it gets the READ-ONLY pool
+    # view rather than a 404 — the same canonical fields the company prospect
+    # list already exposes without a tenancy check.
+    pool_view = await prospects.get_prospect(
+        str(prospect_id), campaign_id=None, account_ctx=_ctx(account_b)
+    )
+    assert pool_view["access"] == "pool"
+    assert pool_view["full_name"] == "Shared Person"
+
+    # The whole point of the pool view: it must carry NOTHING tenant-scoped.
+    # Neither account A's overlay, nor the legacy private fields still sitting
+    # on the shared document, may leak through.
+    assert pool_view.get("notes") is None
+    assert pool_view.get("tags") in (None, [])
+    assert pool_view["status"] == "new"
+    assert "legacy cross-tenant secret" not in str(pool_view)
+    assert "legacy-private" not in str(pool_view)
+    assert "account A note" not in str(pool_view)
+    assert "account-a" not in str(pool_view)
+
+    # Account A, which owns the overlay, is still marked as such.
+    assert visible["access"] == "workspace"
 
     await prospects.update_prospect(
         str(prospect_id),

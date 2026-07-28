@@ -13,6 +13,7 @@ from database import (
     prospects_collection, enrichment_runs_collection, conversations_collection,
     campaigns_collection, campaign_enrollments_collection, meetings_collection,
     reply_classifications_collection, prospect_state_collection,
+    campaign_prospect_state_collection,
 )
 import database
 from auth import get_account_context
@@ -22,97 +23,167 @@ logger = logging.getLogger(__name__)
 router = APIRouter(prefix="/api/analytics", tags=["analytics"])
 
 
+def _acct_any(account_id) -> dict:
+    """Match an account_id stored as either a string or an ObjectId.
+
+    Collections disagree on the storage type: campaign_enrollments and
+    industries keep ObjectId, while conversations / meetings /
+    reply_classifications / prospect_state keep strings. Querying with the
+    wrong type silently returns zero rows — which is exactly how this
+    dashboard used to report 0 emails sent on accounts with live outreach.
+    """
+    account_id_str = str(account_id)
+    values: list = [account_id_str]
+    try:
+        values.append(ObjectId(account_id_str))
+    except Exception:
+        pass
+    return {"$in": values}
+
+
 @router.get("/overview")
 async def get_analytics_overview(account_ctx=Depends(get_account_context)):
     """
-    High-level analytics overview:
-    - Total prospects, enriched, replied
-    - Average scores
-    - Outreach sent/opened/replied
-    """
-    account_id = ObjectId(account_ctx["account"]["_id"])
-    account_id_str = str(account_id)
+    High-level analytics overview.
 
-    # Prospect counts: keyed off prospect_state (new multi-tenant schema)
+    Everything reported here is derived from a source that is actually written
+    to by the live pipeline:
+      - prospects/enrichment  → prospect_state + prospects
+      - sends                 → conversations (outbound messages)
+      - replies               → conversations (inbound messages), counted as
+                                distinct prospects who replied, not raw messages
+      - meetings              → meetings collection
+
+    Open tracking was removed from the product (July 2026), so no open counts
+    or open rates are returned.
+    """
+    account_id_str = str(account_ctx["account"]["_id"])
+    acct = _acct_any(account_id_str)
+
+    # Prospect counts: keyed off prospect_state (multi-tenant overlay)
     total_prospects = await prospect_state_collection.count_documents({"account_id": account_id_str})
 
-    # Enrichment status counts: join prospect_ids from prospect_state then query prospects
-    state_pid_docs = await prospect_state_collection.find(
-        {"account_id": account_id_str}, {"prospect_id": 1}
-    ).to_list(None)
-    prospect_ids_for_acct = [d["prospect_id"] for d in state_pid_docs if d.get("prospect_id")]
-
-    def _oid(x):
-        try:
-            return ObjectId(x) if isinstance(x, str) else x
-        except Exception:
-            return None
-
-    prospect_oids = [o for x in prospect_ids_for_acct if (o := _oid(str(x)))]
-
-    enriched = await prospects_collection.count_documents({"_id": {"$in": prospect_oids}, "enrichment_status": "completed"}) if prospect_oids else 0
-    replied = await prospects_collection.count_documents({"_id": {"$in": prospect_oids}, "enrichment_status": "replied"}) if prospect_oids else 0
-    failed = await prospects_collection.count_documents({"_id": {"$in": prospect_oids}, "enrichment_status": "failed"}) if prospect_oids else 0
-    in_progress = await prospects_collection.count_documents({"_id": {"$in": prospect_oids}, "enrichment_status": "in_progress"}) if prospect_oids else 0
-
-    # Average scores: from prospect_state (ai_score = ai_prospect_score equivalent)
-    score_pipeline = [
-        {"$match": {"account_id": account_id_str, "ai_score": {"$exists": True, "$ne": None}}},
+    # Enrichment state and fit scores both live on campaign_prospect_state, NOT
+    # on the shared prospect doc or the prospect_state overlay:
+    #   - prospects.enrichment_status is only ever None/"not_started" now
+    #   - prospect_state has no ai_score field at all
+    # Reading either of those (as this endpoint used to) reports a hard zero on
+    # accounts with thousands of scored, enriched prospects.
+    enrichment_pipeline = [
+        {"$match": {"account_id": account_id_str}},
         {"$group": {
-            "_id": None,
-            "avg_prospect_score": {"$avg": "$ai_score"},
-            "avg_ai_score": {"$avg": "$ai_score"},
-            "avg_enhanced_score": {"$avg": "$ai_score"},
-        }}
-    ]
-    score_result = await prospect_state_collection.aggregate(score_pipeline).to_list(1)
-    score_data = score_result[0] if score_result else {}
-
-    # Email sent count: count outbound messages in conversations (most reliable source)
-    email_sent_pipeline = [
-        {"$match": {"account_id": account_id, "channel": "email"}},
-        {"$unwind": "$messages"},
-        {"$match": {"messages.direction": "outbound"}},
-        {"$count": "total"},
-    ]
-    email_sent_result = await conversations_collection.aggregate(email_sent_pipeline).to_list(1)
-    total_emails_sent = email_sent_result[0]["total"] if email_sent_result else 0
-
-    # Open/reply counts from campaign_enrollments (outreach_messages moved off prospect doc)
-    outreach_pipeline = [
-        {"$match": {"account_id": account_id, "generated_messages.cold_email.subject_variants": {"$exists": True}}},
-        {"$unwind": "$generated_messages.cold_email.subject_variants"},
-        {"$group": {
-            "_id": None,
-            "total_opened": {"$sum": "$generated_messages.cold_email.subject_variants.times_opened"},
-            "total_replied": {"$sum": "$generated_messages.cold_email.subject_variants.times_replied"},
-        }}
-    ]
-    outreach_result = await campaign_enrollments_collection.aggregate(outreach_pipeline).to_list(1)
-    outreach_data = outreach_result[0] if outreach_result else {}
-
-    total_opened = outreach_data.get("total_opened", 0)
-    total_replied = outreach_data.get("total_replied", 0)
-
-    # LinkedIn outreach counts from conversations collection (channel = "linkedin")
-    linkedin_pipeline = [
-        {"$match": {"account_id": account_id, "channel": "linkedin"}},
-        {"$unwind": "$messages"},
-        {"$match": {"messages.direction": "outbound"}},
-        {"$group": {
-            "_id": {"$ifNull": ["$messages.outreach_type", "linkedin_connection"]},
+            "_id": {"$ifNull": ["$enrichment.state", "not_started"]},
             "count": {"$sum": 1},
         }},
     ]
-    linkedin_results = await conversations_collection.aggregate(linkedin_pipeline).to_list(None)
-    channel_counts = {r["_id"]: r["count"] for r in linkedin_results}
+    enrichment_rows = await campaign_prospect_state_collection.aggregate(
+        enrichment_pipeline
+    ).to_list(None)
+    enrichment_states = {r["_id"]: r["count"] for r in enrichment_rows}
 
-    total_linkedin_connections = channel_counts.get("linkedin_connection", 0)
-    total_linkedin_inmails = channel_counts.get("linkedin_inmail", 0)
+    # State vocabulary written by enrichment_job_service:
+    #   queued / running → in flight
+    #   succeeded        → enriched
+    #   retryable_failure / not_found → failed to enrich
+    def _states(*names: str) -> int:
+        return sum(enrichment_states.get(n, 0) for n in names)
 
-    # Total industries
-    from database import industries_collection
-    total_industries = await industries_collection.count_documents({"account_id": account_id})
+    enriched = _states("succeeded")
+    in_progress = _states("queued", "running")
+    failed = _states("retryable_failure", "not_found", "failed")
+
+    # Average campaign-fit score. There is one score per prospect
+    # (campaign_prospect_state.score.value) — the old response exposed that same
+    # number three times under three different labels, which read as three
+    # independent metrics.
+    score_pipeline = [
+        {"$match": {"account_id": account_id_str, "score.value": {"$ne": None}}},
+        {"$group": {"_id": None, "avg": {"$avg": "$score.value"}, "scored": {"$sum": 1}}},
+    ]
+    score_result = await campaign_prospect_state_collection.aggregate(score_pipeline).to_list(1)
+    score_data = score_result[0] if score_result else {}
+
+    # ── Sends and replies, per channel, from conversations ────────────────────
+    # Sends are counted as messages; replies are counted as *conversations with
+    # at least one inbound message*, i.e. distinct people who replied. Counting
+    # raw inbound messages would inflate the rate for chatty threads.
+    channel_pipeline = [
+        {"$match": {"account_id": acct, "channel": {"$in": ["email", "linkedin"]}}},
+        {"$project": {
+            "channel": 1,
+            "outbound": {
+                "$size": {"$filter": {
+                    "input": {"$ifNull": ["$messages", []]},
+                    "cond": {"$eq": ["$$this.direction", "outbound"]},
+                }}
+            },
+            "inbound": {
+                "$size": {"$filter": {
+                    "input": {"$ifNull": ["$messages", []]},
+                    "cond": {"$eq": ["$$this.direction", "inbound"]},
+                }}
+            },
+        }},
+        {"$group": {
+            "_id": "$channel",
+            "sent": {"$sum": "$outbound"},
+            "contacted": {"$sum": {"$cond": [{"$gt": ["$outbound", 0]}, 1, 0]}},
+            "replied": {"$sum": {"$cond": [{"$gt": ["$inbound", 0]}, 1, 0]}},
+        }},
+    ]
+    channel_rows = await conversations_collection.aggregate(channel_pipeline).to_list(None)
+    by_channel = {r["_id"]: r for r in channel_rows}
+
+    def _ch(name: str) -> dict:
+        return by_channel.get(name) or {"sent": 0, "contacted": 0, "replied": 0}
+
+    email_stats = _ch("email")
+    linkedin_stats = _ch("linkedin")
+
+    # LinkedIn outbound split by outreach type (connection request vs InMail vs DM)
+    linkedin_type_pipeline = [
+        {"$match": {"account_id": acct, "channel": "linkedin"}},
+        {"$unwind": "$messages"},
+        {"$match": {"messages.direction": "outbound"}},
+        {"$group": {
+            "_id": {"$ifNull": ["$messages.outreach_type", "connection_request"]},
+            "count": {"$sum": 1},
+        }},
+    ]
+    linkedin_type_rows = await conversations_collection.aggregate(linkedin_type_pipeline).to_list(None)
+    type_counts = {r["_id"]: r["count"] for r in linkedin_type_rows}
+
+    def _type_count(*names: str) -> int:
+        return sum(type_counts.get(n, 0) for n in names)
+
+    total_linkedin_connections = _type_count("connection_request", "linkedin_connection")
+    total_linkedin_inmails = _type_count("inmail", "linkedin_inmail")
+
+    # ── Meetings booked ───────────────────────────────────────────────────────
+    # Reported at account level only: meeting docs carry no channel field, so a
+    # per-channel split would be a permanent pair of zeros rather than a signal.
+    total_meetings = await meetings_collection.count_documents(
+        {"account_id": acct, "status": {"$in": ["booked", "confirmed"]}}
+    )
+    if total_meetings == 0:
+        # Older meetings may predate the status field entirely.
+        total_meetings = await meetings_collection.count_documents({"account_id": acct})
+
+    total_sent = email_stats["sent"] + linkedin_stats["sent"]
+    total_contacted = email_stats["contacted"] + linkedin_stats["contacted"]
+    total_replied = email_stats["replied"] + linkedin_stats["replied"]
+
+    def _rate(numerator: int, denominator: int) -> float:
+        return round(numerator / denominator * 100, 1) if denominator > 0 else 0.0
+
+    def _channel_block(stats: dict) -> dict:
+        return {
+            "sent": stats["sent"],
+            "contacted": stats["contacted"],
+            "replied": stats["replied"],
+            # Reply rate is people-who-replied ÷ people-contacted, not ÷ messages.
+            "reply_rate": _rate(stats["replied"], stats["contacted"]),
+        }
 
     return {
         "status": "success",
@@ -120,42 +191,26 @@ async def get_analytics_overview(account_ctx=Depends(get_account_context)):
             "total": total_prospects,
             "enriched": enriched,
             "in_progress": in_progress,
-            "replied": replied,
             "failed": failed,
-            "enrichment_rate": round(enriched / total_prospects * 100, 2) if total_prospects > 0 else 0,
+            "enrichment_rate": round(enriched / total_prospects * 100, 1) if total_prospects > 0 else 0,
         },
         "scores": {
-            "avg_prospect_score": round(score_data.get("avg_prospect_score", 0), 2),
-            "avg_ai_score": round(score_data.get("avg_ai_score", 0), 2),
-            "avg_enhanced_score": round(score_data.get("avg_enhanced_score", 0), 2),
+            "avg_fit_score": round(score_data.get("avg") or 0, 1),
+            "scored_prospects": score_data.get("scored", 0),
         },
         "outreach": {
-            "total_sent": total_emails_sent,
-            "total_opened": total_opened,
+            "total_sent": total_sent,
+            "total_contacted": total_contacted,
             "total_replied": total_replied,
-            "open_rate": round(total_opened / total_emails_sent * 100, 2) if total_emails_sent > 0 else 0,
-            "reply_rate": round(total_replied / total_emails_sent * 100, 2) if total_emails_sent > 0 else 0,
-            "total_emails_sent": total_emails_sent,
+            "reply_rate": _rate(total_replied, total_contacted),
+            "total_emails_sent": email_stats["sent"],
             "total_linkedin_connections": total_linkedin_connections,
             "total_linkedin_inmails": total_linkedin_inmails,
+            "meetings_booked": total_meetings,
         },
-        "total_industries": total_industries,
-        # Channel performance breakdown expected by the frontend analytics dashboard
         "channel_performance": {
-            "email": {
-                "assigned": total_prospects,
-                "sent": total_emails_sent,
-                "replied": total_replied,
-                "meetings_booked": 0,
-                "reply_rate": round(total_replied / total_emails_sent * 100, 2) if total_emails_sent > 0 else 0,
-            },
-            "linkedin": {
-                "assigned": total_prospects,
-                "sent": total_linkedin_connections + total_linkedin_inmails,
-                "replied": 0,
-                "meetings_booked": 0,
-                "reply_rate": 0,
-            },
+            "email": _channel_block(email_stats),
+            "linkedin": _channel_block(linkedin_stats),
         },
     }
 
@@ -686,12 +741,18 @@ async def get_funnel_analytics(
     account_ctx=Depends(get_account_context),
 ):
     """
-    Returns a top-of-funnel breakdown across all stages:
-    sourced → enrolled → sent → opened → replied → classified →
-    meeting_proposed → meeting_booked.
+    Returns a top-of-funnel breakdown:
+    sourced → enrolled → sent → replied → classified → meeting_proposed →
+    meeting_booked.
 
     If campaign_id is provided, scoped to that campaign only; otherwise
     aggregated across all campaigns for the account.
+
+    Sourced/enrolled come from campaign_enrollments. Everything downstream is
+    read from the collections the pipeline actually writes — send_attempts,
+    conversations, meetings — because the enrollment doc's `messages_sent`,
+    `last_sent_at`, and post-send statuses are never populated, which pinned
+    the bottom four stages of this funnel at zero.
     """
     account_id = ObjectId(account_ctx["account"]["_id"])
     account_id_str = str(account_ctx["account"]["_id"])
@@ -723,57 +784,75 @@ async def get_funnel_analytics(
     enrolled_match = {**enroll_match, "status": {"$nin": ["created", "pending", "cascade_waiting"]}}
     enrolled = await campaign_enrollments_collection.count_documents(enrolled_match)
 
-    # ── Stage 3: sent — messages_sent > 0 OR last_sent_at exists ──────────
-    sent_match = {
-        **enroll_match,
-        "$or": [
-            {"messages_sent": {"$gt": 0}},
-            {"last_sent_at": {"$exists": True, "$ne": None}},
-        ],
-    }
-    sent = await campaign_enrollments_collection.count_documents(sent_match)
-
-    # ── Stage 4: opened — sum of messages_opened field ────────────────────
-    opened_pipeline = [
-        {"$match": enroll_match},
-        {"$group": {"_id": None, "total": {"$sum": {"$ifNull": ["$messages_opened", 0]}}}},
+    # Enrollment ids for this scope — the join key for send_attempts and
+    # meetings, both of which record enrollment_id rather than campaign_id.
+    enrollment_ids: list[str] = [
+        str(d["_id"])
+        for d in await campaign_enrollments_collection.find(enroll_match, {"_id": 1}).to_list(None)
     ]
-    opened_result = await campaign_enrollments_collection.aggregate(opened_pipeline).to_list(1)
-    opened = opened_result[0]["total"] if opened_result else 0
 
-    # ── Stage 5: replied ──────────────────────────────────────────────────
-    replied_statuses = ["replied", "meeting_proposed", "meeting_booked", "completed"]
-    replied_match = {
-        **enroll_match,
-        "$or": [
-            {"status": {"$in": replied_statuses}},
-            {"conversations": {"$exists": True, "$not": {"$size": 0}}},
-        ],
-    }
-    replied = await campaign_enrollments_collection.count_documents(replied_match)
+    # ── Stage 3: sent — distinct enrollments with a dispatched message ─────
+    if enrollment_ids:
+        sent_rows = await database.send_attempts_collection.aggregate([
+            {"$match": {"enrollment_id": {"$in": enrollment_ids}, "state": "sent"}},
+            {"$group": {"_id": "$enrollment_id"}},
+            {"$count": "total"},
+        ]).to_list(1)
+        sent = sent_rows[0]["total"] if sent_rows else 0
+    else:
+        sent = 0
 
-    # ── Stage 6: classified — reply_classifications for account/campaign ──
+    # ── Stage 4: replied — people with an inbound message ─────────────────
+    # (There is no "opened" stage: open tracking was removed from the product
+    # in July 2026, so messages_opened is never written and the stage always
+    # rendered as a 0% bar.)
+    #
+    # Conversations are keyed by prospect, not enrollment, so a campaign-scoped
+    # request narrows by that campaign's prospect ids.
+    reply_match: dict = {"account_id": _acct_any(account_id_str)}
+    if campaign_id:
+        prospect_ids = [
+            str(d["prospect_id"])
+            for d in await campaign_enrollments_collection.find(
+                enroll_match, {"prospect_id": 1}
+            ).to_list(None)
+            if d.get("prospect_id")
+        ]
+        if not prospect_ids:
+            reply_match["prospect_id"] = {"$in": []}
+        else:
+            reply_match["prospect_id"] = {"$in": prospect_ids}
+
+    replied_rows = await conversations_collection.aggregate([
+        {"$match": reply_match},
+        {"$match": {"messages.direction": "inbound"}},
+        {"$group": {"_id": "$prospect_id"}},
+        {"$count": "total"},
+    ]).to_list(1)
+    replied = replied_rows[0]["total"] if replied_rows else 0
+
+    # ── Stage 5: classified — reply_classifications for account/campaign ──
     classif_match: dict = {"account_id": account_id_str}
     if campaign_id:
         classif_match["campaign_id"] = campaign_id
     classified = await reply_classifications_collection.count_documents(classif_match)
 
-    # ── Stage 7: meeting_proposed ─────────────────────────────────────────
-    proposed_match = {
-        **enroll_match,
-        "status": {"$in": ["meeting_proposed", "meeting_booked"]},
-    }
-    meeting_proposed = await campaign_enrollments_collection.count_documents(proposed_match)
+    # ── Stages 6 & 7: meetings, from the meetings collection ──────────────
+    # A meeting is "booked" once a slot is confirmed; every meeting record
+    # counts as proposed.
+    meeting_scope: dict = {"account_id": _acct_any(account_id_str)}
+    if campaign_id:
+        meeting_scope["enrollment_id"] = {"$in": enrollment_ids} if enrollment_ids else {"$in": []}
 
-    # ── Stage 8: meeting_booked ───────────────────────────────────────────
-    booked_match = {**enroll_match, "status": "meeting_booked"}
-    meeting_booked = await campaign_enrollments_collection.count_documents(booked_match)
+    meeting_proposed = await meetings_collection.count_documents(meeting_scope)
+    meeting_booked = await meetings_collection.count_documents(
+        {**meeting_scope, "status": {"$in": ["booked", "confirmed"]}}
+    )
 
     stages = [
         {"stage": "sourced",          "count": sourced,          "conversion_rate": conv(sourced)},
         {"stage": "enrolled",         "count": enrolled,         "conversion_rate": conv(enrolled)},
         {"stage": "sent",             "count": sent,             "conversion_rate": conv(sent)},
-        {"stage": "opened",           "count": opened,           "conversion_rate": conv(opened)},
         {"stage": "replied",          "count": replied,          "conversion_rate": conv(replied)},
         {"stage": "classified",       "count": classified,       "conversion_rate": conv(classified)},
         {"stage": "meeting_proposed", "count": meeting_proposed, "conversion_rate": conv(meeting_proposed)},

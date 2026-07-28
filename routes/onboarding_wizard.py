@@ -70,6 +70,103 @@ async def start_wizard_session(
     return {"session_id": returned_session_id, "current_stage": returned_stage}
 
 
+# ── Draft autosave ────────────────────────────────────────────────────────────
+
+# Every profile field the wizard can edit. Anything outside this set is dropped
+# rather than written, so a draft call can never reshape unrelated profile data.
+_DRAFT_STR_FIELDS = {
+    "company_name",
+    "website_url",
+    "description",
+    "icp_description",
+    "target_market",
+    "primary_cta",
+    "discovery_call_agenda",
+    "sender_name",
+    "sender_role",
+    "sender_linkedin_url",
+    "target_revenue_range",
+}
+_DRAFT_LIST_FIELDS = {
+    "services",
+    "industries",
+    "pain_points",
+    "value_propositions",
+    "differentiators",
+    "case_studies",
+    "target_industries",
+    "target_job_titles",
+    "target_seniority",
+    "target_geographies",
+    "target_company_sizes",
+    "qualifier_questions",
+    "objections",
+    "competitors",
+    "banned_phrases",
+}
+
+
+class DraftRequest(BaseModel):
+    session_id: Optional[str] = None
+    profile: dict
+
+
+def _clean_draft(profile: dict) -> dict:
+    """Whitelist + coerce a partial profile payload from the wizard."""
+    out: dict = {}
+    for key, value in (profile or {}).items():
+        if key in _DRAFT_STR_FIELDS:
+            if value is None:
+                continue
+            text = str(value).strip()
+            if text:
+                out[key] = text
+        elif key in _DRAFT_LIST_FIELDS:
+            if not isinstance(value, list):
+                continue
+            # Empty lists are kept: the user may have deleted every tag, and a
+            # draft that refuses to shrink would resurrect removed entries.
+            out[key] = [str(v).strip() for v in value if str(v).strip()]
+    return out
+
+
+@router.post("/draft")
+async def save_onboarding_draft(
+    body: DraftRequest,
+    account_ctx: dict = Depends(get_account_context),
+):
+    """Persist partial wizard input the moment it is typed.
+
+    Called on a debounce from every onboarding step so a refresh, crash or
+    device switch mid-step never loses what the user already entered. Purely
+    additive: it writes profile fields only and never advances current_stage,
+    so the authoritative per-stage endpoints keep owning progression.
+    """
+    account_id = str(account_ctx["account"]["_id"])
+    updates = _clean_draft(body.profile)
+    if not updates:
+        return {"ok": True, "saved": 0}
+
+    now = datetime.now(timezone.utc)
+    await database.company_profiles_collection.update_one(
+        {"account_id": account_id},
+        {"$set": {**updates, "updated_at": now}},
+        upsert=True,
+    )
+
+    if body.session_id:
+        await database.onboarding_sessions_collection.update_one(
+            {"session_id": body.session_id},
+            {"$set": {
+                **{f"stage_data.draft.{k}": v for k, v in updates.items()},
+                "draft_saved_at": now,
+                "updated_at": now,
+            }},
+        )
+
+    return {"ok": True, "saved": len(updates)}
+
+
 # ── Stage 1: Company analysis ─────────────────────────────────────────────────
 
 class ScrapeCompanyRequest(BaseModel):
@@ -617,7 +714,13 @@ async def get_onboarding_session(
     profile_out = {
         "company_name":         profile.get("company_name"),
         "website_url":          profile.get("website_url"),
+        "description":          profile.get("description"),
         "services":             profile.get("services") or [],
+        # `industries` = what the company sells into (stage 1); distinct from
+        # target_industries (the ICP). Returned so a drafted stage 1 rehydrates.
+        "industries":           profile.get("industries") or [],
+        "value_propositions":   profile.get("value_propositions") or [],
+        "differentiators":      profile.get("differentiators") or [],
         "pain_points":          profile.get("pain_points") or [],
         "icp_description":      profile.get("icp_description"),
         "target_industries":    profile.get("target_industries") or [],

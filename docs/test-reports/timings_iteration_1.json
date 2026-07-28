@@ -1,0 +1,1102 @@
+{
+  "generated_at": "2026-07-10T13:45:19.231864+00:00",
+  "exit_status": 0,
+  "total_tests": 197,
+  "total_duration_ms": 8506.96,
+  "tests": [
+    {
+      "test": "tests/api/test_admin_api.py::test_health_deep",
+      "outcome": "passed",
+      "duration_ms": 1038.19
+    },
+    {
+      "test": "tests/api/test_auth_api.py::test_password_reset_full_flow",
+      "outcome": "passed",
+      "duration_ms": 844.31
+    },
+    {
+      "test": "tests/perf/test_perf_readonly.py::test_perf_pool_stats_coverage_counts",
+      "outcome": "passed",
+      "duration_ms": 662.84
+    },
+    {
+      "test": "tests/api/test_admin_api.py::test_suspend_blocks_context_then_reactivate",
+      "outcome": "passed",
+      "duration_ms": 378.05
+    },
+    {
+      "test": "tests/api/test_auth_api.py::test_login_success_and_wrong_password",
+      "outcome": "passed",
+      "duration_ms": 370.02
+    },
+    {
+      "test": "tests/api/test_auth_api.py::test_register_creates_user_account_membership",
+      "outcome": "passed",
+      "duration_ms": 264.38
+    },
+    {
+      "test": "tests/api/test_auth_api.py::test_register_duplicate_email_409",
+      "outcome": "passed",
+      "duration_ms": 225.62
+    },
+    {
+      "test": "tests/unit/test_geo_resolver.py::test_resolve_bulk_speed",
+      "outcome": "passed",
+      "duration_ms": 216.94
+    },
+    {
+      "test": "tests/api/test_auth_api.py::test_suspended_account_blocked_with_402",
+      "outcome": "passed",
+      "duration_ms": 205.91
+    },
+    {
+      "test": "tests/api/test_admin_api.py::test_usage_apify_and_openrouter_and_summary_smoke",
+      "outcome": "passed",
+      "duration_ms": 194.38
+    },
+    {
+      "test": "tests/api/test_admin_api.py::test_suppression_crud_cycle",
+      "outcome": "passed",
+      "duration_ms": 190.91
+    },
+    {
+      "test": "tests/api/test_campaigns_api.py::test_lifecycle_activate_pause_resume",
+      "outcome": "passed",
+      "duration_ms": 174.48
+    },
+    {
+      "test": "tests/api/test_admin_api.py::test_account_detail_shape",
+      "outcome": "passed",
+      "duration_ms": 156.32
+    },
+    {
+      "test": "tests/perf/test_perf_readonly.py::test_perf_prospects_list_query_pattern",
+      "outcome": "passed",
+      "duration_ms": 151.28
+    },
+    {
+      "test": "tests/api/test_admin_api.py::test_pool_quality_shape",
+      "outcome": "passed",
+      "duration_ms": 134.73
+    },
+    {
+      "test": "tests/api/test_admin_api.py::test_flags_get_patch_effective_and_clear",
+      "outcome": "passed",
+      "duration_ms": 123.3
+    },
+    {
+      "test": "tests/api/test_admin_api.py::test_pool_stats_on_seeded_pool",
+      "outcome": "passed",
+      "duration_ms": 113.07
+    },
+    {
+      "test": "tests/api/test_admin_api.py::test_quota_patch_writes_overrides",
+      "outcome": "passed",
+      "duration_ms": 104.09
+    },
+    {
+      "test": "tests/api/test_campaigns_api.py::test_campaign_stats_endpoint",
+      "outcome": "passed",
+      "duration_ms": 103.67
+    },
+    {
+      "test": "tests/api/test_admin_api.py::test_force_pause_and_resume",
+      "outcome": "passed",
+      "duration_ms": 99.14
+    },
+    {
+      "test": "tests/perf/test_perf_readonly.py::test_perf_prospect_stats_aggregations",
+      "outcome": "passed",
+      "duration_ms": 95.95
+    },
+    {
+      "test": "tests/api/test_prospects_api.py::test_list_prospects_pagination",
+      "outcome": "passed",
+      "duration_ms": 89.73
+    },
+    {
+      "test": "tests/api/test_admin_api.py::test_usage_unified_merges_sources",
+      "outcome": "passed",
+      "duration_ms": 88.92
+    },
+    {
+      "test": "tests/api/test_campaigns_api.py::test_update_campaign_fields",
+      "outcome": "passed",
+      "duration_ms": 80.11
+    },
+    {
+      "test": "tests/api/test_campaigns_api.py::test_list_campaigns_scoped",
+      "outcome": "passed",
+      "duration_ms": 73.37
+    },
+    {
+      "test": "tests/api/test_campaigns_api.py::test_activate_requires_steps",
+      "outcome": "passed",
+      "duration_ms": 68.29
+    },
+    {
+      "test": "tests/api/test_campaigns_api.py::test_list_campaigns_status_filter",
+      "outcome": "passed",
+      "duration_ms": 67.68
+    },
+    {
+      "test": "tests/api/test_prospects_api.py::test_list_prospects_min_score_filter",
+      "outcome": "passed",
+      "duration_ms": 66.19
+    },
+    {
+      "test": "tests/api/test_unlock_phone_api.py::test_unlock_phone_happy_path_persists",
+      "outcome": "passed",
+      "duration_ms": 61.0
+    },
+    {
+      "test": "tests/unit/test_geo_resolver.py::test_resolve_city_via_sqlite",
+      "outcome": "passed",
+      "duration_ms": 58.6
+    },
+    {
+      "test": "tests/api/test_prospects_api.py::test_stats_shape_and_tiers",
+      "outcome": "passed",
+      "duration_ms": 57.08
+    },
+    {
+      "test": "tests/api/test_admin_api.py::test_webhooks_recent_with_seeded_log",
+      "outcome": "passed",
+      "duration_ms": 56.15
+    },
+    {
+      "test": "tests/api/test_admin_api.py::test_impersonation_token_works",
+      "outcome": "passed",
+      "duration_ms": 49.68
+    },
+    {
+      "test": "tests/api/test_prospects_api.py::test_patch_prospect_notes_written_to_global_doc",
+      "outcome": "passed",
+      "duration_ms": 47.77
+    },
+    {
+      "test": "tests/api/test_prospects_api.py::test_patch_prospect_status",
+      "outcome": "passed",
+      "duration_ms": 47.45
+    },
+    {
+      "test": "tests/api/test_prospects_api.py::test_get_prospect_tenant_isolation",
+      "outcome": "passed",
+      "duration_ms": 46.26
+    },
+    {
+      "test": "tests/api/test_unlock_phone_api.py::test_unlock_phone_cross_tenant_404",
+      "outcome": "passed",
+      "duration_ms": 46.18
+    },
+    {
+      "test": "tests/unit/test_growthtoolkit_service.py::test_429_retry_then_success",
+      "outcome": "passed",
+      "duration_ms": 45.75
+    },
+    {
+      "test": "tests/api/test_admin_api.py::test_extend_trial",
+      "outcome": "passed",
+      "duration_ms": 45.37
+    },
+    {
+      "test": "tests/api/test_prospects_api.py::test_list_prospects_account_b_sees_only_theirs",
+      "outcome": "passed",
+      "duration_ms": 44.99
+    },
+    {
+      "test": "tests/api/test_prospects_api.py::test_list_prospects_status_filter",
+      "outcome": "passed",
+      "duration_ms": 44.71
+    },
+    {
+      "test": "tests/api/test_unlock_phone_api.py::test_unlock_phone_credits_exhausted_402",
+      "outcome": "passed",
+      "duration_ms": 43.99
+    },
+    {
+      "test": "tests/unit/test_growthtoolkit_service.py::test_429_retries_exhausted_raises",
+      "outcome": "passed",
+      "duration_ms": 43.91
+    },
+    {
+      "test": "tests/api/test_prospects_api.py::test_list_prospects_scoped_to_account_and_sorted",
+      "outcome": "passed",
+      "duration_ms": 43.3
+    },
+    {
+      "test": "tests/api/test_prospects_api.py::test_patch_prospect_tags_upsert",
+      "outcome": "passed",
+      "duration_ms": 43.15
+    },
+    {
+      "test": "tests/api/test_prospects_api.py::test_get_prospect_with_state_overlay",
+      "outcome": "passed",
+      "duration_ms": 42.49
+    },
+    {
+      "test": "tests/api/test_prospects_api.py::test_get_prospect_own_tenant_ok",
+      "outcome": "passed",
+      "duration_ms": 40.22
+    },
+    {
+      "test": "tests/api/test_admin_api.py::test_jobs_listing",
+      "outcome": "passed",
+      "duration_ms": 40.15
+    },
+    {
+      "test": "tests/api/test_admin_api.py::test_list_accounts_shape",
+      "outcome": "passed",
+      "duration_ms": 39.37
+    },
+    {
+      "test": "tests/api/test_admin_api.py::test_audit_log_lists_mutations",
+      "outcome": "passed",
+      "duration_ms": 39.22
+    },
+    {
+      "test": "tests/api/test_unlock_phone_api.py::test_unlock_phone_provider_error_502",
+      "outcome": "passed",
+      "duration_ms": 39.12
+    },
+    {
+      "test": "tests/api/test_unlock_phone_api.py::test_unlock_phone_invalid_input_400",
+      "outcome": "passed",
+      "duration_ms": 36.65
+    },
+    {
+      "test": "tests/api/test_unlock_phone_api.py::test_unlock_phone_no_linkedin_url_400",
+      "outcome": "passed",
+      "duration_ms": 34.9
+    },
+    {
+      "test": "tests/api/test_unlock_phone_api.py::test_unlock_phone_cached_no_second_provider_call",
+      "outcome": "passed",
+      "duration_ms": 34.82
+    },
+    {
+      "test": "tests/api/test_unlock_phone_api.py::test_unlock_phone_no_phone_available_404",
+      "outcome": "passed",
+      "duration_ms": 33.56
+    },
+    {
+      "test": "tests/api/test_admin_api.py::test_pool_reenrich_dry_run",
+      "outcome": "passed",
+      "duration_ms": 30.5
+    },
+    {
+      "test": "tests/perf/test_perf_readonly.py::test_perf_vector_search_smoke",
+      "outcome": "passed",
+      "duration_ms": 30.45
+    },
+    {
+      "test": "tests/api/test_campaigns_api.py::test_get_campaign",
+      "outcome": "passed",
+      "duration_ms": 29.77
+    },
+    {
+      "test": "tests/api/test_campaigns_api.py::test_get_campaign_cross_tenant_403",
+      "outcome": "passed",
+      "duration_ms": 29.67
+    },
+    {
+      "test": "tests/api/test_campaigns_api.py::test_lifecycle_cross_tenant_forbidden",
+      "outcome": "passed",
+      "duration_ms": 29.41
+    },
+    {
+      "test": "tests/api/test_prospects_api.py::test_get_prospect_missing_404",
+      "outcome": "passed",
+      "duration_ms": 28.41
+    },
+    {
+      "test": "tests/api/test_campaigns_api.py::test_get_campaign_unknown_404",
+      "outcome": "passed",
+      "duration_ms": 27.69
+    },
+    {
+      "test": "tests/api/test_admin_api.py::test_admin_users_list",
+      "outcome": "passed",
+      "duration_ms": 27.55
+    },
+    {
+      "test": "tests/api/test_auth_api.py::test_patch_me_updates_profile",
+      "outcome": "passed",
+      "duration_ms": 27.35
+    },
+    {
+      "test": "tests/api/test_unlock_phone_api.py::test_unlock_phone_unknown_prospect_404",
+      "outcome": "passed",
+      "duration_ms": 26.73
+    },
+    {
+      "test": "tests/unit/test_growthtoolkit_service.py::test_usage_doc_written_on_success",
+      "outcome": "passed",
+      "duration_ms": 26.58
+    },
+    {
+      "test": "tests/api/test_unlock_phone_api.py::test_unlock_phone_invalid_id_400",
+      "outcome": "passed",
+      "duration_ms": 24.71
+    },
+    {
+      "test": "tests/api/test_prospects_api.py::test_patch_prospect_invalid_status_400",
+      "outcome": "passed",
+      "duration_ms": 23.54
+    },
+    {
+      "test": "tests/api/test_admin_api.py::test_costs_top_accounts",
+      "outcome": "passed",
+      "duration_ms": 23.33
+    },
+    {
+      "test": "tests/perf/test_perf_readonly.py::test_perf_accounts_list_rollup",
+      "outcome": "passed",
+      "duration_ms": 22.94
+    },
+    {
+      "test": "tests/api/test_admin_api.py::test_list_accounts_search_filter",
+      "outcome": "passed",
+      "duration_ms": 22.75
+    },
+    {
+      "test": "tests/unit/test_growthtoolkit_service.py::test_usage_doc_written_on_credit_error",
+      "outcome": "passed",
+      "duration_ms": 22.53
+    },
+    {
+      "test": "tests/api/test_prospects_api.py::test_get_prospect_invalid_id_400",
+      "outcome": "passed",
+      "duration_ms": 20.96
+    },
+    {
+      "test": "tests/api/test_admin_api.py::test_usage_growthtoolkit_rollup",
+      "outcome": "passed",
+      "duration_ms": 20.68
+    },
+    {
+      "test": "tests/api/test_prospects_api.py::test_patch_prospect_no_valid_fields_400",
+      "outcome": "passed",
+      "duration_ms": 20.53
+    },
+    {
+      "test": "tests/perf/test_perf_readonly.py::test_perf_usage_rollups",
+      "outcome": "passed",
+      "duration_ms": 20.22
+    },
+    {
+      "test": "tests/unit/test_growthtoolkit_service.py::test_5xx_retry_then_success",
+      "outcome": "passed",
+      "duration_ms": 19.01
+    },
+    {
+      "test": "tests/api/test_admin_api.py::test_usage_growthtoolkit_account_filter",
+      "outcome": "passed",
+      "duration_ms": 18.15
+    },
+    {
+      "test": "tests/api/test_admin_api.py::test_admin_endpoints_403_for_regular_user[/api/admin/audit-log]",
+      "outcome": "passed",
+      "duration_ms": 17.79
+    },
+    {
+      "test": "tests/unit/test_growthtoolkit_service.py::test_missing_api_key_raises_auth_error",
+      "outcome": "passed",
+      "duration_ms": 17.23
+    },
+    {
+      "test": "tests/api/test_admin_api.py::test_force_pause_unknown_campaign_404",
+      "outcome": "passed",
+      "duration_ms": 15.97
+    },
+    {
+      "test": "tests/api/test_admin_api.py::test_suppression_validation",
+      "outcome": "passed",
+      "duration_ms": 15.34
+    },
+    {
+      "test": "tests/api/test_admin_api.py::test_account_detail_unknown_404",
+      "outcome": "passed",
+      "duration_ms": 14.46
+    },
+    {
+      "test": "tests/api/test_admin_api.py::test_stuck_campaigns_detected",
+      "outcome": "passed",
+      "duration_ms": 14.35
+    },
+    {
+      "test": "tests/perf/test_perf_readonly.py::test_perf_estimated_counts",
+      "outcome": "passed",
+      "duration_ms": 14.02
+    },
+    {
+      "test": "tests/unit/test_geo_resolver.py::test_resolve_cache_hit_is_fast",
+      "outcome": "passed",
+      "duration_ms": 10.01
+    },
+    {
+      "test": "tests/unit/test_growthtoolkit_service.py::test_find_email_credits_exhausted_raises",
+      "outcome": "passed",
+      "duration_ms": 9.88
+    },
+    {
+      "test": "tests/unit/test_growthtoolkit_service.py::test_find_email_not_found_returns_none",
+      "outcome": "passed",
+      "duration_ms": 9.72
+    },
+    {
+      "test": "tests/unit/test_growthtoolkit_service.py::test_enrich_linkedin_task_failure",
+      "outcome": "passed",
+      "duration_ms": 9.71
+    },
+    {
+      "test": "tests/api/test_admin_api.py::test_admin_endpoints_403_for_regular_user[/api/admin/usage/unified]",
+      "outcome": "passed",
+      "duration_ms": 9.52
+    },
+    {
+      "test": "tests/unit/test_growthtoolkit_service.py::test_find_email_success",
+      "outcome": "passed",
+      "duration_ms": 9.43
+    },
+    {
+      "test": "tests/api/test_admin_api.py::test_pool_reenrich_requires_filter",
+      "outcome": "passed",
+      "duration_ms": 9.26
+    },
+    {
+      "test": "tests/unit/test_geo_resolver.py::test_resolve_with_country_hint",
+      "outcome": "passed",
+      "duration_ms": 9.26
+    },
+    {
+      "test": "tests/api/test_admin_api.py::test_flags_unknown_name_400",
+      "outcome": "passed",
+      "duration_ms": 9.08
+    },
+    {
+      "test": "tests/api/test_auth_api.py::test_password_reset_request_never_leaks_registration",
+      "outcome": "passed",
+      "duration_ms": 8.93
+    },
+    {
+      "test": "tests/unit/test_growthtoolkit_service.py::test_enrich_linkedin_task_polling",
+      "outcome": "passed",
+      "duration_ms": 8.91
+    },
+    {
+      "test": "tests/perf/test_perf_readonly.py::test_perf_prospect_state_group_by_account",
+      "outcome": "passed",
+      "duration_ms": 8.9
+    },
+    {
+      "test": "tests/unit/test_growthtoolkit_service.py::test_invalid_input_raises",
+      "outcome": "passed",
+      "duration_ms": 8.85
+    },
+    {
+      "test": "tests/api/test_admin_api.py::test_admin_endpoints_403_for_regular_user[/api/admin/accounts]",
+      "outcome": "passed",
+      "duration_ms": 8.38
+    },
+    {
+      "test": "tests/api/test_admin_api.py::test_usage_unified_bad_date_400",
+      "outcome": "passed",
+      "duration_ms": 8.34
+    },
+    {
+      "test": "tests/api/test_auth_api.py::test_login_unknown_email_401",
+      "outcome": "passed",
+      "duration_ms": 8.27
+    },
+    {
+      "test": "tests/api/test_admin_api.py::test_admin_endpoints_403_for_regular_user[/api/admin/jobs]",
+      "outcome": "passed",
+      "duration_ms": 7.98
+    },
+    {
+      "test": "tests/api/test_admin_api.py::test_pool_reenrich_invalid_prospect_id_400",
+      "outcome": "passed",
+      "duration_ms": 7.71
+    },
+    {
+      "test": "tests/api/test_auth_api.py::test_refresh_returns_new_token",
+      "outcome": "passed",
+      "duration_ms": 6.78
+    },
+    {
+      "test": "tests/api/test_auth_api.py::test_token_for_deleted_user_401",
+      "outcome": "passed",
+      "duration_ms": 6.65
+    },
+    {
+      "test": "tests/api/test_admin_api.py::test_admin_endpoints_403_for_regular_user[/api/admin/webhooks/recent]",
+      "outcome": "passed",
+      "duration_ms": 6.5
+    },
+    {
+      "test": "tests/unit/test_growthtoolkit_service.py::test_auth_error_raises",
+      "outcome": "passed",
+      "duration_ms": 6.49
+    },
+    {
+      "test": "tests/api/test_admin_api.py::test_admin_endpoints_403_for_regular_user[/api/admin/settings/flags]",
+      "outcome": "passed",
+      "duration_ms": 6.35
+    },
+    {
+      "test": "tests/api/test_admin_api.py::test_admin_endpoints_403_for_regular_user[/api/admin/users]",
+      "outcome": "passed",
+      "duration_ms": 6.33
+    },
+    {
+      "test": "tests/api/test_admin_api.py::test_admin_endpoints_403_for_regular_user[/api/admin/health/deep]",
+      "outcome": "passed",
+      "duration_ms": 6.26
+    },
+    {
+      "test": "tests/api/test_admin_api.py::test_admin_endpoints_403_for_regular_user[/api/admin/campaigns/stuck]",
+      "outcome": "passed",
+      "duration_ms": 6.02
+    },
+    {
+      "test": "tests/api/test_admin_api.py::test_admin_endpoints_403_for_regular_user[/api/admin/pool/stats]",
+      "outcome": "passed",
+      "duration_ms": 5.99
+    },
+    {
+      "test": "tests/api/test_campaigns_api.py::test_campaigns_require_auth",
+      "outcome": "passed",
+      "duration_ms": 1.97
+    },
+    {
+      "test": "tests/unit/test_geo_resolver.py::test_resolve_unresolvable_returns_none_and_caches",
+      "outcome": "passed",
+      "duration_ms": 1.81
+    },
+    {
+      "test": "tests/api/test_prospects_api.py::test_prospects_require_auth",
+      "outcome": "passed",
+      "duration_ms": 1.4
+    },
+    {
+      "test": "tests/unit/test_canonicalizers.py::test_seniority_free_text_to_tokens",
+      "outcome": "passed",
+      "duration_ms": 1.07
+    },
+    {
+      "test": "tests/api/test_admin_api.py::test_admin_endpoints_401_without_token",
+      "outcome": "passed",
+      "duration_ms": 0.69
+    },
+    {
+      "test": "tests/api/test_auth_api.py::test_password_reset_short_password_400",
+      "outcome": "passed",
+      "duration_ms": 0.66
+    },
+    {
+      "test": "tests/api/test_auth_api.py::test_me_requires_auth",
+      "outcome": "passed",
+      "duration_ms": 0.64
+    },
+    {
+      "test": "tests/unit/test_canonicalizers.py::test_canonicalize_icp_local_paths",
+      "outcome": "passed",
+      "duration_ms": 0.62
+    },
+    {
+      "test": "tests/api/test_auth_api.py::test_garbage_token_401",
+      "outcome": "passed",
+      "duration_ms": 0.54
+    },
+    {
+      "test": "tests/unit/test_growthtoolkit_service.py::test_find_emails_batch_shapes",
+      "outcome": "passed",
+      "duration_ms": 0.32
+    },
+    {
+      "test": "tests/unit/test_canonicalizers.py::test_industry_alias_substring",
+      "outcome": "passed",
+      "duration_ms": 0.31
+    },
+    {
+      "test": "tests/unit/test_growthtoolkit_service.py::test_facade_never_raises_on_provider_error",
+      "outcome": "passed",
+      "duration_ms": 0.31
+    },
+    {
+      "test": "tests/unit/test_scoring.py::test_v2_company_size_bands",
+      "outcome": "passed",
+      "duration_ms": 0.22
+    },
+    {
+      "test": "tests/api/test_campaigns_api.py::test_create_campaign_defaults",
+      "outcome": "passed",
+      "duration_ms": 0.17
+    },
+    {
+      "test": "tests/unit/test_system_settings_and_audit.py::test_db_error_falls_back_to_default",
+      "outcome": "passed",
+      "duration_ms": 0.17
+    },
+    {
+      "test": "tests/unit/test_canonicalizers.py::test_canonicalize_icp_empty_input",
+      "outcome": "passed",
+      "duration_ms": 0.16
+    },
+    {
+      "test": "tests/unit/test_growthtoolkit_service.py::test_find_emails_empty_entries",
+      "outcome": "passed",
+      "duration_ms": 0.16
+    },
+    {
+      "test": "tests/unit/test_system_settings_and_audit.py::test_get_flag_default_when_no_override",
+      "outcome": "passed",
+      "duration_ms": 0.16
+    },
+    {
+      "test": "tests/unit/test_canonicalizers.py::test_expand_icp_to_industry_ids_dedupes",
+      "outcome": "passed",
+      "duration_ms": 0.14
+    },
+    {
+      "test": "tests/unit/test_canonicalizers.py::test_seniority_one_input_many_tokens_no_duplicates",
+      "outcome": "passed",
+      "duration_ms": 0.13
+    },
+    {
+      "test": "tests/unit/test_canonicalizers.py::test_industry_exact_alias",
+      "outcome": "passed",
+      "duration_ms": 0.13
+    },
+    {
+      "test": "tests/unit/test_canonicalizers.py::test_industry_unresolvable_returns_none",
+      "outcome": "passed",
+      "duration_ms": 0.13
+    },
+    {
+      "test": "tests/unit/test_scoring.py::test_tier_from_score[None-None]",
+      "outcome": "passed",
+      "duration_ms": 0.13
+    },
+    {
+      "test": "tests/unit/test_system_settings_and_audit.py::test_cache_ttl_expiry",
+      "outcome": "passed",
+      "duration_ms": 0.13
+    },
+    {
+      "test": "tests/unit/test_scoring.py::test_v2_email_presence_signal",
+      "outcome": "passed",
+      "duration_ms": 0.12
+    },
+    {
+      "test": "tests/unit/test_serialization.py::test_aware_datetime_utc_gets_z_suffix",
+      "outcome": "passed",
+      "duration_ms": 0.12
+    },
+    {
+      "test": "tests/unit/test_system_settings_and_audit.py::test_get_flag_db_override_wins",
+      "outcome": "passed",
+      "duration_ms": 0.12
+    },
+    {
+      "test": "tests/unit/test_system_settings_and_audit.py::test_negative_lookup_is_cached",
+      "outcome": "passed",
+      "duration_ms": 0.12
+    },
+    {
+      "test": "tests/unit/test_system_settings_and_audit.py::test_cached_false_value_not_confused_with_miss",
+      "outcome": "passed",
+      "duration_ms": 0.12
+    },
+    {
+      "test": "tests/unit/test_geo_resolver.py::test_resolve_empty_and_none",
+      "outcome": "passed",
+      "duration_ms": 0.11
+    },
+    {
+      "test": "tests/unit/test_geo_resolver.py::test_resolve_country_name_no_sqlite_needed",
+      "outcome": "passed",
+      "duration_ms": 0.11
+    },
+    {
+      "test": "tests/unit/test_geo_resolver.py::test_resolve_iso2_code",
+      "outcome": "passed",
+      "duration_ms": 0.11
+    },
+    {
+      "test": "tests/unit/test_growthtoolkit_service.py::test_split_full_name",
+      "outcome": "passed",
+      "duration_ms": 0.11
+    },
+    {
+      "test": "tests/unit/test_scoring.py::test_v2_empty_lead_scores_low_but_not_zero",
+      "outcome": "passed",
+      "duration_ms": 0.11
+    },
+    {
+      "test": "tests/unit/test_scoring.py::test_v2_ideal_prospect_scores_high_and_capped_at_100",
+      "outcome": "passed",
+      "duration_ms": 0.11
+    },
+    {
+      "test": "tests/unit/test_scoring.py::test_v2_bad_numeric_inputs_do_not_crash",
+      "outcome": "passed",
+      "duration_ms": 0.11
+    },
+    {
+      "test": "tests/unit/test_scoring.py::test_v2_icp_alignment_bonus",
+      "outcome": "passed",
+      "duration_ms": 0.11
+    },
+    {
+      "test": "tests/unit/test_scoring.py::test_v2_digital_maturity_gap",
+      "outcome": "passed",
+      "duration_ms": 0.11
+    },
+    {
+      "test": "tests/unit/test_serialization.py::test_uuid_binary_rendered_as_uuid_string",
+      "outcome": "passed",
+      "duration_ms": 0.1
+    },
+    {
+      "test": "tests/unit/test_canonicalizers.py::test_seniority_unknown_input_yields_empty",
+      "outcome": "passed",
+      "duration_ms": 0.09
+    },
+    {
+      "test": "tests/unit/test_growthtoolkit_service.py::test_extract_first_last_prefers_explicit_fields",
+      "outcome": "passed",
+      "duration_ms": 0.09
+    },
+    {
+      "test": "tests/unit/test_scoring.py::test_tier_from_score[0-cold]",
+      "outcome": "passed",
+      "duration_ms": 0.09
+    },
+    {
+      "test": "tests/unit/test_serialization.py::test_non_utf8_binary_becomes_none",
+      "outcome": "passed",
+      "duration_ms": 0.09
+    },
+    {
+      "test": "tests/unit/test_serialization.py::test_utf8_binary_decoded_as_text",
+      "outcome": "passed",
+      "duration_ms": 0.09
+    },
+    {
+      "test": "tests/unit/test_canonicalizers.py::test_cosine_similarity_basics",
+      "outcome": "passed",
+      "duration_ms": 0.08
+    },
+    {
+      "test": "tests/unit/test_scoring.py::test_tier_from_score[59.9-cold]",
+      "outcome": "passed",
+      "duration_ms": 0.08
+    },
+    {
+      "test": "tests/unit/test_scoring.py::test_campaign_score_full_match",
+      "outcome": "passed",
+      "duration_ms": 0.08
+    },
+    {
+      "test": "tests/unit/test_scoring.py::test_campaign_score_no_email_no_linkedin_penalty",
+      "outcome": "passed",
+      "duration_ms": 0.08
+    },
+    {
+      "test": "tests/unit/test_scoring.py::test_decision_maker_rules[prospect3-True]",
+      "outcome": "passed",
+      "duration_ms": 0.08
+    },
+    {
+      "test": "tests/unit/test_scoring.py::test_decision_maker_rules[prospect4-True]",
+      "outcome": "passed",
+      "duration_ms": 0.08
+    },
+    {
+      "test": "tests/unit/test_serialization.py::test_aware_non_utc_datetime_preserves_offset",
+      "outcome": "passed",
+      "duration_ms": 0.08
+    },
+    {
+      "test": "tests/unit/test_canonicalizers.py::test_employee_bands",
+      "outcome": "passed",
+      "duration_ms": 0.07
+    },
+    {
+      "test": "tests/unit/test_scoring.py::test_tier_from_score[60-warm]",
+      "outcome": "passed",
+      "duration_ms": 0.07
+    },
+    {
+      "test": "tests/unit/test_scoring.py::test_tier_from_score[79.9-warm]",
+      "outcome": "passed",
+      "duration_ms": 0.07
+    },
+    {
+      "test": "tests/unit/test_scoring.py::test_tier_from_score[80-hot]",
+      "outcome": "passed",
+      "duration_ms": 0.07
+    },
+    {
+      "test": "tests/unit/test_scoring.py::test_tier_from_score[100-hot]",
+      "outcome": "passed",
+      "duration_ms": 0.07
+    },
+    {
+      "test": "tests/unit/test_scoring.py::test_campaign_score_weight_overrides",
+      "outcome": "passed",
+      "duration_ms": 0.07
+    },
+    {
+      "test": "tests/unit/test_scoring.py::test_campaign_score_never_exceeds_100",
+      "outcome": "passed",
+      "duration_ms": 0.07
+    },
+    {
+      "test": "tests/unit/test_scoring.py::test_campaign_score_location_subdocument_fallback",
+      "outcome": "passed",
+      "duration_ms": 0.07
+    },
+    {
+      "test": "tests/unit/test_scoring.py::test_decision_maker_rules[prospect0-True]",
+      "outcome": "passed",
+      "duration_ms": 0.07
+    },
+    {
+      "test": "tests/unit/test_scoring.py::test_decision_maker_rules[prospect1-True]",
+      "outcome": "passed",
+      "duration_ms": 0.07
+    },
+    {
+      "test": "tests/unit/test_scoring.py::test_decision_maker_rules[prospect2-False]",
+      "outcome": "passed",
+      "duration_ms": 0.07
+    },
+    {
+      "test": "tests/unit/test_scoring.py::test_decision_maker_rules[prospect5-False]",
+      "outcome": "passed",
+      "duration_ms": 0.07
+    },
+    {
+      "test": "tests/unit/test_scoring.py::test_decision_maker_rules[prospect6-True]",
+      "outcome": "passed",
+      "duration_ms": 0.07
+    },
+    {
+      "test": "tests/unit/test_scoring.py::test_decision_maker_rules[prospect7-False]",
+      "outcome": "passed",
+      "duration_ms": 0.07
+    },
+    {
+      "test": "tests/unit/test_scoring.py::test_title_gate_blocklist_keyword",
+      "outcome": "passed",
+      "duration_ms": 0.07
+    },
+    {
+      "test": "tests/unit/test_scoring.py::test_title_gate_non_dm_title_blocked_for_senior_icp",
+      "outcome": "passed",
+      "duration_ms": 0.07
+    },
+    {
+      "test": "tests/unit/test_scoring.py::test_company_fit_only_company_dimensions",
+      "outcome": "passed",
+      "duration_ms": 0.07
+    },
+    {
+      "test": "tests/unit/test_serialization.py::test_objectid_to_string_recursive",
+      "outcome": "passed",
+      "duration_ms": 0.07
+    },
+    {
+      "test": "tests/unit/test_serialization.py::test_naive_datetime_assumed_utc_with_z_suffix",
+      "outcome": "passed",
+      "duration_ms": 0.07
+    },
+    {
+      "test": "tests/unit/test_serialization.py::test_list_of_mixed_types",
+      "outcome": "passed",
+      "duration_ms": 0.07
+    },
+    {
+      "test": "tests/unit/test_system_settings_and_audit.py::test_sanitize_redacts_credential_shaped_keys",
+      "outcome": "passed",
+      "duration_ms": 0.07
+    },
+    {
+      "test": "tests/unit/test_system_settings_and_audit.py::test_sanitize_objectid_and_datetime",
+      "outcome": "passed",
+      "duration_ms": 0.07
+    },
+    {
+      "test": "tests/unit/test_system_settings_and_audit.py::test_sanitize_truncates_long_strings_and_lists",
+      "outcome": "passed",
+      "duration_ms": 0.07
+    },
+    {
+      "test": "tests/unit/test_system_settings_and_audit.py::test_sanitize_stringifies_unknown_types",
+      "outcome": "passed",
+      "duration_ms": 0.07
+    },
+    {
+      "test": "tests/unit/test_canonicalizers.py::test_extract_prefers_first_matching_key",
+      "outcome": "passed",
+      "duration_ms": 0.06
+    },
+    {
+      "test": "tests/unit/test_canonicalizers.py::test_extract_geographies_and_titles",
+      "outcome": "passed",
+      "duration_ms": 0.06
+    },
+    {
+      "test": "tests/unit/test_geo_resolver.py::test_normalize_raw",
+      "outcome": "passed",
+      "duration_ms": 0.06
+    },
+    {
+      "test": "tests/unit/test_scoring.py::test_title_gate_non_dm_title_allowed_for_junior_icp",
+      "outcome": "passed",
+      "duration_ms": 0.06
+    },
+    {
+      "test": "tests/unit/test_scoring.py::test_title_gate_passes_clean_title",
+      "outcome": "passed",
+      "duration_ms": 0.06
+    },
+    {
+      "test": "tests/unit/test_serialization.py::test_scalars_passthrough",
+      "outcome": "passed",
+      "duration_ms": 0.06
+    },
+    {
+      "test": "tests/unit/test_system_settings_and_audit.py::test_sanitize_depth_cap",
+      "outcome": "passed",
+      "duration_ms": 0.06
+    },
+    {
+      "test": "tests/unit/test_canonicalizers.py::test_normalize_industry",
+      "outcome": "passed",
+      "duration_ms": 0.05
+    },
+    {
+      "test": "tests/unit/test_geo_resolver.py::test_to_geojson_lng_lat_order",
+      "outcome": "passed",
+      "duration_ms": 0.05
+    },
+    {
+      "test": "tests/unit/test_geo_resolver.py::test_hint_to_code",
+      "outcome": "passed",
+      "duration_ms": 0.05
+    }
+  ],
+  "perf_metrics": [
+    {
+      "name": "estimated_counts_prospects_companies",
+      "ms": 13.7
+    },
+    {
+      "name": "pool_size",
+      "ms": 0,
+      "prospects": 47246,
+      "companies": 26694
+    },
+    {
+      "name": "pool_stats_count_prospects_location",
+      "ms": 100.5
+    },
+    {
+      "name": "pool_stats_count_prospects_industry",
+      "ms": 84.2
+    },
+    {
+      "name": "pool_stats_count_prospects_embeddings",
+      "ms": 47.2
+    },
+    {
+      "name": "pool_stats_count_prospects_email",
+      "ms": 111.1
+    },
+    {
+      "name": "pool_stats_count_prospects_phone",
+      "ms": 62.0
+    },
+    {
+      "name": "pool_stats_count_prospects_company_linked",
+      "ms": 106.9
+    },
+    {
+      "name": "pool_stats_count_companies_location",
+      "ms": 61.2
+    },
+    {
+      "name": "pool_stats_count_companies_industry",
+      "ms": 59.5
+    },
+    {
+      "name": "pool_stats_count_companies_embeddings",
+      "ms": 29.6
+    },
+    {
+      "name": "pool_stats_count_battery_total",
+      "ms": 662.2
+    },
+    {
+      "name": "prospect_state_group_by_account",
+      "ms": 8.5
+    },
+    {
+      "name": "prospects_list_phase1_synthetic_2000id_sample",
+      "ms": 117.7
+    },
+    {
+      "name": "prospects_list_state_docs_returned",
+      "ms": 0,
+      "count": 2000
+    },
+    {
+      "name": "prospects_list_phase2_page_fetch",
+      "ms": 8.7
+    },
+    {
+      "name": "prospects_list_count_documents_id_in",
+      "ms": 17.3,
+      "n_ids": 2000
+    },
+    {
+      "name": "stats_by_industry",
+      "ms": 22.5,
+      "n_ids": 2000
+    },
+    {
+      "name": "stats_by_country",
+      "ms": 22.1,
+      "n_ids": 2000
+    },
+    {
+      "name": "stats_unique_companies",
+      "ms": 22.6,
+      "n_ids": 2000
+    },
+    {
+      "name": "usage_growthtoolkit_rollup",
+      "ms": 6.3
+    },
+    {
+      "name": "usage_apify_rollup",
+      "ms": 7.9
+    },
+    {
+      "name": "usage_openrouter_rollup",
+      "ms": 5.8
+    },
+    {
+      "name": "admin_accounts_list_lookup_pipeline",
+      "ms": 22.5
+    },
+    {
+      "name": "vector_search_prospects_vec_top5",
+      "ms": 19.5
+    }
+  ]
+}

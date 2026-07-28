@@ -41,6 +41,7 @@ from routes.email_accounts import router as email_accounts_router
 from routes.linkedin_accounts import router as linkedin_accounts_router
 from routes.admin import router as admin_router
 from routes.admin_accounts import router as admin_accounts_router
+from routes.admin_costs import router as admin_costs_router
 from routes.admin_usage import router as admin_usage_router
 from routes.admin_pool import router as admin_pool_router
 from routes.admin_system import router as admin_system_router
@@ -294,6 +295,7 @@ app.include_router(email_accounts_router)
 app.include_router(linkedin_accounts_router)
 app.include_router(admin_router)
 app.include_router(admin_accounts_router)
+app.include_router(admin_costs_router)
 app.include_router(admin_usage_router)
 app.include_router(admin_pool_router)
 app.include_router(admin_system_router)

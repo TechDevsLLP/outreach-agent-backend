@@ -1,4 +1,6 @@
+import asyncio
 import logging
+import re
 from datetime import datetime
 from io import BytesIO
 from typing import List, Optional
@@ -46,8 +48,11 @@ async def list_companies(
     industry_id: Optional[str] = Query(None),
     search: Optional[str] = Query(None),
     min_prospects: int = Query(0, ge=0),
+    min_employees: Optional[int] = Query(None, ge=0),
+    max_employees: Optional[int] = Query(None, ge=0),
+    has_website: Optional[bool] = Query(None),
     sort_by: str = "name",
-    sort_order: str = "desc",
+    sort_order: str = "asc",
     page: int = Query(1, ge=1),
     page_size: int = Query(20, ge=1, le=100),
     ctx: dict = Depends(get_account_context),
@@ -57,23 +62,58 @@ async def list_companies(
     prospect_count is computed live via a $lookup against prospects.company_id
     (prospects store company_id as the stringified company _id) — there is no
     longer a denormalized prospect_count stored on the company doc.
+
+    Search is a case-insensitive substring match on name / domain / website
+    rather than a `$text` query: the list is a lookup tool, and users type
+    partial names ("acme" should find "Acme Robotics"), which `$text`
+    whole-word matching does not do.
     """
-    query: dict = {}
-    if search:
-        query["$text"] = {"$search": search}
+    filters: list[dict] = []
+
+    if search and search.strip():
+        pattern = re.escape(search.strip())
+        filters.append({"$or": [
+            {"name": {"$regex": pattern, "$options": "i"}},
+            {"domain": {"$regex": pattern, "$options": "i"}},
+            {"website": {"$regex": pattern, "$options": "i"}},
+        ]})
 
     if industry:
-        query["$or"] = [
-            {"industry.label": {"$regex": industry, "$options": "i"}},
-            {"industry.raw": {"$regex": industry, "$options": "i"}},
-        ]
+        filters.append({"$or": [
+            {"industry.label": {"$regex": re.escape(industry), "$options": "i"}},
+            {"industry.raw": {"$regex": re.escape(industry), "$options": "i"}},
+        ]})
 
     if industry_id:
-        query["industry.id"] = industry_id
+        filters.append({"industry.id": industry_id})
+
+    if min_employees is not None or max_employees is not None:
+        size_range: dict = {}
+        if min_employees is not None:
+            size_range["$gte"] = min_employees
+        if max_employees is not None:
+            size_range["$lte"] = max_employees
+        filters.append({"employee_count": size_range})
+
+    if has_website is not None:
+        site_present = {"$or": [
+            {"website": {"$nin": [None, ""]}},
+            {"domain": {"$nin": [None, ""]}},
+        ]}
+        filters.append(site_present if has_website else {"$nor": [site_present]})
+
+    query: dict = {"$and": filters} if filters else {}
 
     sort_direction = -1 if sort_order == "desc" else 1
-    allowed_sorts = {"name", "industry", "employee_count", "prospect_count"}
-    sort_field = sort_by if sort_by in allowed_sorts else "name"
+    # "industry" is a subdocument — sort on its label so the ordering is
+    # alphabetical rather than by BSON field order.
+    allowed_sorts = {
+        "name": "name",
+        "industry": "industry.label",
+        "employee_count": "employee_count",
+        "prospect_count": "prospect_count",
+    }
+    sort_field = allowed_sorts.get(sort_by, "name")
 
     skip = (page - 1) * page_size
 
@@ -110,6 +150,24 @@ async def list_companies(
         {"$addFields": {"prospect_count": {"$ifNull": [{"$arrayElemAt": ["$_pc.n", 0]}, 0]}}},
     ]
 
+    # A few dozen company docs are bare stubs — just an _id and a linkedin_url,
+    # queued for a scrape that never completed. Mongo sorts missing values FIRST
+    # ascending, so without this they'd monopolise page 1 and the list would
+    # look completely empty. Rank rows with a value ahead of rows without one,
+    # in either sort direction; the stubs still appear, just at the end.
+    rank_stage = {
+        "$addFields": {
+            "_missing_sort_key": {
+                "$cond": [
+                    {"$in": [{"$ifNull": [f"${sort_field}", ""]}, [None, ""]]},
+                    1,
+                    0,
+                ]
+            }
+        }
+    }
+    sort_stage = {"$sort": {"_missing_sort_key": 1, sort_field: sort_direction, "_id": 1}}
+
     needs_prospect_count_first = min_prospects > 0 or sort_field == "prospect_count"
 
     pipeline: list[dict] = [{"$match": query}]
@@ -124,7 +182,8 @@ async def list_companies(
                 "$facet": {
                     "total": [{"$count": "count"}],
                     "rows": [
-                        {"$sort": {sort_field: sort_direction, "_id": 1}},
+                        rank_stage,
+                        sort_stage,
                         {"$skip": skip},
                         {"$limit": page_size},
                         {"$project": projection},
@@ -139,7 +198,8 @@ async def list_companies(
                 "$facet": {
                     "total": [{"$count": "count"}],
                     "rows": [
-                        {"$sort": {sort_field: sort_direction, "_id": 1}},
+                        rank_stage,
+                        sort_stage,
                         {"$skip": skip},
                         {"$limit": page_size},
                         *lookup_stages,
@@ -225,29 +285,65 @@ async def companies_by_industry():
 # ---------------------------------------------------------------------------
 @router.get("/stats")
 async def get_company_stats(ctx: dict = Depends(get_account_context)):
-    """Aggregate company stats: total count, avg employee count, breakdown by industry."""
-    pipeline = [
+    """Headline stats for the companies list plus the industry facet used by
+    the industry filter dropdown.
+
+    Deliberately does NOT report an average employee count: it mixes
+    LinkedIn's self-reported headcount across every company in the pool and
+    answers no question anyone asks. The numbers here are about coverage —
+    how much of the pool is actually usable for outreach.
+    """
+    company_facets = [
         {
             "$facet": {
                 "total": [{"$count": "count"}],
+                "with_website": [
+                    {"$match": {"$or": [
+                        {"website": {"$nin": [None, ""]}},
+                        {"domain": {"$nin": [None, ""]}},
+                    ]}},
+                    {"$count": "count"},
+                ],
                 "by_industry": [
-                    {"$match": {"industry.id": {"$ne": None, "$exists": True}}},
+                    {"$match": {"industry.label": {"$ne": None, "$exists": True}}},
                     {"$group": {"_id": "$industry.label", "count": {"$sum": 1}}},
                     {"$sort": {"count": -1}},
-                    {"$limit": 20},
-                ],
-                "avg": [
-                    {"$group": {"_id": None, "avg_employee_count": {"$avg": "$employee_count"}}}
+                    {"$limit": 50},
                 ],
             }
         }
     ]
-    result = await companies_collection.aggregate(pipeline).to_list(length=1)
-    data = result[0] if result else {}
-    total = data.get("total", [{}])[0].get("count", 0)
-    avg = data.get("avg", [{}])[0].get("avg_employee_count") or 0
-    by_industry = data.get("by_industry", [])
-    return {"total_companies": total, "avg_employee_count": avg, "by_industry": by_industry}
+
+    # Companies that actually have people attached, and the total people count.
+    # prospects.company_id is the stringified company _id.
+    prospect_facets = [
+        {"$match": {"company_id": {"$nin": [None, ""]}}},
+        {"$group": {"_id": "$company_id", "n": {"$sum": 1}}},
+        {"$group": {"_id": None, "companies": {"$sum": 1}, "prospects": {"$sum": "$n"}}},
+    ]
+
+    company_result, prospect_result, total_employees = await asyncio.gather(
+        companies_collection.aggregate(company_facets).to_list(length=1),
+        prospects_collection.aggregate(prospect_facets).to_list(length=1),
+        employees_collection.estimated_document_count(),
+    )
+
+    data = company_result[0] if company_result else {}
+
+    def _count(key: str) -> int:
+        rows = data.get(key) or []
+        return rows[0].get("count", 0) if rows else 0
+
+    prospect_data = prospect_result[0] if prospect_result else {}
+
+    return {
+        "total_companies": _count("total"),
+        "companies_with_prospects": prospect_data.get("companies", 0),
+        "total_prospects": prospect_data.get("prospects", 0),
+        "total_employees_scraped": total_employees,
+        "companies_with_website": _count("with_website"),
+        "by_industry": data.get("by_industry", []),
+    }
 
 
 # ---------------------------------------------------------------------------
@@ -853,6 +949,170 @@ async def promote_employees_to_prospects(
         )
 
     return {"prospect_ids": prospect_ids, "promoted": promoted, "already_existed": already_existed}
+
+
+# ---------------------------------------------------------------------------
+# POST /api/companies/{company_id}/scrape-employees
+# GET  /api/companies/{company_id}/scrape-employees/status
+# ---------------------------------------------------------------------------
+
+class ScrapeEmployeesRequest(BaseModel):
+    """Knobs for a single-company employee top-up scrape."""
+    max_employees: int = Field(50, ge=1, le=200)
+    seniority_levels: Optional[List[str]] = None
+
+
+async def _run_employee_scrape(
+    company_id_str: str,
+    linkedin_url: str,
+    max_employees: int,
+    seniority_levels: Optional[List[str]],
+):
+    """Background worker for /scrape-employees. Records the before/after
+    employee count so the UI can report what the run actually added."""
+    try:
+        oid = ObjectId(company_id_str)
+    except Exception:
+        return
+
+    before = await employees_collection.count_documents(
+        {"company_id": {"$in": [oid, company_id_str]}}
+    )
+    try:
+        result = await scrape_companies_and_employees(
+            company_urls=[linkedin_url],
+            max_employees_per_company=max_employees,
+            seniority_levels=seniority_levels,
+        )
+        after = await employees_collection.count_documents(
+            {"company_id": {"$in": [oid, company_id_str]}}
+        )
+        await companies_collection.update_one(
+            {"_id": oid},
+            {"$set": {
+                "employee_scrape_status": "completed",
+                "employee_scrape_completed_at": datetime.utcnow(),
+                "employee_scrape_result": {
+                    "employees_before": before,
+                    "employees_after": after,
+                    "employees_added": max(0, after - before),
+                    "scraper_stats": result,
+                },
+                "employee_scrape_error": None,
+            }},
+        )
+    except Exception as e:
+        logger.error(f"Employee scrape failed for company {company_id_str}: {e}")
+        await companies_collection.update_one(
+            {"_id": oid},
+            {"$set": {
+                "employee_scrape_status": "failed",
+                "employee_scrape_error": str(e),
+                "employee_scrape_completed_at": datetime.utcnow(),
+            }},
+        )
+
+
+@router.post("/{company_id}/scrape-employees")
+async def scrape_more_employees(
+    company_id: str,
+    body: ScrapeEmployeesRequest,
+    background_tasks: BackgroundTasks,
+    ctx: dict = Depends(get_account_context),
+):
+    """Scrape more employees for a single company.
+
+    This is the "find more people at this company" action on the company
+    detail page. It runs in the background because the Apify actor takes
+    tens of seconds; poll the companion status endpoint for progress.
+
+    Concurrent runs for the same company are rejected rather than queued —
+    each run costs Apify credits and a double-click should not double-charge.
+    """
+    try:
+        oid = ObjectId(company_id)
+    except Exception:
+        raise HTTPException(status_code=400, detail="Invalid company_id")
+
+    company = await companies_collection.find_one(
+        {"_id": oid},
+        {"linkedin_url": 1, "name": 1, "employee_scrape_status": 1},
+    )
+    if not company:
+        raise HTTPException(status_code=404, detail="Company not found")
+
+    linkedin_url = company.get("linkedin_url")
+    if not linkedin_url:
+        raise HTTPException(
+            status_code=400,
+            detail="This company has no LinkedIn URL, so its employees can't be scraped.",
+        )
+
+    if company.get("employee_scrape_status") == "in_progress":
+        raise HTTPException(
+            status_code=409,
+            detail="An employee scrape is already running for this company.",
+        )
+
+    seniority_levels = body.seniority_levels or None
+    if seniority_levels:
+        bad = [s for s in seniority_levels if s not in _VALID_SENIORITIES]
+        if bad:
+            raise HTTPException(status_code=400, detail=f"Invalid seniority levels: {bad}")
+
+    await companies_collection.update_one(
+        {"_id": oid},
+        {"$set": {
+            "employee_scrape_status": "in_progress",
+            "employee_scrape_started_at": datetime.utcnow(),
+            "employee_scrape_started_by": str(ctx["account"]["_id"]),
+            "employee_scrape_error": None,
+        }},
+    )
+
+    background_tasks.add_task(
+        _run_employee_scrape, company_id, linkedin_url, body.max_employees, seniority_levels
+    )
+    return {
+        "status": "started",
+        "company_id": company_id,
+        "company_name": company.get("name"),
+        "max_employees": body.max_employees,
+    }
+
+
+@router.get("/{company_id}/scrape-employees/status")
+async def get_employee_scrape_status(
+    company_id: str,
+    ctx: dict = Depends(get_account_context),
+):
+    """Current state of the last employee scrape for a company."""
+    try:
+        oid = ObjectId(company_id)
+    except Exception:
+        raise HTTPException(status_code=400, detail="Invalid company_id")
+
+    company = await companies_collection.find_one(
+        {"_id": oid},
+        {
+            "employee_scrape_status": 1,
+            "employee_scrape_started_at": 1,
+            "employee_scrape_completed_at": 1,
+            "employee_scrape_result": 1,
+            "employee_scrape_error": 1,
+        },
+    )
+    if not company:
+        raise HTTPException(status_code=404, detail="Company not found")
+
+    result = company.get("employee_scrape_result") or {}
+    return {
+        "status": company.get("employee_scrape_status") or "idle",
+        "started_at": company.get("employee_scrape_started_at"),
+        "completed_at": company.get("employee_scrape_completed_at"),
+        "employees_added": result.get("employees_added"),
+        "error": company.get("employee_scrape_error"),
+    }
 
 
 # ---------------------------------------------------------------------------

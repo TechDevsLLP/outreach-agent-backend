@@ -94,8 +94,9 @@ _PROFILE_SCRAPER_MODE = "Full ($8 per 1k)"
 # say WHY a campaign enrolled 0 prospects instead of showing an empty list.
 _SKIP_REASON_MESSAGES = {
     "no_sending_account": (
-        "No prospects could be scheduled — connect an email or LinkedIn sending "
-        "account, then re-run discovery."
+        "Your prospects are ready but there's nowhere to send from — connect an "
+        "email or LinkedIn account in Settings and they'll be scheduled "
+        "automatically. No need to re-run discovery."
     ),
     "no_contact_info": (
         "No email or LinkedIn contact could be found for the scraped prospects. "
@@ -1082,6 +1083,8 @@ async def run_fast_discovery(campaign_id: str, account_id: str, generation: int 
                         for i, c in enumerate(_matched_sc_list)
                     ],
                     icp_prompt,
+                    account_id=str(account_id),
+                    campaign_id=str(campaign_id),
                 )
                 _cg_kept = [
                     c for i, c in enumerate(_matched_sc_list)
@@ -1283,6 +1286,8 @@ async def run_fast_discovery(campaign_id: str, account_id: str, generation: int 
                                 for i, c in enumerate(_batch_pass)
                             ],
                             icp_prompt,
+                            account_id=str(account_id),
+                            campaign_id=str(campaign_id),
                         )
                         _bg_kept: list[dict] = []
                         for i, c in enumerate(_batch_pass):
@@ -1565,7 +1570,10 @@ async def run_fast_discovery(campaign_id: str, account_id: str, generation: int 
                     {"index": i, "title": t.get("job_title") or "", "headline": t.get("headline") or ""}
                     for i, (t, _) in enumerate(pairs)
                 ]
-                _verdicts = await ai_title_gate(_cands, _ai_gate_icp)
+                _verdicts = await ai_title_gate(
+                    _cands, _ai_gate_icp,
+                    account_id=str(account_id), campaign_id=str(campaign_id),
+                )
                 _kept = [
                     pair for i, pair in enumerate(pairs)
                     if (_verdicts.get(i) or {}).get("match", True)

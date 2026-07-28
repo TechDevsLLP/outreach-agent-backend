@@ -308,13 +308,20 @@ async def _track_progress(campaign_id: str, account_id: str, session_id: str) ->
         while True:
             await asyncio.sleep(5)
             campaign = await database.campaigns_collection.find_one(
-                {"_id": campaign_oid}, {"discovery_status": 1, "discovery_error": 1}
+                {"_id": campaign_oid},
+                {"discovery_status": 1, "discovery_error": 1, "discovery_failure_reason": 1},
             )
             if not campaign:
                 return
             status = campaign.get("discovery_status")
+            # Only prospects that can actually be contacted count as "found".
+            # Counting every enrollment let the onboarding page claim it had
+            # found N people while all N were skipped_no_channel.
             count = await database.campaign_enrollments_collection.count_documents(
-                {"campaign_id": campaign_oid}
+                {
+                    "campaign_id": campaign_oid,
+                    "status": {"$nin": ["skipped_no_channel", "archived"]},
+                }
             )
 
             if status == "failed":
@@ -332,6 +339,30 @@ async def _track_progress(campaign_id: str, account_id: str, session_id: str) ->
 
             day1_ready = status in ("completed", "enriching", "awaiting_approval")
             done = status in ("completed", "awaiting_approval")
+
+            # Discovery can "succeed" and still enroll nobody (most often: the
+            # user has no sending account connected yet). Reporting that as a
+            # clean completion left the onboarding page celebrating an empty
+            # list; surface the reason so the user knows what to fix.
+            reason = campaign.get("discovery_failure_reason") or campaign.get("discovery_error")
+            if done and count == 0 and reason:
+                await database.onboarding_scrape_jobs_collection.update_one(
+                    {"session_id": session_id},
+                    {"$set": {
+                        "status": "failed",
+                        "error": str(reason)[:400],
+                        "prospects_found": 0,
+                        "day1_ready": False,
+                        "campaign_id": campaign_id,
+                        "updated_at": datetime.now(timezone.utc),
+                    }},
+                )
+                logger.warning(
+                    f"[onboarding_scrape] discovery completed with 0 contactable prospects "
+                    f"session={session_id} campaign={campaign_id}: {reason}"
+                )
+                return
+
             await database.onboarding_scrape_jobs_collection.update_one(
                 {"session_id": session_id},
                 {"$set": {

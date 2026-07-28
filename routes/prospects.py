@@ -957,10 +957,20 @@ async def get_prospect(
     if not prospect:
         raise HTTPException(status_code=404, detail="Prospect not found")
 
-    if not await _account_has_prospect_access(
+    # Prospects are a SHARED pool. An account that has neither a prospect_state
+    # overlay nor an enrollment still gets a READ-ONLY view of the canonical
+    # record, because the same fields are already listed by
+    # GET /api/companies/{id}/prospects with no tenancy check — 404ing here made
+    # ~97% of company-page rows unopenable while protecting nothing.
+    #
+    # What tenancy still guarantees: every tenant-private field is stripped from
+    # the shared doc below, and both the prospect_state and
+    # campaign_prospect_state lookups are account-scoped, so a pool view carries
+    # no other tenant's score, status, notes, intelligence, or messages. All
+    # mutating endpoints keep using _account_has_prospect_access and still 404.
+    has_workspace_access = await _account_has_prospect_access(
         account_id=account_oid, prospect_id=pid, prospect=prospect
-    ):
-        raise HTTPException(status_code=404, detail="Prospect not found")
+    )
 
     # Never expose legacy tenant-private fields that may still be present on a
     # shared document.  The requesting account's overlay is applied below.
@@ -1182,6 +1192,11 @@ async def get_prospect(
     research = comp_doc.get("research") if comp_doc else None
     prospect["company_research"] = research if isinstance(research, dict) else None
 
+    # Tells the client whether this is the account's own prospect or a
+    # read-only record from the shared pool, so the UI can hide workspace-only
+    # affordances rather than rendering them as permanently empty.
+    prospect["access"] = "workspace" if has_workspace_access else "pool"
+
     return serialize_doc(prospect)
 
 
@@ -1328,6 +1343,49 @@ async def get_prospect_touchpoints(
     result.sort(key=lambda r: str(r.get("enrolled_at") or ""), reverse=True)
 
     return serialize_doc({"prospect_id": prospect_id, "enrollments": result})
+
+
+@router.post("/{prospect_id}/claim")
+async def claim_prospect(prospect_id: str, account_ctx=Depends(get_account_context)):
+    """Adopt a shared-pool prospect into this account's workspace.
+
+    Creates the prospect_state overlay that turns a read-only pool record into
+    one the account owns — after this the prospect is editable, enrichable, and
+    enrollable. Idempotent: claiming an already-owned prospect is a no-op.
+    """
+    from datetime import datetime
+
+    account_id_str = str(account_ctx["account"]["_id"])
+    try:
+        pid = ObjectId(prospect_id)
+    except Exception:
+        raise HTTPException(status_code=400, detail="Invalid prospect ID")
+
+    prospect = await prospects_collection.find_one({"_id": pid}, {"_id": 1, "full_name": 1})
+    if not prospect:
+        raise HTTPException(status_code=404, detail="Prospect not found")
+
+    now = datetime.utcnow()
+    result = await prospect_state_collection.update_one(
+        {"account_id": account_id_str, "prospect_id": prospect_id},
+        {
+            "$setOnInsert": {
+                "account_id": account_id_str,
+                "prospect_id": prospect_id,
+                "status": "new",
+                "tags": [],
+                "created_at": now,
+            },
+            "$set": {"last_updated_at": now},
+        },
+        upsert=True,
+    )
+
+    return {
+        "prospect_id": prospect_id,
+        "access": "workspace",
+        "already_owned": result.upserted_id is None,
+    }
 
 
 @router.patch("/{prospect_id}")

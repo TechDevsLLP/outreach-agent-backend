@@ -545,3 +545,62 @@ async def test_preview_message_404_unknown_session(client, as_identity_a, mock_p
     resp = await client.post("/api/onboarding/preview-message",
                              json={"session_id": "no-such-session"}, headers=as_identity_a["headers"])
     assert resp.status_code == 404
+
+
+# ---------------------------------------------------------------------------
+# Draft autosave — partial wizard input must land in the DB immediately
+# ---------------------------------------------------------------------------
+
+@pytest.mark.asyncio
+async def test_draft_persists_partial_profile_without_advancing_stage(
+    client, identity_a, wizard_session
+):
+    resp = await client.post(
+        "/api/onboarding/draft",
+        json={
+            "session_id": wizard_session,
+            "profile": {
+                "website_url": "  https://acme.test  ",
+                "target_job_titles": ["Head of Sales", " ", "VP Marketing"],
+                "primary_cta": "Book a 20-min call",
+            },
+        },
+        headers=identity_a["headers"],
+    )
+    assert resp.status_code == 200, resp.text
+    assert resp.json()["ok"] is True
+
+    profile = await database.company_profiles_collection.find_one(
+        {"account_id": identity_a["account_id"]}
+    )
+    assert profile["website_url"] == "https://acme.test"
+    assert profile["target_job_titles"] == ["Head of Sales", "VP Marketing"]
+    assert profile["primary_cta"] == "Book a 20-min call"
+
+    session = await database.onboarding_sessions_collection.find_one(
+        {"session_id": wizard_session}
+    )
+    # Drafts record progress but never move the wizard forward.
+    assert session["current_stage"] == 1
+    assert session["stage_data"]["draft"]["primary_cta"] == "Book a 20-min call"
+
+
+@pytest.mark.asyncio
+async def test_draft_ignores_unknown_fields(client, identity_a, wizard_session):
+    resp = await client.post(
+        "/api/onboarding/draft",
+        json={
+            "session_id": wizard_session,
+            "profile": {"plan": "enterprise", "account_id": "someone-else", "services": ["SEO"]},
+        },
+        headers=identity_a["headers"],
+    )
+    assert resp.status_code == 200
+    assert resp.json()["saved"] == 1
+
+    profile = await database.company_profiles_collection.find_one(
+        {"account_id": identity_a["account_id"]}
+    )
+    assert profile["services"] == ["SEO"]
+    assert profile.get("plan") is None
+    assert profile["account_id"] == identity_a["account_id"]
