@@ -7,6 +7,7 @@ Router prefix: /api/linkedin-accounts
 
 import json
 import logging
+import secrets
 from datetime import datetime, timezone, timedelta
 from typing import Literal, Optional
 
@@ -183,6 +184,53 @@ def _extract_profile_fields(profile_data: dict, user_profile: Optional[dict] = N
     }
 
 
+HOSTED_AUTH_TTL_HOURS = 24
+
+
+async def _issue_hosted_auth_nonce(account_id: str, user_id: str) -> tuple[str, datetime]:
+    """Record a pending hosted-auth request and return its (nonce, expires_at).
+
+    Unipile's hosted-auth ``notify_url`` callback carries no signature or shared
+    secret — there is no way to configure headers on it — so the callback proves
+    its provenance by echoing back a nonce that only we could have issued.
+    """
+    nonce = secrets.token_urlsafe(32)
+    expires_at = datetime.now(timezone.utc) + timedelta(hours=HOSTED_AUTH_TTL_HOURS)
+    await database.linkedin_auth_requests_collection.insert_one(
+        {
+            "nonce": nonce,
+            "account_id": account_id,
+            "user_id": user_id,
+            "created_at": datetime.now(timezone.utc),
+            "expires_at": expires_at,
+        }
+    )
+    return nonce, expires_at
+
+
+async def _consume_hosted_auth_nonce(nonce: str) -> Optional[dict]:
+    """Atomically claim a pending hosted-auth request, or return None.
+
+    Deleting on read makes the nonce single-use, so a replayed or forged notify
+    body cannot re-bind a Unipile account to a tenant. The TTL index on
+    ``expires_at`` reaps requests the user abandoned, but Mongo's TTL reaper runs
+    only once a minute, so expiry is re-checked here rather than trusted.
+    """
+    if not nonce:
+        return None
+    doc = await database.linkedin_auth_requests_collection.find_one_and_delete({"nonce": nonce})
+    if not doc:
+        return None
+    expires_at = doc.get("expires_at")
+    if expires_at is not None:
+        if expires_at.tzinfo is None:
+            expires_at = expires_at.replace(tzinfo=timezone.utc)
+        if expires_at < datetime.now(timezone.utc):
+            logger.warning("Hosted-auth nonce expired at %s; rejecting notify", expires_at)
+            return None
+    return doc
+
+
 async def _upsert_linkedin_account_from_unipile(
     unipile_account_id: str,
     account_id: str,
@@ -325,20 +373,21 @@ async def initiate_hosted_auth(
 
     # Unipile hosted-auth v2 schema: type="create", providers=["LINKEDIN"],
     # expiresOn (ISO 8601 UTC with ms), api_url (server root, no /api/v1 suffix)
-    expires_on = (datetime.now(timezone.utc) + timedelta(hours=24)).strftime(
-        "%Y-%m-%dT%H:%M:%S.000Z"
-    )
+    nonce, expires_at = await _issue_hosted_auth_nonce(account_id, user_id)
+    expires_on = expires_at.strftime("%Y-%m-%dT%H:%M:%S.000Z")
     api_url = settings.unipile_base_url.removesuffix("/api/v1")
 
     # "name" is echoed back verbatim on the notify_url callback — it's the only way
     # to carry our tenant + user identity through Unipile's hosted-auth flow back to
-    # the notify webhook, since Unipile has no concept of our JWT/session.
+    # the notify webhook, since Unipile has no concept of our JWT/session. The nonce
+    # rides along in the same field because that callback is otherwise unauthenticated:
+    # it is what proves the callback answers a link *we* issued for *this* tenant.
     payload = {
         "type": "create",
         "providers": ["LINKEDIN"],
         "expiresOn": expires_on,
         "api_url": api_url,
-        "name": f"{account_id}:{user_id}",
+        "name": f"{account_id}:{user_id}:{nonce}",
         "success_redirect_url": success_redirect_url,
         "failure_redirect_url": failure_redirect_url,
         "notify_url": f"{settings.api_base_url}/api/linkedin-accounts/connect/notify",
@@ -420,19 +469,37 @@ async def linkedin_connect_notify(request: Request, background_tasks: Background
     popup lingers on a success screen through a slow 2FA login).
 
     Tenant + user identity is recovered from the "name" field we set on the
-    hosted-auth request (f"{account_id}:{user_id}" in initiate_hosted_auth), since
-    Unipile echoes it back verbatim.
+    hosted-auth request (f"{account_id}:{user_id}:{nonce}" in initiate_hosted_auth),
+    since Unipile echoes it back verbatim.
+
+    **This callback is not signed.** Unipile's hosted-auth link accepts a bare
+    ``notify_url`` with no way to attach a shared secret or signing key — only
+    webhooks created through ``/webhooks`` carry the headers that
+    ``_verify_unipile_signature`` checks. Requiring a signature here therefore
+    rejected every real callback in any environment with UNIPILE_WEBHOOK_SECRET
+    set (which config.py makes mandatory in production): the account linked fine
+    at Unipile and then never appeared in the dashboard, because /sync is retired
+    and the notify callback is the only path that creates the record.
+
+    Provenance is instead proven by the single-use nonce minted in
+    initiate_hosted_auth: an unsigned body is trusted only when its nonce matches
+    a pending request we issued, and the tenant is taken from that stored request
+    rather than from the request body. A validly signed request is still accepted
+    without a nonce so links issued before this change (and any future signed
+    delivery) keep working.
     """
     settings = get_settings()
     body = await request.body()
     x_webhook_secret = request.headers.get("X-Webhook-Secret", "")
-    x_unipile_signature = request.headers.get("X-Unipile-Signature", "")
+    signature_header = getattr(
+        settings, "unipile_webhook_signature_header", "X-Unipile-Signature"
+    )
+    x_unipile_signature = request.headers.get(signature_header, "")
     x_unipile_timestamp = request.headers.get("X-Unipile-Timestamp", "")
     sig = x_unipile_signature or x_webhook_secret
-
-    if not _verify_unipile_signature(settings.unipile_webhook_secret, body, sig, x_unipile_timestamp):
-        logger.warning("Unipile connect/notify verification failed")
-        raise HTTPException(status_code=403, detail="Invalid webhook secret")
+    signature_ok = _verify_unipile_signature(
+        settings.unipile_webhook_secret, body, sig, x_unipile_timestamp
+    )
 
     try:
         payload = json.loads(body)
@@ -444,12 +511,42 @@ async def linkedin_connect_notify(request: Request, background_tasks: Background
     name = payload.get("name") or ""
 
     # Only a successful (re)connection creates/updates a record — everything else
-    # (CREATION_FAILED, etc.) is ack'd so Unipile doesn't retry.
+    # (CREATION_FAILED, etc.) is ack'd so Unipile doesn't retry. Checked before the
+    # nonce is consumed so a failed attempt doesn't burn the user's pending link.
     if unipile_status.upper() not in ("CREATION_SUCCESS", "RECONNECTED") or not unipile_account_id:
         logger.info(f"Ignoring Unipile connect/notify status={unipile_status!r}")
         return {"status": "ignored"}
 
-    account_id, _, user_id = name.partition(":")
+    account_id, _, rest = name.partition(":")
+    user_id, _, nonce = rest.partition(":")
+
+    pending = await _consume_hosted_auth_nonce(nonce)
+    if pending is not None:
+        # Trust the stored request, not the body: the body only proved it holds
+        # the nonce, so the nonce decides which tenant this account belongs to.
+        account_id = pending["account_id"]
+        user_id = pending.get("user_id") or ""
+    elif not signature_ok:
+        # Unipile retries a notify it couldn't confirm, and the first (successful)
+        # delivery already burned the nonce. Ack a retry that names an account we
+        # have already linked so the provider stops retrying — it changes no state,
+        # so it grants a forged body nothing.
+        already_linked = await database.linkedin_accounts_collection.find_one(
+            {"unipile_account_id": unipile_account_id}, {"_id": 1}
+        )
+        if already_linked:
+            logger.info(
+                "Acking replayed Unipile connect/notify for already-linked account %s",
+                unipile_account_id,
+            )
+            return {"status": "ignored", "reason": "already linked"}
+        logger.warning(
+            "Rejecting Unipile connect/notify: no valid signature and no pending "
+            "hosted-auth request for name=%r",
+            name,
+        )
+        raise HTTPException(status_code=403, detail="Unrecognized hosted-auth callback")
+
     if not account_id:
         logger.warning(f"Unipile connect/notify missing account_id in name={name!r}")
         return {"status": "ignored", "reason": "missing account_id in name"}

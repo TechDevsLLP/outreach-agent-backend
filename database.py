@@ -38,6 +38,9 @@ company_profiles_collection = db["company_profiles"]
 email_accounts_collection = db["email_accounts"]
 linkedin_accounts_collection = db["linkedin_accounts"]
 linkedin_connection_requests_collection = db["linkedin_connection_requests"]
+# Short-lived nonces proving a /connect/notify callback belongs to a hosted-auth
+# link we issued (Unipile sends no signature on that callback).
+linkedin_auth_requests_collection = db["linkedin_auth_requests"]
 
 # Campaign system
 campaigns_collection = db["campaigns"]
@@ -334,6 +337,13 @@ async def create_indexes():
         IndexModel([("account_id", ASCENDING), ("status", ASCENDING)]),
         IndexModel([("recipient_provider_id", ASCENDING)]),
         IndexModel([("unipile_invitation_id", ASCENDING)], sparse=True),
+    ])
+
+    # LinkedIn hosted-auth requests — TTL auto-delete once expires_at passes
+    await linkedin_auth_requests_collection.create_indexes([
+        IndexModel([("nonce", ASCENDING)], unique=True),
+        IndexModel([("account_id", ASCENDING)]),
+        IndexModel([("expires_at", ASCENDING)], expireAfterSeconds=0),
     ])
 
     # Campaigns
